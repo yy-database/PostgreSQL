@@ -1,0 +1,26 @@
+# OS
+.DS_Store/
+thumbs.db
+time-travel.*
+
+# Dependencies
+node_modules/
+
+# Python caches
+__pycache__/
+
+# IDE
+.vscode/
+.vs/
+.idea/
+*.iml
+
+# Rust
+target/
+Cargo.lock
+
+# Native bindings built from Cargo
+*.node
+
+# TypeScript build output
+projects/postgres.ts/packages/postgres/dist/

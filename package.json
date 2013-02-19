@@ -1,0 +1,27 @@
+{
+    "name": "postgres-workspace",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Workspace for the PostgreSQL protocol-v3 product",
+    "license": "MPL-2.0",
+    "type": "module",
+    "scripts": {
+        "check": "cargo check --manifest-path projects/postgres.rs/Cargo.toml --workspace --all-targets",
+        "build:napi": "node scripts/build-napi.mjs",
+        "build:ts": "tsc -p projects/postgres.ts/packages/postgres/tsconfig.json",
+        "fmt": "cargo fmt --manifest-path projects/postgres.rs/Cargo.toml --all",
+        "fmt:check": "cargo fmt --manifest-path projects/postgres.rs/Cargo.toml --all --check",
+        "test": "node projects/postgres.ts/packages/postgres-harness/cli.mjs test",
+        "test:rust": "cargo test --manifest-path projects/postgres.rs/Cargo.toml --workspace",
+        "typecheck": "tsc --noEmit",
+        "examples:ts": "node projects/postgres.ts/examples/roundtrip.ts",
+        "examples:py": "python projects/postgres.py/examples/roundtrip.py"
+    },
+    "engines": {
+        "node": ">=24.0.0"
+    },
+    "devDependencies": {
+        "@types/node": "24.10.1",
+        "typescript": "5.9.3"
+    }
+}

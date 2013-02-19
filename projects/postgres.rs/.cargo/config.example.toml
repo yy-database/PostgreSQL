@@ -1,0 +1,5 @@
+# Copy to `.cargo/config.toml` for a local absolute-path override of the facade.
+# The committed manifest keeps the pinned git rev, so CI resolves the real rev.
+
+[patch."https://github.com/oovm/database.rs.git"]
+yyds = { path = "E:/dxo 深度学习/database.rs/projects/facades/yyds" }

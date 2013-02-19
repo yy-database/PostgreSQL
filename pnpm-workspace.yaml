@@ -1,0 +1,4 @@
+packages:
+  - "projects/postgres.ts/packages/*"
+  - "projects/postgres.ts/platforms/*"
+  - "projects/postgres.ts/examples"
