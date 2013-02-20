@@ -1,0 +1,25 @@
+[package]
+name = "postgres-napi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node-API bindings for the PostgreSQL protocol-v3 primitives"
+readme = "readme.md"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+name = "postgres_napi"
+
+[dependencies]
+napi = { workspace = true }
+napi-derive = { workspace = true }
+postgres-client = { path = "../postgres-client" }
+
+[build-dependencies]
+napi-build = { workspace = true }
+
+[package.metadata.napi]
+name = "postgres"
