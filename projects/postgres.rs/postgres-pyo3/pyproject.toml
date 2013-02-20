@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "postgres-pyo3"
+version = "0.1.0"
+description = "PyO3 bindings for the PostgreSQL protocol-v3 disguise surface"
+license = { text = "MPL-2.0" }
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+module-name = "postgres_pyo3"

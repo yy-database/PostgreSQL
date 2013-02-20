@@ -1,0 +1,18 @@
+[package]
+name = "postgres-pyo3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PyO3 bindings for the PostgreSQL protocol-v3 primitives"
+readme = "readme.md"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+name = "postgres_pyo3"
+
+[dependencies]
+pyo3 = { workspace = true }
+postgres-client = { path = "../postgres-client" }
