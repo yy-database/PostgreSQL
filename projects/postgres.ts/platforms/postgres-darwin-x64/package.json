@@ -1,0 +1,23 @@
+{
+    "name": "@yydb/postgres-darwin-x64",
+    "version": "0.1.0",
+    "private": true,
+    "description": "PostgreSQL native binding for darwin x64; installed automatically by @yydb/postgres",
+    "license": "MPL-2.0",
+    "type": "module",
+    "main": "./index.js",
+    "exports": {
+        ".": "./index.js"
+    },
+    "os": [
+        "darwin"
+    ],
+    "cpu": [
+        "x64"
+    ],
+    "files": [
+        "index.js",
+        "lib",
+        "readme.md"
+    ]
+}

@@ -1,0 +1,48 @@
+{
+    "name": "@yydb/postgres",
+    "version": "0.1.0",
+    "private": true,
+    "description": "PostgreSQL protocol-v3 client primitives and a psql-compatible command line",
+    "license": "MPL-2.0",
+    "type": "module",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "default": "./dist/index.js"
+        },
+        "./client": {
+            "types": "./dist/client.d.ts",
+            "default": "./dist/client.js"
+        },
+        "./cli": {
+            "types": "./dist/cli.d.ts",
+            "default": "./dist/cli.js"
+        },
+        "./native": {
+            "types": "./dist/native.d.ts",
+            "default": "./dist/native.js"
+        }
+    },
+    "bin": {
+        "psql": "./bin/psql.mjs"
+    },
+    "files": [
+        "bin",
+        "dist",
+        "readme.md"
+    ],
+    "scripts": {
+        "build": "tsc -p tsconfig.json"
+    },
+    "engines": {
+        "node": ">=24.0.0"
+    },
+    "optionalDependencies": {
+        "@yydb/postgres-darwin-arm64": "workspace:*",
+        "@yydb/postgres-darwin-x64": "workspace:*",
+        "@yydb/postgres-linux-x64": "workspace:*",
+        "@yydb/postgres-win32-x64": "workspace:*"
+    }
+}

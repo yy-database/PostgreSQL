@@ -1,0 +1,11 @@
+{
+    "name": "@yydb/postgres-examples",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Runnable samples for @yydb/postgres",
+    "license": "MPL-2.0",
+    "type": "module",
+    "dependencies": {
+        "@yydb/postgres": "workspace:*"
+    }
+}
