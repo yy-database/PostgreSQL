@@ -1,0 +1,414 @@
+[
+    {
+        "name": "literal-int",
+        "sql": "SELECT 1 AS one",
+        "expect": [{ "columns": ["one"], "rows": [["1"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "unnamed-column",
+        "sql": "SELECT 1",
+        "expect": [{ "columns": ["?column?"], "rows": [["1"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "quoted-alias",
+        "sql": "SELECT 1 AS \"One\"",
+        "expect": [{ "columns": ["One"], "rows": [["1"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "literal-text",
+        "sql": "SELECT 'hello' AS txt",
+        "expect": [{ "columns": ["txt"], "rows": [["hello"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "literal-null",
+        "sql": "SELECT NULL::text AS empty",
+        "expect": [{ "columns": ["empty"], "rows": [[null]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "boolean-text",
+        "sql": "SELECT true AS flag, false AS off",
+        "expect": [{ "columns": ["flag", "off"], "rows": [["t", "f"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "numeric-scale",
+        "sql": "SELECT 1.50::numeric AS n",
+        "expect": [{ "columns": ["n"], "rows": [["1.50"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "float8-text",
+        "sql": "SELECT 1.5::float8 AS f",
+        "expect": [{ "columns": ["f"], "rows": [["1.5"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "bigint-range",
+        "sql": "SELECT 2147483648::bigint AS b",
+        "expect": [{ "columns": ["b"], "rows": [["2147483648"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "negative-int",
+        "sql": "SELECT -5 AS n",
+        "expect": [{ "columns": ["n"], "rows": [["-5"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "unicode-text",
+        "sql": "SELECT '中文' AS txt",
+        "expect": [{ "columns": ["txt"], "rows": [["中文"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "quoted-quote",
+        "sql": "SELECT 'it''s' AS q",
+        "expect": [{ "columns": ["q"], "rows": [["it's"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "multi-column",
+        "sql": "SELECT 1 AS a, 'x' AS b, NULL::text AS c",
+        "expect": [{ "columns": ["a", "b", "c"], "rows": [["1", "x", null]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "values-order",
+        "sql": "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, txt) ORDER BY id",
+        "expect": [{
+            "columns": ["id", "txt"],
+            "rows": [["1", "a"], ["2", "b"]],
+            "tag": "SELECT 2"
+        }]
+    },
+    {
+        "name": "where-filter",
+        "sql": "SELECT id FROM (VALUES (1), (2), (3)) AS t(id) WHERE id > 1 ORDER BY id",
+        "expect": [{ "columns": ["id"], "rows": [["2"], ["3"]], "tag": "SELECT 2" }]
+    },
+    {
+        "name": "where-no-match",
+        "sql": "SELECT id FROM (VALUES (1)) AS t(id) WHERE false",
+        "expect": [{ "columns": ["id"], "rows": [], "tag": "SELECT 0" }]
+    },
+    {
+        "name": "order-desc",
+        "sql": "SELECT id FROM (VALUES (3), (1), (2)) AS t(id) ORDER BY id DESC",
+        "expect": [{ "columns": ["id"], "rows": [["3"], ["2"], ["1"]], "tag": "SELECT 3" }]
+    },
+    {
+        "name": "limit-offset",
+        "sql": "SELECT id FROM (VALUES (1), (2), (3), (4)) AS t(id) ORDER BY id LIMIT 2 OFFSET 1",
+        "expect": [{ "columns": ["id"], "rows": [["2"], ["3"]], "tag": "SELECT 2" }]
+    },
+    {
+        "name": "count-all",
+        "sql": "SELECT count(*) AS c FROM (VALUES (1), (2), (3)) AS t(x)",
+        "expect": [{ "columns": ["c"], "rows": [["3"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "sum-int",
+        "sql": "SELECT sum(x) AS s FROM (VALUES (1), (2), (3)) AS t(x)",
+        "expect": [{ "columns": ["s"], "rows": [["6"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "avg-int",
+        "sql": "SELECT avg(x) AS a FROM (VALUES (2), (4)) AS t(x)",
+        "expect": [{ "columns": ["a"], "rows": [["3.0000000000000000"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "group-by-count",
+        "sql": "SELECT a, count(*) AS c FROM (VALUES (1), (1), (2)) AS t(a) GROUP BY a ORDER BY a",
+        "expect": [{ "columns": ["a", "c"], "rows": [["1", "2"], ["2", "1"]], "tag": "SELECT 2" }]
+    },
+    {
+        "name": "having-filter",
+        "sql": "SELECT a, count(*) AS c FROM (VALUES (1), (1), (2)) AS t(a) GROUP BY a HAVING count(*) > 1 ORDER BY a",
+        "expect": [{ "columns": ["a", "c"], "rows": [["1", "2"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "inner-join",
+        "sql": "SELECT a.id, b.txt FROM (VALUES (1), (2)) AS a(id) JOIN (VALUES (1, 'one'), (2, 'two')) AS b(id, txt) ON a.id = b.id ORDER BY a.id",
+        "expect": [{ "columns": ["id", "txt"], "rows": [["1", "one"], ["2", "two"]], "tag": "SELECT 2" }]
+    },
+    {
+        "name": "left-join-null",
+        "sql": "SELECT a.id, b.txt FROM (VALUES (1), (2), (3)) AS a(id) LEFT JOIN (VALUES (1, 'one'), (2, 'two')) AS b(id, txt) ON a.id = b.id ORDER BY a.id",
+        "expect": [{
+            "columns": ["id", "txt"],
+            "rows": [["1", "one"], ["2", "two"], ["3", null]],
+            "tag": "SELECT 3"
+        }]
+    },
+    {
+        "name": "cross-join",
+        "sql": "SELECT a.id, b.id FROM (VALUES (1), (2)) AS a(id) CROSS JOIN (VALUES (1), (2)) AS b(id) ORDER BY a.id, b.id",
+        "expect": [{
+            "columns": ["id", "id"],
+            "rows": [["1", "1"], ["1", "2"], ["2", "1"], ["2", "2"]],
+            "tag": "SELECT 4"
+        }]
+    },
+    {
+        "name": "scalar-subquery",
+        "sql": "SELECT (SELECT 1) AS n",
+        "expect": [{ "columns": ["n"], "rows": [["1"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "distinct-values",
+        "sql": "SELECT DISTINCT a FROM (VALUES (1), (1), (2)) AS t(a) ORDER BY a",
+        "expect": [{ "columns": ["a"], "rows": [["1"], ["2"]], "tag": "SELECT 2" }]
+    },
+    {
+        "name": "union-values",
+        "sql": "SELECT 1 AS n UNION SELECT 2 ORDER BY n",
+        "expect": [{ "columns": ["n"], "rows": [["1"], ["2"]], "tag": "SELECT 2" }]
+    },
+    {
+        "name": "case-expression",
+        "sql": "SELECT CASE WHEN 1 = 1 THEN 'yes' ELSE 'no' END AS c",
+        "expect": [{ "columns": ["c"], "rows": [["yes"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "coalesce-null",
+        "sql": "SELECT coalesce(NULL, 'x') AS c",
+        "expect": [{ "columns": ["c"], "rows": [["x"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "string-functions",
+        "sql": "SELECT upper('abc') AS u, length('abc') AS l",
+        "expect": [{ "columns": ["u", "l"], "rows": [["ABC", "3"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "integer-arithmetic",
+        "sql": "SELECT 2 + 3 AS s, 7 / 2 AS d, 7 % 2 AS m",
+        "expect": [{ "columns": ["s", "d", "m"], "rows": [["5", "3", "1"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "between-operator",
+        "sql": "SELECT 5 BETWEEN 1 AND 10 AS b",
+        "expect": [{ "columns": ["b"], "rows": [["t"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "in-operator",
+        "sql": "SELECT 3 IN (1, 2, 3) AS i",
+        "expect": [{ "columns": ["i"], "rows": [["t"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "like-operator",
+        "sql": "SELECT 'abc' LIKE 'a%' AS m",
+        "expect": [{ "columns": ["m"], "rows": [["t"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "is-null",
+        "sql": "SELECT NULL IS NULL AS n",
+        "expect": [{ "columns": ["n"], "rows": [["t"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "cast-integer-text",
+        "sql": "SELECT '42'::int AS i, 1::text AS t",
+        "expect": [{ "columns": ["i", "t"], "rows": [["42", "1"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "date-text",
+        "sql": "SELECT '2024-01-02'::date AS d",
+        "expect": [{ "columns": ["d"], "rows": [["2024-01-02"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "timestamp-text",
+        "sql": "SELECT '2024-01-02 03:04:05'::timestamp AS ts",
+        "expect": [{ "columns": ["ts"], "rows": [["2024-01-02 03:04:05"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "time-text",
+        "sql": "SELECT '12:34:56'::time AS t",
+        "expect": [{ "columns": ["t"], "rows": [["12:34:56"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "array-text",
+        "sql": "SELECT ARRAY[1, 2, 3] AS a",
+        "expect": [{ "columns": ["a"], "rows": [["{1,2,3}"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "json-text",
+        "sql": "SELECT '{\"a\":1}'::json AS j",
+        "expect": [{ "columns": ["j"], "rows": [["{\"a\":1}"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "cte-select",
+        "sql": "WITH t AS (SELECT 1 AS n) SELECT n FROM t",
+        "expect": [{ "columns": ["n"], "rows": [["1"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "window-row-number",
+        "sql": "SELECT x, row_number() OVER (ORDER BY x) AS rn FROM (VALUES (2), (1)) AS t(x) ORDER BY x",
+        "expect": [{ "columns": ["x", "rn"], "rows": [["1", "1"], ["2", "2"]], "tag": "SELECT 2" }]
+    },
+    {
+        "name": "generate-series",
+        "sql": "SELECT generate_series(1, 3) AS n",
+        "expect": [{ "columns": ["n"], "rows": [["1"], ["2"], ["3"]], "tag": "SELECT 3" }]
+    },
+    {
+        "name": "empty-count",
+        "sql": "SELECT count(*) AS c FROM (SELECT 1 AS x WHERE false) AS t",
+        "expect": [{ "columns": ["c"], "rows": [["0"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "empty-sum-null",
+        "sql": "SELECT sum(x) AS s FROM (SELECT 1 AS x WHERE false) AS t",
+        "expect": [{ "columns": ["s"], "rows": [[null]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "multi-statement-two-selects",
+        "sql": "SELECT 1 AS a; SELECT 2 AS b",
+        "expect": [
+            { "columns": ["a"], "rows": [["1"]], "tag": "SELECT 1" },
+            { "columns": ["b"], "rows": [["2"]], "tag": "SELECT 1" }
+        ]
+    },
+    {
+        "name": "multi-statement-ddl-dml",
+        "sql": "CREATE TABLE harness_multi (id int); INSERT INTO harness_multi VALUES (1); SELECT count(*) AS c FROM harness_multi",
+        "setup": ["DROP TABLE IF EXISTS harness_multi"],
+        "teardown": ["DROP TABLE IF EXISTS harness_multi"],
+        "expect": [
+            { "columns": [], "rows": [], "tag": "CREATE TABLE" },
+            { "columns": [], "rows": [], "tag": "INSERT 0 1" },
+            { "columns": ["c"], "rows": [["1"]], "tag": "SELECT 1" }
+        ]
+    },
+    {
+        "name": "comment-prefix",
+        "sql": "-- a comment\nSELECT 1 AS a",
+        "expect": [{ "columns": ["a"], "rows": [["1"]], "tag": "SELECT 1" }]
+    },
+    {
+        "name": "empty-query",
+        "sql": "",
+        "expect": []
+    },
+    {
+        "name": "create-table",
+        "sql": "CREATE TABLE harness_crud (id int, txt text)",
+        "setup": ["DROP TABLE IF EXISTS harness_crud"],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": [], "rows": [], "tag": "CREATE TABLE" }]
+    },
+    {
+        "name": "insert-two-rows",
+        "sql": "INSERT INTO harness_crud VALUES (1, 'a'), (2, 'b')",
+        "setup": ["DROP TABLE IF EXISTS harness_crud", "CREATE TABLE harness_crud (id int, txt text)"],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": [], "rows": [], "tag": "INSERT 0 2" }]
+    },
+    {
+        "name": "select-after-insert",
+        "sql": "SELECT id, txt FROM harness_crud ORDER BY id",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_crud",
+            "CREATE TABLE harness_crud (id int, txt text)",
+            "INSERT INTO harness_crud VALUES (1, 'a'), (2, 'b')"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [
+            { "columns": ["id", "txt"], "rows": [["1", "a"], ["2", "b"]], "tag": "SELECT 2" }
+        ]
+    },
+    {
+        "name": "insert-returning",
+        "sql": "INSERT INTO harness_crud VALUES (7, 'seven') RETURNING id, txt",
+        "setup": ["DROP TABLE IF EXISTS harness_crud", "CREATE TABLE harness_crud (id int, txt text)"],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": ["id", "txt"], "rows": [["7", "seven"]], "tag": "INSERT 0 1" }]
+    },
+    {
+        "name": "update-one-row",
+        "sql": "UPDATE harness_crud SET txt = 'z' WHERE id = 1",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_crud",
+            "CREATE TABLE harness_crud (id int, txt text)",
+            "INSERT INTO harness_crud VALUES (1, 'a'), (2, 'b')"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": [], "rows": [], "tag": "UPDATE 1" }]
+    },
+    {
+        "name": "update-returning",
+        "sql": "UPDATE harness_crud SET txt = 'z' WHERE id = 1 RETURNING id, txt",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_crud",
+            "CREATE TABLE harness_crud (id int, txt text)",
+            "INSERT INTO harness_crud VALUES (1, 'a'), (2, 'b')"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": ["id", "txt"], "rows": [["1", "z"]], "tag": "UPDATE 1" }]
+    },
+    {
+        "name": "delete-one-row",
+        "sql": "DELETE FROM harness_crud WHERE id = 1",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_crud",
+            "CREATE TABLE harness_crud (id int, txt text)",
+            "INSERT INTO harness_crud VALUES (1, 'a'), (2, 'b')"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": [], "rows": [], "tag": "DELETE 1" }]
+    },
+    {
+        "name": "delete-returning",
+        "sql": "DELETE FROM harness_crud WHERE id = 2 RETURNING id",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_crud",
+            "CREATE TABLE harness_crud (id int, txt text)",
+            "INSERT INTO harness_crud VALUES (1, 'a'), (2, 'b')"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": ["id"], "rows": [["2"]], "tag": "DELETE 1" }]
+    },
+    {
+        "name": "delete-all-rows",
+        "sql": "DELETE FROM harness_crud",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_crud",
+            "CREATE TABLE harness_crud (id int, txt text)",
+            "INSERT INTO harness_crud VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": [], "rows": [], "tag": "DELETE 3" }]
+    },
+    {
+        "name": "truncate-table",
+        "sql": "TRUNCATE harness_crud",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_crud",
+            "CREATE TABLE harness_crud (id int, txt text)",
+            "INSERT INTO harness_crud VALUES (1, 'a')"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": [], "rows": [], "tag": "TRUNCATE TABLE" }]
+    },
+    {
+        "name": "insert-select-series",
+        "sql": "INSERT INTO harness_crud SELECT n, 'v' FROM generate_series(1, 3) AS n",
+        "setup": ["DROP TABLE IF EXISTS harness_crud", "CREATE TABLE harness_crud (id int, txt text)"],
+        "teardown": ["DROP TABLE IF EXISTS harness_crud"],
+        "expect": [{ "columns": [], "rows": [], "tag": "INSERT 0 3" }]
+    },
+    {
+        "name": "drop-table",
+        "sql": "DROP TABLE harness_crud",
+        "setup": ["DROP TABLE IF EXISTS harness_crud", "CREATE TABLE harness_crud (id int)"],
+        "expect": [{ "columns": [], "rows": [], "tag": "DROP TABLE" }]
+    },
+    {
+        "name": "begin-select-commit",
+        "sql": "BEGIN; SELECT 1 AS n; COMMIT",
+        "expect": [
+            { "columns": [], "rows": [], "tag": "BEGIN" },
+            { "columns": ["n"], "rows": [["1"]], "tag": "SELECT 1" },
+            { "columns": [], "rows": [], "tag": "COMMIT" }
+        ]
+    },
+    {
+        "name": "begin-select-rollback",
+        "sql": "BEGIN; SELECT 1 AS n; ROLLBACK",
+        "expect": [
+            { "columns": [], "rows": [], "tag": "BEGIN" },
+            { "columns": ["n"], "rows": [["1"]], "tag": "SELECT 1" },
+            { "columns": [], "rows": [], "tag": "ROLLBACK" }
+        ]
+    }
+]

@@ -1,0 +1,54 @@
+[
+    {
+        "name": "select-series-1000",
+        "sql": "SELECT generate_series(1, 1000) AS n",
+        "expectRows": 1000,
+        "first": "1",
+        "last": "1000",
+        "columns": ["n"],
+        "budgetMs": 5000
+    },
+    {
+        "name": "select-series-5000",
+        "sql": "SELECT generate_series(1, 5000) AS n",
+        "expectRows": 5000,
+        "first": "1",
+        "last": "5000",
+        "columns": ["n"],
+        "budgetMs": 8000
+    },
+    {
+        "name": "select-series-20000",
+        "sql": "SELECT generate_series(1, 20000) AS n",
+        "expectRows": 20000,
+        "first": "1",
+        "last": "20000",
+        "columns": ["n"],
+        "budgetMs": 15000
+    },
+    {
+        "name": "big-text-1mib",
+        "sql": "SELECT repeat('x', 1048576) AS s",
+        "expectRows": 1,
+        "columns": ["s"],
+        "valueLength": 1048576,
+        "budgetMs": 10000
+    },
+    {
+        "name": "bulk-insert-500",
+        "setup": ["DROP TABLE IF EXISTS harness_stress", "CREATE TABLE harness_stress (id int)"],
+        "teardown": ["DROP TABLE IF EXISTS harness_stress"],
+        "sql": "INSERT INTO harness_stress SELECT generate_series(1, 500); SELECT count(*) AS c FROM harness_stress",
+        "expectRows": 1,
+        "columns": ["c"],
+        "expectResults": 2,
+        "budgetMs": 8000
+    },
+    {
+        "name": "ten-statements",
+        "sql": "SELECT 1 AS n; SELECT 2 AS n; SELECT 3 AS n; SELECT 4 AS n; SELECT 5 AS n; SELECT 6 AS n; SELECT 7 AS n; SELECT 8 AS n; SELECT 9 AS n; SELECT 10 AS n",
+        "expectResults": 10,
+        "expectedValues": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+        "budgetMs": 5000
+    }
+]

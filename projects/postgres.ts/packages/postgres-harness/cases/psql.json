@@ -1,0 +1,256 @@
+{
+    "defaults": {
+        "host": "127.0.0.1",
+        "port": 5432,
+        "user": "postgres",
+        "database": "postgres",
+        "sql": "",
+        "headers": true,
+        "separator": "|",
+        "nullValue": ""
+    },
+    "parse": [
+        {
+            "name": "defaults-short-command",
+            "args": ["-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": "|", "nullValue": ""
+            }
+        },
+        {
+            "name": "all-short-flags",
+            "args": ["-h", "example.com", "-p", "6543", "-U", "alice", "-d", "app", "-c", "SELECT 1"],
+            "expect": {
+                "host": "example.com", "port": 6543, "user": "alice", "database": "app",
+                "sql": "SELECT 1", "headers": true, "separator": "|", "nullValue": ""
+            }
+        },
+        {
+            "name": "all-long-flags",
+            "args": ["--host", "h.example", "--port", "5433", "--username", "u", "--dbname", "d", "--command", "SELECT 2"],
+            "expect": {
+                "host": "h.example", "port": 5433, "user": "u", "database": "d",
+                "sql": "SELECT 2", "headers": true, "separator": "|", "nullValue": ""
+            }
+        },
+        {
+            "name": "tuples-only",
+            "args": ["-t", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": false, "separator": "|", "nullValue": ""
+            }
+        },
+        {
+            "name": "tuples-only-long",
+            "args": ["--tuples-only", "--command", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": false, "separator": "|", "nullValue": ""
+            }
+        },
+        {
+            "name": "field-separator-short",
+            "args": ["-F", ",", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": ",", "nullValue": ""
+            }
+        },
+        {
+            "name": "field-separator-long",
+            "args": ["--field-separator", "::", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": "::", "nullValue": ""
+            }
+        },
+        {
+            "name": "field-separator-empty",
+            "args": ["-F", "", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": "", "nullValue": ""
+            }
+        },
+        {
+            "name": "null-text-short",
+            "args": ["-P", "null=NULL", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": "|", "nullValue": "NULL"
+            }
+        },
+        {
+            "name": "null-text-long",
+            "args": ["--pset", "null=<null>", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": "|", "nullValue": "<null>"
+            }
+        },
+        {
+            "name": "null-text-empty-value",
+            "args": ["-P", "null=", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": "|", "nullValue": ""
+            }
+        },
+        {
+            "name": "combined-flags-order",
+            "args": ["-t", "-F", ",", "-P", "null=NULL", "-h", "h", "-p", "5432", "-U", "u", "-d", "d", "-c", "SELECT 1"],
+            "expect": {
+                "host": "h", "port": 5432, "user": "u", "database": "d",
+                "sql": "SELECT 1", "headers": false, "separator": ",", "nullValue": "NULL"
+            }
+        },
+        {
+            "name": "port-leading-zero",
+            "args": ["-p", "05432", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": "|", "nullValue": ""
+            }
+        },
+        {
+            "name": "port-lower-bound",
+            "args": ["-p", "1", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 1, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": "|", "nullValue": ""
+            }
+        },
+        {
+            "name": "port-upper-bound",
+            "args": ["-p", "65535", "-c", "SELECT 1"],
+            "expect": {
+                "host": "127.0.0.1", "port": 65535, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1", "headers": true, "separator": "|", "nullValue": ""
+            }
+        },
+        {
+            "name": "sql-with-semicolon",
+            "args": ["-c", "SELECT 1; SELECT 2"],
+            "expect": {
+                "host": "127.0.0.1", "port": 5432, "user": "postgres", "database": "postgres",
+                "sql": "SELECT 1; SELECT 2", "headers": true, "separator": "|", "nullValue": ""
+            }
+        }
+    ],
+    "parseErrors": [
+        { "name": "no-arguments", "args": [], "message": "a nonempty command, user and database are required" },
+        { "name": "missing-command-value", "args": ["-c"], "message": "invalid value for -c" },
+        { "name": "empty-command", "args": ["-c", ""], "message": "a nonempty command, user and database are required" },
+        { "name": "port-zero", "args": ["-p", "0", "-c", "SELECT 1"], "message": "invalid port" },
+        { "name": "port-too-large", "args": ["-p", "65536", "-c", "SELECT 1"], "message": "invalid port" },
+        { "name": "port-not-number", "args": ["-p", "abc", "-c", "SELECT 1"], "message": "invalid port" },
+        { "name": "port-fraction", "args": ["-p", "5432.5", "-c", "SELECT 1"], "message": "invalid port" },
+        { "name": "unknown-option", "args": ["--nope", "-c", "SELECT 1"], "message": "unsupported option '--nope'" },
+        { "name": "nul-in-host", "args": ["-h", "h\u0000", "-c", "SELECT 1"], "message": "invalid value for -h" },
+        { "name": "nul-in-sql", "args": ["-c", "SELECT 1\u0000"], "message": "invalid value for -c" },
+        { "name": "pset-without-prefix", "args": ["-P", "null", "-c", "SELECT 1"], "message": "only psql null output is configurable" },
+        { "name": "pset-other-setting", "args": ["-P", "x=y", "-c", "SELECT 1"], "message": "only psql null output is configurable" },
+        { "name": "pset-missing-value", "args": ["-P"], "message": "only psql null output is configurable" },
+        { "name": "separator-missing-value", "args": ["-F"], "message": "invalid value for -F" },
+        { "name": "empty-user", "args": ["-U", "", "-d", "d", "-c", "SELECT 1"], "message": "a nonempty command, user and database are required" },
+        { "name": "empty-database", "args": ["-d", "", "-c", "SELECT 1"], "message": "a nonempty command, user and database are required" },
+        { "name": "tuples-only-without-command", "args": ["-t"], "message": "a nonempty command, user and database are required" },
+        { "name": "unknown-double-dash", "args": ["--", "-c", "SELECT 1"], "message": "unsupported option '--'" },
+        { "name": "missing-host-value", "args": ["-h"], "message": "invalid value for -h" }
+    ],
+    "format": [
+        {
+            "name": "headers-and-rows",
+            "results": [{ "columns": [{ "name": "a" }, { "name": "b" }], "rows": [{ "values": ["1", "2"] }], "tag": "SELECT 1" }],
+            "options": {},
+            "expect": ["a|b", "1|2"]
+        },
+        {
+            "name": "null-default-empty",
+            "results": [{ "columns": [{ "name": "a" }, { "name": "b" }], "rows": [{ "values": ["1", null] }], "tag": "SELECT 1" }],
+            "options": {},
+            "expect": ["a|b", "1|"]
+        },
+        {
+            "name": "null-text-override",
+            "results": [{ "columns": [{ "name": "a" }, { "name": "b" }], "rows": [{ "values": ["1", null] }], "tag": "SELECT 1" }],
+            "options": { "nullValue": "NULL" },
+            "expect": ["a|b", "1|NULL"]
+        },
+        {
+            "name": "custom-separator",
+            "results": [{ "columns": [{ "name": "a" }, { "name": "b" }], "rows": [{ "values": ["1", "2"] }], "tag": "SELECT 1" }],
+            "options": { "separator": "," },
+            "expect": ["a,b", "1,2"]
+        },
+        {
+            "name": "multi-character-separator",
+            "results": [{ "columns": [{ "name": "a" }, { "name": "b" }], "rows": [{ "values": ["1", "2"] }], "tag": "SELECT 1" }],
+            "options": { "separator": "::" },
+            "expect": ["a::b", "1::2"]
+        },
+        {
+            "name": "empty-separator",
+            "results": [{ "columns": [{ "name": "a" }, { "name": "b" }], "rows": [{ "values": ["1", "2"] }], "tag": "SELECT 1" }],
+            "options": { "separator": "" },
+            "expect": ["ab", "12"]
+        },
+        {
+            "name": "tuples-only",
+            "results": [{ "columns": [{ "name": "a" }, { "name": "b" }], "rows": [{ "values": ["1", "2"] }], "tag": "SELECT 1" }],
+            "options": { "headers": false },
+            "expect": ["1|2"]
+        },
+        {
+            "name": "command-tag-with-headers",
+            "results": [{ "columns": [], "rows": [], "tag": "INSERT 0 1" }],
+            "options": {},
+            "expect": ["INSERT 0 1"]
+        },
+        {
+            "name": "command-tag-tuples-only",
+            "results": [{ "columns": [], "rows": [], "tag": "INSERT 0 1" }],
+            "options": { "headers": false },
+            "expect": []
+        },
+        {
+            "name": "two-result-sets",
+            "results": [
+                { "columns": [{ "name": "a" }], "rows": [{ "values": ["1"] }], "tag": "SELECT 1" },
+                { "columns": [{ "name": "b" }], "rows": [{ "values": ["2"] }], "tag": "SELECT 1" }
+            ],
+            "options": {},
+            "expect": ["a", "1", "b", "2"]
+        },
+        {
+            "name": "header-only-no-rows",
+            "results": [{ "columns": [{ "name": "a" }, { "name": "b" }], "rows": [], "tag": "SELECT 0" }],
+            "options": {},
+            "expect": ["a|b"]
+        },
+        {
+            "name": "unicode-cells",
+            "results": [{ "columns": [{ "name": "txt" }], "rows": [{ "values": ["中文"] }], "tag": "SELECT 1" }],
+            "options": {},
+            "expect": ["txt", "中文"]
+        },
+        {
+            "name": "empty-cell-value",
+            "results": [{ "columns": [{ "name": "a" }, { "name": "b" }], "rows": [{ "values": ["", "x"] }], "tag": "SELECT 1" }],
+            "options": {},
+            "expect": ["a|b", "|x"]
+        },
+        {
+            "name": "multi-row-multi-column",
+            "results": [{
+                "columns": [{ "name": "id" }, { "name": "txt" }],
+                "rows": [{ "values": ["1", "a"] }, { "values": ["2", null] }],
+                "tag": "SELECT 2"
+            }],
+            "options": { "nullValue": "?" },
+            "expect": ["id|txt", "1|a", "2|?"]
+        }
+    ]
+}

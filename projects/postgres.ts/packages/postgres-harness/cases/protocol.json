@@ -1,0 +1,187 @@
+{
+    "version": 196608,
+    "maxMessageBytes": 16777216,
+    "encodeStartup": [
+        {
+            "name": "startup-u-d",
+            "user": "u",
+            "database": "d",
+            "expectHex": "0000004f00030000757365720075006461746162617365006400636c69656e745f656e636f64696e670055544638006170706c69636174696f6e5f6e616d6500706f7374677265732d7073716c0000"
+        },
+        {
+            "name": "startup-postgres-postgres",
+            "user": "postgres",
+            "database": "postgres",
+            "expectHex": "0000005d000300007573657200706f73746772657300646174616261736500706f73746772657300636c69656e745f656e636f64696e670055544638006170706c69636174696f6e5f6e616d6500706f7374677265732d7073716c0000"
+        }
+    ],
+    "encodeQuery": [
+        {
+            "name": "query-select-one",
+            "sql": "SELECT 1",
+            "expectHex": "510000000d53454c454354203100"
+        },
+        {
+            "name": "query-empty",
+            "sql": "",
+            "expectHex": "510000000500"
+        },
+        {
+            "name": "query-two-statements",
+            "sql": "SELECT 1; SELECT 2",
+            "structural": true
+        },
+        {
+            "name": "query-unicode",
+            "sql": "SELECT '中文'",
+            "structural": true
+        }
+    ],
+    "decodeError": [
+        {
+            "name": "error-code-and-message",
+            "payloadHex": "534552524f5200433432503031004d72656c6174696f6e20226d697373696e672220646f6573206e6f742065786973740000",
+            "expect": { "code": "42P01", "message": "relation \"missing\" does not exist" }
+        },
+        {
+            "name": "error-missing-message",
+            "payloadHex": "4332333530350000",
+            "expect": { "code": "23505", "message": "PostgreSQL error" }
+        },
+        {
+            "name": "error-missing-code",
+            "payloadHex": "4d626f6f6d0000",
+            "expect": { "code": "unknown", "message": "boom" }
+        },
+        {
+            "name": "error-empty-payload",
+            "payloadHex": "",
+            "expect": { "code": "unknown", "message": "PostgreSQL error" }
+        },
+        {
+            "name": "error-malformed-field",
+            "payloadHex": "43",
+            "expectError": "malformed PostgreSQL error response"
+        }
+    ],
+    "decodeRowDescription": [
+        {
+            "name": "row-one-column",
+            "payloadHex": "00016f6e6500000000000000000000170004ffffffff0000",
+            "expect": ["one"]
+        },
+        {
+            "name": "row-two-columns",
+            "payloadHex": "00026100000000000000000000170004ffffffff00006200000000000000000000170004ffffffff0000",
+            "expect": ["a", "b"]
+        },
+        {
+            "name": "row-zero-columns",
+            "payloadHex": "0000",
+            "expect": []
+        },
+        {
+            "name": "row-binary-format",
+            "payloadHex": "00016100000000000000000000170004ffffffff0001",
+            "expectError": "binary PostgreSQL results are unsupported"
+        },
+        {
+            "name": "row-truncated-header",
+            "payloadHex": "00",
+            "expectError": "truncated RowDescription"
+        },
+        {
+            "name": "row-missing-name-terminator",
+            "payloadHex": "000161",
+            "expectError": "truncated column description"
+        },
+        {
+            "name": "row-trailing-bytes",
+            "payloadHex": "00016100000000000000000000170004ffffffff0000ff",
+            "expectError": "trailing RowDescription bytes"
+        }
+    ],
+    "decodeDataRow": [
+        {
+            "name": "data-row-text-and-null",
+            "columns": 2,
+            "payloadHex": "00020000000137ffffffff",
+            "expect": ["7", null]
+        },
+        {
+            "name": "data-row-zero-columns",
+            "columns": 0,
+            "payloadHex": "0000",
+            "expect": []
+        },
+        {
+            "name": "data-row-unicode",
+            "columns": 1,
+            "payloadHex": "000100000006e4b8ade69687",
+            "expect": ["中文"]
+        },
+        {
+            "name": "data-row-invalid-utf8",
+            "columns": 1,
+            "payloadHex": "00010000000180",
+            "expect": ["\ufffd"]
+        },
+        {
+            "name": "data-row-count-mismatch",
+            "columns": 3,
+            "payloadHex": "00020000000137ffffffff",
+            "expectError": "invalid DataRow column count"
+        },
+        {
+            "name": "data-row-empty-payload",
+            "columns": 1,
+            "payloadHex": "",
+            "expectError": "invalid DataRow column count"
+        },
+        {
+            "name": "data-row-negative-length",
+            "columns": 1,
+            "payloadHex": "0001fffffffe",
+            "expectError": "invalid DataRow length"
+        },
+        {
+            "name": "data-row-truncated-length",
+            "columns": 1,
+            "payloadHex": "0001000000",
+            "expectError": "truncated DataRow length"
+        },
+        {
+            "name": "data-row-trailing-bytes",
+            "columns": 1,
+            "payloadHex": "00010000000137ff",
+            "expectError": "trailing DataRow bytes"
+        }
+    ],
+    "decodeCommandTag": [
+        {
+            "name": "tag-select",
+            "payloadHex": "53454c454354203100",
+            "expect": "SELECT 1"
+        },
+        {
+            "name": "tag-insert",
+            "payloadHex": "494e534552542030203200",
+            "expect": "INSERT 0 2"
+        },
+        {
+            "name": "tag-empty-string",
+            "payloadHex": "00",
+            "expectError": "invalid CommandComplete"
+        },
+        {
+            "name": "tag-without-terminator",
+            "payloadHex": "53454c4543542031",
+            "expectError": "invalid CommandComplete"
+        },
+        {
+            "name": "tag-empty-payload",
+            "payloadHex": "",
+            "expectError": "invalid CommandComplete"
+        }
+    ]
+}

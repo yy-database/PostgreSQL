@@ -1,0 +1,19 @@
+{
+    "name": "@yydb/postgres-harness",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Acceptance harness for the PostgreSQL product; never published",
+    "license": "MPL-2.0",
+    "type": "module",
+    "bin": {
+        "postgres-harness": "./cli.mjs"
+    },
+    "scripts": {
+        "test": "node ./cli.mjs test"
+    },
+    "devDependencies": {
+        "@electric-sql/pglite": "0.5.15",
+        "@electric-sql/pglite-socket": "0.2.18",
+        "pg": "^8.16.0"
+    }
+}

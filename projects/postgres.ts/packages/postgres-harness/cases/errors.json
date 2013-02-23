@@ -1,0 +1,109 @@
+[
+    {
+        "name": "missing-table",
+        "sql": "SELECT * FROM harness_missing_table",
+        "code": "42P01",
+        "messageContains": "harness_missing_table"
+    },
+    {
+        "name": "syntax-error",
+        "sql": "SELEC 1",
+        "code": "42601",
+        "messageContains": "syntax error"
+    },
+    {
+        "name": "division-by-zero",
+        "sql": "SELECT 1 / 0",
+        "code": "22012",
+        "messageContains": "division by zero",
+        "recovery": true
+    },
+    {
+        "name": "undefined-column",
+        "sql": "SELECT nope FROM (VALUES (1)) AS t(id)",
+        "code": "42703",
+        "messageContains": "nope"
+    },
+    {
+        "name": "invalid-integer-input",
+        "sql": "SELECT 'abc'::int",
+        "code": "22P02",
+        "messageContains": "invalid input syntax for type integer"
+    },
+    {
+        "name": "undefined-function",
+        "sql": "SELECT harness_nope(1)",
+        "code": "42883",
+        "messageContains": "harness_nope"
+    },
+    {
+        "name": "unique-violation",
+        "sql": "INSERT INTO harness_unique VALUES (1)",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_unique",
+            "CREATE TABLE harness_unique (id int UNIQUE)",
+            "INSERT INTO harness_unique VALUES (1)"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_unique"],
+        "code": "23505",
+        "messageContains": "duplicate key value violates unique constraint"
+    },
+    {
+        "name": "not-null-violation",
+        "sql": "INSERT INTO harness_notnull VALUES (1, NULL)",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_notnull",
+            "CREATE TABLE harness_notnull (id int, txt text NOT NULL)"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_notnull"],
+        "code": "23502",
+        "messageContains": "null value in column \"txt\""
+    },
+    {
+        "name": "check-violation",
+        "sql": "INSERT INTO harness_check VALUES (0)",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_check",
+            "CREATE TABLE harness_check (id int CHECK (id > 0))"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_check"],
+        "code": "23514",
+        "messageContains": "violates check constraint"
+    },
+    {
+        "name": "duplicate-table",
+        "sql": "CREATE TABLE harness_dup (id int)",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_dup",
+            "CREATE TABLE harness_dup (id int)"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_dup"],
+        "code": "42P07",
+        "messageContains": "harness_dup"
+    },
+    {
+        "name": "duplicate-column",
+        "sql": "CREATE TABLE harness_dupeolumn (id int, id int)",
+        "setup": ["DROP TABLE IF EXISTS harness_dupeolumn"],
+        "teardown": ["DROP TABLE IF EXISTS harness_dupeolumn"],
+        "code": "42701",
+        "messageContains": "column \"id\" specified more than once"
+    },
+    {
+        "name": "drop-missing-table",
+        "sql": "DROP TABLE harness_absent_table",
+        "code": "42P01",
+        "messageContains": "harness_absent_table"
+    },
+    {
+        "name": "insert-type-mismatch",
+        "sql": "INSERT INTO harness_types VALUES ('abc')",
+        "setup": [
+            "DROP TABLE IF EXISTS harness_types",
+            "CREATE TABLE harness_types (id int)"
+        ],
+        "teardown": ["DROP TABLE IF EXISTS harness_types"],
+        "code": "22P02",
+        "messageContains": "invalid input syntax for type integer"
+    }
+]

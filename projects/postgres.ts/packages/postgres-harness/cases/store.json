@@ -1,0 +1,242 @@
+{
+    "shardFile": "postgres-0.yykv",
+    "catalogFile": "postgres-0.yyds",
+    "cases": [
+        {
+            "name": "empty-open",
+            "ops": [
+                { "op": "open" },
+                { "op": "expectFiles" },
+                { "op": "namespaces", "expectNamespaces": [] },
+                { "op": "len", "namespace": "public.empty", "expectLen": 0 },
+                { "op": "reopen" },
+                { "op": "expectFiles" },
+                { "op": "namespaces", "expectNamespaces": [] }
+            ]
+        },
+        {
+            "name": "put-and-get",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.users", "key": "u1", "value": "alice" },
+                { "op": "put", "namespace": "public.users", "key": "u2", "value": "bob" },
+                { "op": "get", "namespace": "public.users", "key": "u1", "expect": "alice" },
+                { "op": "get", "namespace": "public.users", "key": "u2", "expect": "bob" },
+                { "op": "get", "namespace": "public.users", "key": "u3", "expect": null },
+                { "op": "len", "namespace": "public.users", "expectLen": 2 },
+                { "op": "verifyShard", "nextRevision": 3, "records": [
+                    { "namespace": "public.users", "key": "u1", "value": "alice", "revision": 1 },
+                    { "namespace": "public.users", "key": "u2", "value": "bob", "revision": 2 }
+                ] }
+            ]
+        },
+        {
+            "name": "overwrite-keeps-one-record",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.users", "key": "u1", "value": "first" },
+                { "op": "put", "namespace": "public.users", "key": "u1", "value": "second" },
+                { "op": "get", "namespace": "public.users", "key": "u1", "expect": "second" },
+                { "op": "len", "namespace": "public.users", "expectLen": 1 },
+                { "op": "verifyShard", "nextRevision": 3, "records": [
+                    { "namespace": "public.users", "key": "u1", "value": "second", "revision": 2 }
+                ] }
+            ]
+        },
+        {
+            "name": "delete-report-and-miss",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.users", "key": "u1", "value": "alice" },
+                { "op": "delete", "namespace": "public.users", "key": "u1", "expectDeleted": true },
+                { "op": "get", "namespace": "public.users", "key": "u1", "expect": null },
+                { "op": "delete", "namespace": "public.users", "key": "u1", "expectDeleted": false },
+                { "op": "len", "namespace": "public.users", "expectLen": 0 }
+            ]
+        },
+        {
+            "name": "keys-with-prefix",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.fruit", "key": "banana", "value": "yellow" },
+                { "op": "put", "namespace": "public.fruit", "key": "apple", "value": "red" },
+                { "op": "put", "namespace": "public.fruit", "key": "apricot", "value": "orange" },
+                { "op": "keys", "namespace": "public.fruit", "prefix": "ap", "expectKeys": ["apple", "apricot"] },
+                { "op": "keys", "namespace": "public.fruit", "prefix": "", "expectKeys": ["apple", "apricot", "banana"] },
+                { "op": "keys", "namespace": "public.fruit", "prefix": "zz", "expectKeys": [] }
+            ]
+        },
+        {
+            "name": "scan-pairs",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.fruit", "key": "b", "value": "2" },
+                { "op": "put", "namespace": "public.fruit", "key": "a", "value": "1" },
+                { "op": "scan", "namespace": "public.fruit", "prefix": "", "expectPairs": [["a", "1"], ["b", "2"]] },
+                { "op": "scan", "namespace": "public.fruit", "prefix": "b", "expectPairs": [["b", "2"]] }
+            ]
+        },
+        {
+            "name": "namespaces-are-isolated",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "db1.users", "key": "id1", "value": "one" },
+                { "op": "put", "namespace": "db2.users", "key": "id1", "value": "two" },
+                { "op": "get", "namespace": "db1.users", "key": "id1", "expect": "one" },
+                { "op": "get", "namespace": "db2.users", "key": "id1", "expect": "two" },
+                { "op": "namespaces", "expectNamespaces": ["db1.users", "db2.users"] },
+                { "op": "len", "namespace": "db1.users", "expectLen": 1 },
+                { "op": "len", "namespace": "db2.users", "expectLen": 1 }
+            ]
+        },
+        {
+            "name": "reopen-persists-values",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.users", "key": "u1", "value": "alice" },
+                { "op": "reopen" },
+                { "op": "get", "namespace": "public.users", "key": "u1", "expect": "alice" },
+                { "op": "namespaces", "expectNamespaces": ["public.users"] },
+                { "op": "put", "namespace": "public.users", "key": "u2", "value": "bob" },
+                { "op": "get", "namespace": "public.users", "key": "u2", "expect": "bob" },
+                { "op": "verifyShard", "nextRevision": 3, "records": [
+                    { "namespace": "public.users", "key": "u1", "value": "alice", "revision": 1 },
+                    { "namespace": "public.users", "key": "u2", "value": "bob", "revision": 2 }
+                ] }
+            ]
+        },
+        {
+            "name": "flush-namespace",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.tmp", "key": "a", "value": "1" },
+                { "op": "put", "namespace": "public.tmp", "key": "b", "value": "2" },
+                { "op": "put", "namespace": "public.keep", "key": "c", "value": "3" },
+                { "op": "flush", "namespace": "public.tmp", "expectRemoved": 2 },
+                { "op": "keys", "namespace": "public.tmp", "prefix": "", "expectKeys": [] },
+                { "op": "len", "namespace": "public.tmp", "expectLen": 0 },
+                { "op": "namespaces", "expectNamespaces": ["public.keep"] },
+                { "op": "get", "namespace": "public.keep", "key": "c", "expect": "3" }
+            ]
+        },
+        {
+            "name": "shard-file-recovery",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.users", "key": "u1", "value": "alice" },
+                { "op": "reopen" },
+                { "op": "removeShard" },
+                { "op": "reopen" },
+                { "op": "namespaces", "expectNamespaces": [] },
+                { "op": "get", "namespace": "public.users", "key": "u1", "expect": null },
+                { "op": "put", "namespace": "public.users", "key": "u2", "value": "bob" },
+                { "op": "get", "namespace": "public.users", "key": "u2", "expect": "bob" }
+            ]
+        },
+        {
+            "name": "catalog-file-recovery",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.users", "key": "u1", "value": "alice" },
+                { "op": "removeCatalog" },
+                { "op": "reopen" },
+                { "op": "get", "namespace": "public.users", "key": "u1", "expect": "alice" },
+                { "op": "expectFiles" }
+            ]
+        },
+        {
+            "name": "corrupt-shard-magic",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeShard", "hex": "5a5a5a5a5a" },
+                { "op": "openExpectError", "expectError": "unknown .yykv header" }
+            ]
+        },
+        {
+            "name": "corrupt-shard-truncated",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeShard", "hex": "59594b5603" },
+                { "op": "openExpectError", "expectError": "truncated shard checksum" }
+            ]
+        },
+        {
+            "name": "corrupt-shard-checksum",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeShard", "hex": "59594b5603000000000000000000" },
+                { "op": "openExpectError", "expectError": ".yykv checksum mismatch" }
+            ]
+        },
+        {
+            "name": "legacy-shard-v2",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeShard", "hex": "59594b5602000000000000000000" },
+                { "op": "openExpectError", "expectError": "legacy .yykv v2 snapshot carries no checksum: delete the shard and let the node recreate it" }
+            ]
+        },
+        {
+            "name": "corrupt-catalog-magic",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "5a5a5a5a5a00000000" },
+                { "op": "openExpectError", "expectError": "unknown .yyds catalog header" }
+            ]
+        },
+        {
+            "name": "corrupt-catalog-version",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "5959445301010000000000000000000000" },
+                { "op": "openExpectError", "expectError": "catalog version requires regeneration" }
+            ]
+        },
+        {
+            "name": "corrupt-catalog-truncated",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "5959445301" },
+                { "op": "openExpectError", "expectError": "truncated catalog header" }
+            ]
+        },
+        {
+            "name": "unicode-keys-and-values",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.中文", "key": "键", "value": "值" },
+                { "op": "get", "namespace": "public.中文", "key": "键", "expect": "值" },
+                { "op": "keys", "namespace": "public.中文", "prefix": "键", "expectKeys": ["键"] },
+                { "op": "namespaces", "expectNamespaces": ["public.中文"] }
+            ]
+        },
+        {
+            "name": "namespace-validation",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "", "key": "k", "value": "v", "expectError": "namespace must not be empty" },
+                { "op": "put", "namespace": "public.\u0000bad", "key": "k", "value": "v", "expectError": "namespace must not contain a NUL byte" },
+                { "op": "len", "namespace": "public.ok", "expectLen": 0 }
+            ]
+        },
+        {
+            "name": "revision-stays-monotonic-across-reopen",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "public.seq", "key": "a", "value": "1" },
+                { "op": "put", "namespace": "public.seq", "key": "b", "value": "2" },
+                { "op": "reopen" },
+                { "op": "verifyShard", "nextRevision": 3, "records": [
+                    { "namespace": "public.seq", "key": "a", "value": "1", "revision": 1 },
+                    { "namespace": "public.seq", "key": "b", "value": "2", "revision": 2 }
+                ] },
+                { "op": "put", "namespace": "public.seq", "key": "c", "value": "3" },
+                { "op": "verifyShard", "nextRevision": 4, "records": [
+                    { "namespace": "public.seq", "key": "a", "value": "1", "revision": 1 },
+                    { "namespace": "public.seq", "key": "b", "value": "2", "revision": 2 },
+                    { "namespace": "public.seq", "key": "c", "value": "3", "revision": 3 }
+                ] }
+            ]
+        }
+    ]
+}
