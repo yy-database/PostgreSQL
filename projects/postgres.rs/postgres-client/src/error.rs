@@ -9,6 +9,8 @@ pub enum PostgresError {
     Server { code: String, message: String },
     /// The byte stream did not match the protocol contract.
     Protocol(String),
+    /// A feature this client deliberately refuses instead of degrading.
+    Unsupported(String),
 }
 
 impl PostgresError {
@@ -23,8 +25,16 @@ impl PostgresError {
     /// Human readable message without the code prefix.
     pub fn message(&self) -> &str {
         match self {
-            Self::Io(message) | Self::Protocol(message) => message,
+            Self::Io(message) | Self::Protocol(message) | Self::Unsupported(message) => message,
             Self::Server { message, .. } => message,
+        }
+    }
+
+    /// Feature name of an [`PostgresError::Unsupported`] rejection.
+    pub fn feature(&self) -> Option<&str> {
+        match self {
+            Self::Unsupported(feature) => Some(feature),
+            _ => None,
         }
     }
 }
@@ -34,6 +44,7 @@ impl fmt::Display for PostgresError {
         match self {
             Self::Io(message) | Self::Protocol(message) => formatter.write_str(message),
             Self::Server { code, message } => write!(formatter, "{code}: {message}"),
+            Self::Unsupported(feature) => write!(formatter, "unsupported: {feature}"),
         }
     }
 }

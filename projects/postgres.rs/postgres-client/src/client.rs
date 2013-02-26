@@ -65,9 +65,29 @@ impl QueryResult {
     }
 }
 
+/// A named prepared statement living on one connection's session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prepared {
+    /// Server-side statement name, unique per connection.
+    pub name: String,
+    /// Parameter OIDs the server resolved, in declaration order.
+    pub parameters: Vec<u32>,
+    /// Columns the statement returns; empty when it returns no row set.
+    pub columns: Vec<Column>,
+}
+
 /// A live protocol-v3 connection in the simple-query mode.
 pub struct Connection {
     stream: TcpStream,
+    session_tag: u32,
+    statements: u64,
+}
+
+/// Response of one extended-protocol round trip.
+struct ExtendedOutcome {
+    results: Vec<QueryResult>,
+    parameters: Vec<u32>,
+    described: Vec<Column>,
 }
 
 impl Connection {
@@ -83,7 +103,11 @@ impl Connection {
         stream.set_read_timeout(Some(TIMEOUT)).map_err(io_error)?;
         stream.set_write_timeout(Some(TIMEOUT)).map_err(io_error)?;
         stream.set_nodelay(true).map_err(io_error)?;
-        let mut connection = Self { stream };
+        let session_tag = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0);
+        let mut connection = Self { stream, session_tag, statements: 0 };
         connection.startup(config)?;
         Ok(connection)
     }
@@ -182,10 +206,147 @@ impl Connection {
         }
     }
 
-    /// Closes the socket on the wire instead of waiting for the process to exit.
-    pub fn close(mut self) -> Result<(), PostgresError> {
+    /// Runs one parameterised statement through the extended protocol using the
+    /// unnamed prepared statement, so nothing stays on the server afterwards.
+    pub fn execute_with_params(
+        &mut self,
+        sql: &str,
+        params: &[Option<&str>],
+        param_types: &[u32],
+    ) -> Result<Vec<QueryResult>, PostgresError> {
+        let mut packet = protocol::parse_packet("", sql, param_types)?;
+        packet.extend_from_slice(&protocol::bind_packet("", "", params, 0)?);
+        packet.extend_from_slice(&protocol::describe_packet(b'P', "")?);
+        packet.extend_from_slice(&protocol::execute_packet("", 0)?);
+        packet.extend_from_slice(&protocol::sync_packet());
+        Ok(self.read_extended(&packet)?.results)
+    }
+
+    /// Prepares a named statement and describes it in the same round trip.
+    pub fn prepare(&mut self, sql: &str, param_types: &[u32]) -> Result<Prepared, PostgresError> {
+        self.statements += 1;
+        let name = format!("pg_rs_{:08x}_{}", self.session_tag, self.statements);
+        let mut packet = protocol::parse_packet(&name, sql, param_types)?;
+        packet.extend_from_slice(&protocol::describe_packet(b'S', &name)?);
+        packet.extend_from_slice(&protocol::sync_packet());
+        let outcome = self.read_extended(&packet)?;
+        Ok(Prepared { name, parameters: outcome.parameters, columns: outcome.described })
+    }
+
+    /// Binds parameters to an existing prepared statement and executes it.
+    pub fn execute_prepared(&mut self, name: &str, params: &[Option<&str>]) -> Result<Vec<QueryResult>, PostgresError> {
+        let mut packet = protocol::bind_packet("", name, params, 0)?;
+        packet.extend_from_slice(&protocol::describe_packet(b'P', "")?);
+        packet.extend_from_slice(&protocol::execute_packet("", 0)?);
+        packet.extend_from_slice(&protocol::sync_packet());
+        Ok(self.read_extended(&packet)?.results)
+    }
+
+    /// Closes a prepared statement on the server. Closing an unknown name is a
+    /// no-op: the server answers CloseComplete either way.
+    pub fn close_prepared(&mut self, name: &str) -> Result<(), PostgresError> {
+        let mut packet = protocol::close_packet(b'S', name)?;
+        packet.extend_from_slice(&protocol::sync_packet());
+        let outcome = self.read_extended(&packet)?;
+        if !outcome.results.is_empty() {
+            return Err(PostgresError::Protocol("Close returned a result set".into()));
+        }
+        Ok(())
+    }
+
+    fn read_extended(&mut self, packet: &[u8]) -> Result<ExtendedOutcome, PostgresError> {
+        self.stream.write_all(packet).map_err(io_error)?;
+        let mut results = Vec::new();
+        let mut parameters = Vec::new();
+        let mut described = Vec::new();
+        let mut current: Option<(Vec<Column>, Vec<Vec<Option<String>>>)> = None;
+        let mut failure: Option<PostgresError> = None;
+        loop {
+            let (tag, payload) = self.read_message()?;
+            if failure.is_some() {
+                // After an error the server skips the rest of the batch and only
+                // sends ReadyForQuery, so drain it to keep the socket usable.
+                if tag == b'Z' {
+                    return Err(failure.expect("checked above"));
+                }
+                continue;
+            }
+            match tag {
+                b'1' | b'2' | b'3' => {
+                    if !payload.is_empty() {
+                        return Err(PostgresError::Protocol("invalid extended-protocol completion".into()));
+                    }
+                }
+                b't' => parameters = protocol::parameter_description(&payload)?,
+                b'T' => {
+                    if current.is_some() {
+                        return Err(PostgresError::Protocol("unexpected PostgreSQL RowDescription".into()));
+                    }
+                    let columns: Vec<Column> =
+                        protocol::column_names(&payload)?.into_iter().map(|name| Column { name }).collect();
+                    described = columns.clone();
+                    current = Some((columns, Vec::new()));
+                }
+                b'n' => {
+                    if current.is_some() {
+                        return Err(PostgresError::Protocol("unexpected PostgreSQL NoData".into()));
+                    }
+                    current = Some((Vec::new(), Vec::new()));
+                }
+                b'D' => {
+                    let Some((columns, rows)) = current.as_mut() else {
+                        return Err(PostgresError::Protocol("DataRow without RowDescription".into()));
+                    };
+                    rows.push(protocol::data_row(&payload, columns.len())?);
+                }
+                b'C' => {
+                    let command = protocol::command_tag(&payload)?;
+                    let (columns, rows) = current.take().unwrap_or_else(|| (described.clone(), Vec::new()));
+                    results.push(QueryResult { columns, rows, tag: command });
+                }
+                b'I' => {
+                    // An empty statement answers Describe with NoData and Execute
+                    // with EmptyQueryResponse, so clear that placeholder instead of
+                    // treating it as a result set.
+                    if !payload.is_empty() {
+                        return Err(PostgresError::Protocol("invalid EmptyQueryResponse".into()));
+                    }
+                    if let Some((columns, rows)) = current.take() {
+                        if !columns.is_empty() || !rows.is_empty() {
+                            return Err(PostgresError::Protocol("invalid EmptyQueryResponse".into()));
+                        }
+                    }
+                }
+                b's' => return Err(PostgresError::Unsupported("execute-row-limit".into())),
+                b'E' => failure = Some(protocol::error_response(&payload)),
+                b'Z' => {
+                    if payload.len() != 1 {
+                        return Err(PostgresError::Protocol("invalid ReadyForQuery".into()));
+                    }
+                    // A describe-only round trip (prepare) leaves the RowDescription
+                    // pending without a CommandComplete; that is not a result set.
+                    if let Some((_, rows)) = current.take() {
+                        if !rows.is_empty() {
+                            return Err(PostgresError::Protocol("PostgreSQL result ended before CommandComplete".into()));
+                        }
+                    }
+                    return Ok(ExtendedOutcome { results, parameters, described });
+                }
+                b'S' | b'K' | b'N' => {}
+                other => return Err(PostgresError::Protocol(format!("unsupported PostgreSQL response tag {other}"))),
+            }
+        }
+    }
+
+    /// Shuts the socket down without consuming the handle.
+    pub fn disconnect(&mut self) -> Result<(), PostgresError> {
         self.stream.flush().map_err(io_error)?;
         self.stream.shutdown(std::net::Shutdown::Both).map_err(io_error)
+    }
+
+    /// Closes the socket on the wire instead of waiting for the process to exit.
+    pub fn close(mut self) -> Result<(), PostgresError> {
+        self.disconnect()
     }
 
     fn read_message(&mut self) -> Result<(u8, Vec<u8>), PostgresError> {
