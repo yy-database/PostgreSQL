@@ -33,9 +33,25 @@ export interface ServerErrorInfo {
     message: string;
 }
 
-/** One socket in the simple-query protocol. */
+/** One named prepared statement on a live connection. */
+export interface PreparedStatement {
+    name(): string;
+    /** Parameter OIDs the server resolved, in declaration order. */
+    parameters(): number[];
+    /** Columns the statement returns; empty when it returns no row set. */
+    columns(): ColumnInfo[];
+    isClosed(): boolean;
+    execute(params: (string | null)[]): StatementResult[];
+    close(): void;
+}
+
+/** One socket in the protocol-v3 simple and extended query modes. */
 export interface Connection {
     execute(sql: string): StatementResult[];
+    executeWithParams(sql: string, params: (string | null)[], types: number[]): StatementResult[];
+    prepare(sql: string, types: number[]): PreparedStatement;
+    executePrepared(name: string, params: (string | null)[]): StatementResult[];
+    closePrepared(name: string): void;
     close(): void;
 }
 
@@ -80,6 +96,20 @@ export interface PostgresNative {
     decodeRowDescription(payload: Buffer): string[];
     decodeDataRow(payload: Buffer, columns: number): (string | null)[];
     decodeCommandTag(payload: Buffer): string;
+    encodeParseMessage(name: string, sql: string, paramTypes: number[]): Buffer;
+    encodeBindMessage(
+        portal: string,
+        statement: string,
+        params: (string | null)[],
+        resultFormat: number,
+    ): Buffer;
+    encodeDescribeMessage(target: 'statement' | 'portal', name: string): Buffer;
+    encodeExecuteMessage(portal: string, maxRows: number): Buffer;
+    encodeSyncMessage(): Buffer;
+    encodeCloseMessage(target: 'statement' | 'portal', name: string): Buffer;
+    decodeParameterDescription(payload: Buffer): number[];
+    parameterTypeOid(name: string): number | null;
+    encodeBytea(bytes: Buffer): string;
     parsePsqlArguments(args: string[]): CommandOptions;
     formatPsqlResults(results: StatementResult[], options: CommandOptions): string[];
     Store: new (dataDir: string) => Store;

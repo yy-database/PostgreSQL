@@ -8,6 +8,7 @@ export type {
     Connection,
     DataRow,
     PostgresNative,
+    PreparedStatement,
     ServerErrorInfo,
     StatementResult,
     Store,

@@ -6,6 +6,8 @@
 //! normalize one command line. No global state, no command loop and no server.
 //! Command lines and emulation compose these in Python.
 
+use std::sync::{Arc, Mutex};
+
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -139,28 +141,156 @@ pub struct StoreRow {
     value: Vec<u8>,
 }
 
-/// One socket in the simple-query protocol.
+/// One socket in the protocol-v3 simple and extended query modes.
 #[pyclass]
 pub struct Connection {
-    inner: Option<postgres_client::Connection>,
+    inner: Arc<Mutex<Option<postgres_client::Connection>>>,
 }
 
 #[pymethods]
 impl Connection {
     /// Runs one statement and returns every result set it produced.
-    fn execute(&mut self, sql: &str) -> PyResult<Vec<StatementResult>> {
-        let Some(connection) = self.inner.as_mut() else {
-            return Err(PostgresError::new_err("connection is closed"));
+    fn execute(&self, sql: &str) -> PyResult<Vec<StatementResult>> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
         };
         connection.execute(sql).map(|results| results.into_iter().map(statement).collect()).map_err(native)
     }
 
-    /// Shuts the socket down on the wire.
-    fn close(&mut self) -> PyResult<()> {
-        let Some(connection) = self.inner.take() else {
-            return Err(PostgresError::new_err("connection is closed"));
+    /// Runs one parameterised statement through an unnamed prepared statement.
+    /// `types` lists parameter OIDs; pass an empty list to let the server infer.
+    fn execute_with_params(
+        &self,
+        sql: &str,
+        params: Vec<Option<String>>,
+        types: Vec<u32>,
+    ) -> PyResult<Vec<StatementResult>> {
+        let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
         };
-        connection.close().map_err(native)
+        connection
+            .execute_with_params(sql, &values, &types)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Prepares a named statement and describes its parameters and columns.
+    fn prepare(&self, sql: &str, types: Vec<u32>) -> PyResult<PreparedStatement> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        let prepared = connection.prepare(sql, &types).map_err(native)?;
+        Ok(PreparedStatement {
+            connection: Arc::clone(&self.inner),
+            name: prepared.name,
+            parameters: prepared.parameters,
+            columns: prepared.columns.into_iter().map(|column| ColumnInfo { name: column.name }).collect(),
+            closed: false,
+        })
+    }
+
+    /// Executes a statement by server-side name. The name is not checked
+    /// locally, so a closed name surfaces the server error as-is.
+    fn execute_prepared(&self, name: &str, params: Vec<Option<String>>) -> PyResult<Vec<StatementResult>> {
+        let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        connection
+            .execute_prepared(name, &values)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Closes a prepared statement by server-side name.
+    fn close_prepared(&self, name: &str) -> PyResult<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        connection.close_prepared(name).map_err(native)
+    }
+
+    /// Shuts the socket down on the wire.
+    fn close(&self) -> PyResult<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(mut connection) = guard.take() else {
+            return Err(closed_error());
+        };
+        connection.disconnect().map_err(native)
+    }
+}
+
+/// One named prepared statement on a live connection.
+#[pyclass]
+pub struct PreparedStatement {
+    connection: Arc<Mutex<Option<postgres_client::Connection>>>,
+    name: String,
+    parameters: Vec<u32>,
+    columns: Vec<ColumnInfo>,
+    closed: bool,
+}
+
+#[pymethods]
+impl PreparedStatement {
+    /// Server-side statement name.
+    #[getter]
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// Parameter OIDs resolved by the server, in declaration order.
+    #[getter]
+    fn parameters(&self) -> Vec<u32> {
+        self.parameters.clone()
+    }
+
+    /// Columns the statement returns; empty when it returns no row set.
+    #[getter]
+    fn columns(&self) -> Vec<ColumnInfo> {
+        self.columns.clone()
+    }
+
+    /// Whether `close` already ran.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Binds parameters and runs the statement.
+    fn execute(&mut self, params: Vec<Option<String>>) -> PyResult<Vec<StatementResult>> {
+        if self.closed {
+            return Err(PostgresError::new_err("statement is closed"));
+        }
+        let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
+        let mut guard = self.connection.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        connection
+            .execute_prepared(&self.name, &values)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Closes the server-side statement. Calling it twice is a no-op.
+    fn close(&mut self) -> PyResult<()> {
+        if self.closed {
+            return Ok(());
+        }
+        {
+            let mut guard = self.connection.lock().map_err(|_| lock_error())?;
+            if let Some(connection) = guard.as_mut() {
+                connection.close_prepared(&self.name).map_err(native)?;
+            }
+        }
+        self.closed = true;
+        Ok(())
     }
 }
 
@@ -169,7 +299,7 @@ impl Connection {
 fn connect(host: &str, port: u16, user: &str, database: &str) -> PyResult<Connection> {
     let config = postgres_client::ClientConfig::new(host, port, user, database);
     postgres_client::Connection::open(&config)
-        .map(|inner| Connection { inner: Some(inner) })
+        .map(|inner| Connection { inner: Arc::new(Mutex::new(Some(inner))) })
         .map_err(native)
 }
 
@@ -228,6 +358,71 @@ fn decode_data_row(payload: Vec<u8>, columns: usize) -> PyResult<Vec<Option<Stri
 #[pyfunction]
 fn decode_command_tag(payload: Vec<u8>) -> PyResult<String> {
     postgres_client::protocol::command_tag(&payload).map_err(native)
+}
+
+/// Builds one extended-protocol `Parse` message. `param_types` holds OIDs;
+/// an empty list lets the server infer every parameter.
+#[pyfunction]
+fn encode_parse_message(name: &str, sql: &str, param_types: Vec<u32>) -> PyResult<Vec<u8>> {
+    postgres_client::protocol::parse_packet(name, sql, &param_types).map_err(native)
+}
+
+/// Builds one extended-protocol `Bind` message. Parameters are text values and
+/// `None` is SQL `NULL`. `result_format` must be `0`; binary results are refused.
+#[pyfunction]
+fn encode_bind_message(
+    portal: &str,
+    statement: &str,
+    params: Vec<Option<String>>,
+    result_format: u16,
+) -> PyResult<Vec<u8>> {
+    let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
+    postgres_client::protocol::bind_packet(portal, statement, &values, result_format).map_err(native)
+}
+
+/// Builds one extended-protocol `Describe` message for a statement or portal.
+#[pyfunction]
+fn encode_describe_message(target: &str, name: &str) -> PyResult<Vec<u8>> {
+    let kind = describe_target(target)?;
+    postgres_client::protocol::describe_packet(kind, name).map_err(native)
+}
+
+/// Builds one extended-protocol `Execute` message. `max_rows` must be `0`;
+/// partial execution is refused.
+#[pyfunction]
+fn encode_execute_message(portal: &str, max_rows: i32) -> PyResult<Vec<u8>> {
+    postgres_client::protocol::execute_packet(portal, max_rows).map_err(native)
+}
+
+/// Builds the `Sync` message that ends an extended-protocol round trip.
+#[pyfunction]
+fn encode_sync_message() -> Vec<u8> {
+    postgres_client::protocol::sync_packet()
+}
+
+/// Builds one extended-protocol `Close` message for a statement or portal.
+#[pyfunction]
+fn encode_close_message(target: &str, name: &str) -> PyResult<Vec<u8>> {
+    let kind = describe_target(target)?;
+    postgres_client::protocol::close_packet(kind, name).map_err(native)
+}
+
+/// Decodes the parameter OIDs of a `ParameterDescription`.
+#[pyfunction]
+fn decode_parameter_description(payload: Vec<u8>) -> PyResult<Vec<u32>> {
+    postgres_client::protocol::parameter_description(&payload).map_err(native)
+}
+
+/// OID of the named SQL type, or `None` when the mapping has no entry.
+#[pyfunction]
+fn parameter_type_oid(name: &str) -> Option<u32> {
+    postgres_client::protocol::parameter_type_oid(name)
+}
+
+/// Text-format `bytea` value: `\x` plus lowercase hexadecimal.
+#[pyfunction]
+fn encode_bytea(bytes: Vec<u8>) -> String {
+    postgres_client::protocol::encode_bytea(&bytes)
 }
 
 /// Parses the supported `psql` flags.
@@ -332,6 +527,22 @@ fn query_result(result: StatementResult) -> QueryResult {
     }
 }
 
+fn describe_target(target: &str) -> PyResult<u8> {
+    match target {
+        "statement" => Ok(b'S'),
+        "portal" => Ok(b'P'),
+        _ => Err(PostgresError::new_err("describe target must be S or P")),
+    }
+}
+
+fn lock_error() -> PyErr {
+    PostgresError::new_err("connection lock is poisoned")
+}
+
+fn closed_error() -> PyErr {
+    PostgresError::new_err("connection is closed")
+}
+
 fn native(error: CoreError) -> PyErr {
     PostgresError::new_err(error.to_string())
 }
@@ -339,6 +550,7 @@ fn native(error: CoreError) -> PyErr {
 #[pymodule]
 fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Connection>()?;
+    module.add_class::<PreparedStatement>()?;
     module.add_class::<ColumnInfo>()?;
     module.add_class::<StatementResult>()?;
     module.add_class::<PsqlOptions>()?;
@@ -355,6 +567,15 @@ fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(decode_row_description, module)?)?;
     module.add_function(wrap_pyfunction!(decode_data_row, module)?)?;
     module.add_function(wrap_pyfunction!(decode_command_tag, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_parse_message, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_bind_message, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_describe_message, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_execute_message, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_sync_message, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_close_message, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_parameter_description, module)?)?;
+    module.add_function(wrap_pyfunction!(parameter_type_oid, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_bytea, module)?)?;
     module.add_function(wrap_pyfunction!(parse_psql_arguments, module)?)?;
     module.add_function(wrap_pyfunction!(format_psql_results, module)?)?;
     Ok(())

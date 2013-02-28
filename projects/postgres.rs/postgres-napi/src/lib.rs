@@ -6,6 +6,8 @@
 //! normalize one command line. No global state, no command loop and no server.
 //! Command lines and emulation compose these in TypeScript.
 
+use std::sync::{Arc, Mutex};
+
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -23,6 +25,7 @@ pub struct ClientOptions {
 
 /// One column of a result set.
 #[napi(object)]
+#[derive(Clone)]
 pub struct ColumnInfo {
     pub name: String,
 }
@@ -68,32 +71,155 @@ pub struct CommandOptions {
     pub null_value: String,
 }
 
-/// One socket in the simple-query protocol.
+/// One socket in the protocol-v3 simple and extended query modes.
+///
+/// Every [`PreparedStatement`] of this connection shares the same session, so a
+/// statement can be executed after the connection handed it out.
 #[napi]
 pub struct Connection {
-    inner: Option<postgres_client::Connection>,
+    inner: Arc<Mutex<Option<postgres_client::Connection>>>,
 }
 
 #[napi]
 impl Connection {
     /// Runs one statement and returns every result set it produced.
     #[napi]
-    pub fn execute(&mut self, sql: String) -> Result<Vec<StatementResult>> {
-        let connection = self
-            .inner
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("connection is closed"))?;
+    pub fn execute(&self, sql: String) -> Result<Vec<StatementResult>> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
         connection.execute(&sql).map(|results| results.into_iter().map(statement).collect()).map_err(native)
+    }
+
+    /// Runs one parameterised statement through an unnamed prepared statement.
+    /// `types` lists parameter OIDs; pass an empty list to let the server infer.
+    #[napi]
+    pub fn execute_with_params(
+        &self,
+        sql: String,
+        params: Vec<Option<String>>,
+        types: Vec<u32>,
+    ) -> Result<Vec<StatementResult>> {
+        let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection
+            .execute_with_params(&sql, &values, &types)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Prepares a named statement and describes its parameters and columns.
+    #[napi]
+    pub fn prepare(&self, sql: String, types: Vec<u32>) -> Result<PreparedStatement> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        let prepared = connection.prepare(&sql, &types).map_err(native)?;
+        Ok(PreparedStatement {
+            connection: Arc::clone(&self.inner),
+            name: prepared.name,
+            parameters: prepared.parameters,
+            columns: prepared.columns.into_iter().map(|column| ColumnInfo { name: column.name }).collect(),
+            closed: false,
+        })
+    }
+
+    /// Executes a statement by server-side name. The name is not checked
+    /// locally, so a closed name surfaces the server error as-is.
+    #[napi]
+    pub fn execute_prepared(&self, name: String, params: Vec<Option<String>>) -> Result<Vec<StatementResult>> {
+        let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection
+            .execute_prepared(&name, &values)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Closes a prepared statement by server-side name.
+    #[napi]
+    pub fn close_prepared(&self, name: String) -> Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection.close_prepared(&name).map_err(native)
     }
 
     /// Shuts the socket down on the wire.
     #[napi]
+    pub fn close(&self) -> Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(mut connection) = guard.take() else {
+            return Err(closed_error());
+        };
+        connection.disconnect().map_err(native)
+    }
+}
+
+/// One named prepared statement on a live connection.
+#[napi]
+pub struct PreparedStatement {
+    connection: Arc<Mutex<Option<postgres_client::Connection>>>,
+    name: String,
+    parameters: Vec<u32>,
+    columns: Vec<ColumnInfo>,
+    closed: bool,
+}
+
+#[napi]
+impl PreparedStatement {
+    /// Server-side statement name.
+    #[napi]
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// Parameter OIDs resolved by the server, in declaration order.
+    #[napi]
+    pub fn parameters(&self) -> Vec<u32> {
+        self.parameters.clone()
+    }
+
+    /// Columns the statement returns; empty when it returns no row set.
+    #[napi]
+    pub fn columns(&self) -> Vec<ColumnInfo> {
+        self.columns.clone()
+    }
+
+    /// Whether `close` already ran.
+    #[napi]
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Binds parameters and runs the statement.
+    #[napi]
+    pub fn execute(&mut self, params: Vec<Option<String>>) -> Result<Vec<StatementResult>> {
+        if self.closed {
+            return Err(Error::from_reason("statement is closed"));
+        }
+        let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
+        let mut guard = self.connection.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection
+            .execute_prepared(&self.name, &values)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Closes the server-side statement. Calling it twice is a no-op.
+    #[napi]
     pub fn close(&mut self) -> Result<()> {
-        let connection = self
-            .inner
-            .take()
-            .ok_or_else(|| Error::from_reason("connection is closed"))?;
-        connection.close().map_err(native)
+        if self.closed {
+            return Ok(());
+        }
+        {
+            let mut guard = self.connection.lock().map_err(|_| lock_error())?;
+            if let Some(connection) = guard.as_mut() {
+                connection.close_prepared(&self.name).map_err(native)?;
+            }
+        }
+        self.closed = true;
+        Ok(())
     }
 }
 
@@ -102,7 +228,7 @@ impl Connection {
 pub fn connect(options: ClientOptions) -> Result<Connection> {
     let config = postgres_client::ClientConfig::new(options.host, options.port, options.user, options.database);
     postgres_client::Connection::open(&config)
-        .map(|inner| Connection { inner: Some(inner) })
+        .map(|inner| Connection { inner: Arc::new(Mutex::new(Some(inner))) })
         .map_err(native)
 }
 
@@ -163,6 +289,83 @@ pub fn decode_data_row(payload: Buffer, columns: u32) -> Result<Vec<Option<Strin
 #[napi]
 pub fn decode_command_tag(payload: Buffer) -> Result<String> {
     postgres_client::protocol::command_tag(payload.as_ref()).map_err(native)
+}
+
+/// Builds one extended-protocol `Parse` message. `paramTypes` holds OIDs;
+/// an empty list lets the server infer every parameter.
+#[napi]
+pub fn encode_parse_message(name: String, sql: String, param_types: Vec<u32>) -> Result<Buffer> {
+    postgres_client::protocol::parse_packet(&name, &sql, &param_types)
+        .map(Buffer::from)
+        .map_err(native)
+}
+
+/// Builds one extended-protocol `Bind` message. Parameters are text values and
+/// `null` is SQL `NULL`. `resultFormat` must be `0`; binary results are refused.
+#[napi]
+pub fn encode_bind_message(
+    portal: String,
+    statement: String,
+    params: Vec<Option<String>>,
+    result_format: u32,
+) -> Result<Buffer> {
+    let format = u16::try_from(result_format)
+        .map_err(|_| Error::from_reason("result format does not fit 16 bits"))?;
+    let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
+    postgres_client::protocol::bind_packet(&portal, &statement, &values, format)
+        .map(Buffer::from)
+        .map_err(native)
+}
+
+/// Builds one extended-protocol `Describe` message for a statement or portal.
+#[napi]
+pub fn encode_describe_message(target: String, name: String) -> Result<Buffer> {
+    let kind = describe_target(&target)?;
+    postgres_client::protocol::describe_packet(kind, &name)
+        .map(Buffer::from)
+        .map_err(native)
+}
+
+/// Builds one extended-protocol `Execute` message. `maxRows` must be `0`;
+/// partial execution is refused.
+#[napi]
+pub fn encode_execute_message(portal: String, max_rows: i32) -> Result<Buffer> {
+    postgres_client::protocol::execute_packet(&portal, max_rows)
+        .map(Buffer::from)
+        .map_err(native)
+}
+
+/// Builds the `Sync` message that ends an extended-protocol round trip.
+#[napi]
+pub fn encode_sync_message() -> Buffer {
+    Buffer::from(postgres_client::protocol::sync_packet())
+}
+
+/// Builds one extended-protocol `Close` message for a statement or portal.
+#[napi]
+pub fn encode_close_message(target: String, name: String) -> Result<Buffer> {
+    let kind = describe_target(&target)?;
+    postgres_client::protocol::close_packet(kind, &name)
+        .map(Buffer::from)
+        .map_err(native)
+}
+
+/// Decodes the parameter OIDs of a `ParameterDescription`.
+#[napi]
+pub fn decode_parameter_description(payload: Buffer) -> Result<Vec<u32>> {
+    postgres_client::protocol::parameter_description(payload.as_ref()).map_err(native)
+}
+
+/// OID of the named SQL type, or `null` when the mapping has no entry.
+#[napi]
+pub fn parameter_type_oid(name: String) -> Option<u32> {
+    postgres_client::protocol::parameter_type_oid(&name)
+}
+
+/// Text-format `bytea` value: `\x` plus lowercase hexadecimal.
+#[napi]
+pub fn encode_bytea(bytes: Buffer) -> String {
+    postgres_client::protocol::encode_bytea(bytes.as_ref())
 }
 
 /// Parses the supported `psql` flags.
@@ -311,6 +514,22 @@ impl From<CommandOptions> for PsqlOptions {
             null_value: options.null_value,
         }
     }
+}
+
+fn describe_target(target: &str) -> Result<u8> {
+    match target {
+        "statement" => Ok(b'S'),
+        "portal" => Ok(b'P'),
+        _ => Err(Error::from_reason("describe target must be S or P")),
+    }
+}
+
+fn lock_error() -> Error {
+    Error::from_reason("connection lock is poisoned")
+}
+
+fn closed_error() -> Error {
+    Error::from_reason("connection is closed")
 }
 
 fn native(error: PostgresError) -> Error {
