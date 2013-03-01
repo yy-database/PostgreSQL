@@ -1,0 +1,1960 @@
+{
+    "source": "PGlite 0.5.15 (real PostgreSQL backend) through the protocol-v3 extended path",
+    "messages": {
+        "encode": [
+            {
+                "name": "parse-empty",
+                "kind": "parse",
+                "name0": "",
+                "sql": "SELECT 1",
+                "types": [],
+                "expectHex": "50000000100053454c4543542031000000"
+            },
+            {
+                "name": "parse-typed",
+                "kind": "parse",
+                "name0": "",
+                "sql": "SELECT $1::int4, $2::text",
+                "types": [
+                    23,
+                    25
+                ],
+                "expectHex": "50000000290053454c4543542024313a3a696e74342c2024323a3a746578740000020000001700000019"
+            },
+            {
+                "name": "parse-named-unicode",
+                "kind": "parse",
+                "name0": "s1",
+                "sql": "SELECT 'héllo 世界'",
+                "types": [],
+                "expectHex": "500000002073310053454c454354202768c3a96c6c6f20e4b896e7958c27000000"
+            },
+            {
+                "name": "bind-empty",
+                "kind": "bind",
+                "portal": "",
+                "statement": "",
+                "params": [],
+                "resultFormat": 0,
+                "expectHex": "420000000c0000000000000000"
+            },
+            {
+                "name": "bind-null-and-text",
+                "kind": "bind",
+                "portal": "",
+                "statement": "",
+                "params": [
+                    null,
+                    "42"
+                ],
+                "resultFormat": 0,
+                "expectHex": "4200000016000000000002ffffffff0000000234320000"
+            },
+            {
+                "name": "bind-empty-and-unicode",
+                "kind": "bind",
+                "portal": "",
+                "statement": "",
+                "params": [
+                    "",
+                    "héllo 世界"
+                ],
+                "resultFormat": 0,
+                "expectHex": "4200000021000000000002000000000000000d68c3a96c6c6f20e4b896e7958c0000"
+            },
+            {
+                "name": "bind-named-portal",
+                "kind": "bind",
+                "portal": "p1",
+                "statement": "s1",
+                "params": [
+                    null
+                ],
+                "resultFormat": 0,
+                "expectHex": "420000001470310073310000000001ffffffff0000"
+            },
+            {
+                "name": "describe-statement",
+                "kind": "describe",
+                "target": "statement",
+                "name0": "s1",
+                "expectHex": "440000000853733100"
+            },
+            {
+                "name": "describe-portal",
+                "kind": "describe",
+                "target": "portal",
+                "name0": "",
+                "expectHex": "44000000065000"
+            },
+            {
+                "name": "execute-all-rows",
+                "kind": "execute",
+                "portal": "",
+                "maxRows": 0,
+                "expectHex": "45000000090000000000"
+            },
+            {
+                "name": "sync",
+                "kind": "sync",
+                "expectHex": "5300000004"
+            },
+            {
+                "name": "close-statement",
+                "kind": "close",
+                "target": "statement",
+                "name0": "s1",
+                "expectHex": "430000000853733100"
+            }
+        ],
+        "decode": [
+            {
+                "name": "no-parameters",
+                "payloadHex": "0000",
+                "expect": []
+            },
+            {
+                "name": "two-parameters",
+                "payloadHex": "000200000017000006a4",
+                "expect": [
+                    23,
+                    1700
+                ]
+            },
+            {
+                "name": "truncated",
+                "payloadHex": "000200000017",
+                "expectError": "invalid ParameterDescription length"
+            },
+            {
+                "name": "empty",
+                "payloadHex": "",
+                "expectError": "truncated ParameterDescription"
+            }
+        ],
+        "reject": [
+            {
+                "name": "binary-result-format",
+                "kind": "bind",
+                "portal": "",
+                "statement": "",
+                "params": [],
+                "resultFormat": 1,
+                "expectError": "unsupported: binary-result-format"
+            },
+            {
+                "name": "row-limit",
+                "kind": "execute",
+                "portal": "",
+                "maxRows": 5,
+                "expectError": "unsupported: execute-row-limit"
+            },
+            {
+                "name": "too-many-types",
+                "kind": "parse",
+                "count": 65536,
+                "expectError": "at most 65535 parameter types can be declared"
+            },
+            {
+                "name": "too-many-params",
+                "kind": "bind",
+                "count": 65536,
+                "expectError": "at most 65535 parameters can be bound"
+            },
+            {
+                "name": "bad-describe-target",
+                "kind": "describe",
+                "target": "x",
+                "name0": "s1",
+                "expectError": "describe target must be S or P"
+            },
+            {
+                "name": "negative-row-limit",
+                "kind": "execute",
+                "portal": "",
+                "maxRows": -1,
+                "expectError": "execute row limit cannot be negative"
+            }
+        ],
+        "types": [
+            {
+                "name": "bool",
+                "type": "bool",
+                "oid": 16
+            },
+            {
+                "name": "bytea",
+                "type": "bytea",
+                "oid": 17
+            },
+            {
+                "name": "int8",
+                "type": "int8",
+                "oid": 20
+            },
+            {
+                "name": "int2",
+                "type": "int2",
+                "oid": 21
+            },
+            {
+                "name": "int4",
+                "type": "int4",
+                "oid": 23
+            },
+            {
+                "name": "text",
+                "type": "text",
+                "oid": 25
+            },
+            {
+                "name": "float4",
+                "type": "float4",
+                "oid": 700
+            },
+            {
+                "name": "float8",
+                "type": "float8",
+                "oid": 701
+            },
+            {
+                "name": "numeric",
+                "type": "numeric",
+                "oid": 1700
+            },
+            {
+                "name": "date",
+                "type": "date",
+                "oid": 1082
+            },
+            {
+                "name": "timestamp",
+                "type": "timestamp",
+                "oid": 1114
+            },
+            {
+                "name": "timestamptz",
+                "type": "timestamptz",
+                "oid": 1184
+            },
+            {
+                "name": "unknown",
+                "type": "nope",
+                "oid": null
+            }
+        ],
+        "bytea": [
+            {
+                "name": "mixed-bytes",
+                "bytes": [
+                    0,
+                    65,
+                    255
+                ],
+                "expect": "\\x0041ff"
+            },
+            {
+                "name": "empty",
+                "bytes": [],
+                "expect": "\\x"
+            }
+        ]
+    },
+    "binding": [
+        {
+            "name": "int4",
+            "sql": "SELECT $1::int4 AS v",
+            "params": [
+                "42"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "42"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "int2",
+            "sql": "SELECT $1::int2 AS v",
+            "params": [
+                "-7"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "-7"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "int8",
+            "sql": "SELECT $1::int8 AS v",
+            "params": [
+                "9223372036854775807"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "9223372036854775807"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "float4",
+            "sql": "SELECT $1::float4 AS v",
+            "params": [
+                "1.5"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "1.5"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "float8",
+            "sql": "SELECT $1::float8 AS v",
+            "params": [
+                "1.5e300"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "1.5e+300"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "numeric",
+            "sql": "SELECT $1::numeric AS v",
+            "params": [
+                "1.234567890123456789"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "1.234567890123456789"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "text-unicode",
+            "sql": "SELECT $1::text AS v",
+            "params": [
+                "héllo 世界"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "héllo 世界"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "text-empty",
+            "sql": "SELECT $1::text AS v",
+            "params": [
+                ""
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            ""
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "bool-true",
+            "sql": "SELECT $1::bool AS v",
+            "params": [
+                "true"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "t"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "bool-false",
+            "sql": "SELECT $1::bool AS v",
+            "params": [
+                "false"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "f"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "null-int4",
+            "sql": "SELECT $1::int4 AS v",
+            "params": [
+                null
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            null
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "bytea",
+            "sql": "SELECT $1::bytea AS v",
+            "params": [
+                "\\x0041FF"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "\\x0041ff"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "date",
+            "sql": "SELECT $1::date AS v",
+            "params": [
+                "2024-02-29"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "2024-02-29"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "time",
+            "sql": "SELECT $1::time AS v",
+            "params": [
+                "12:34:56.789"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "12:34:56.789"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "timestamp",
+            "sql": "SELECT $1::timestamp AS v",
+            "params": [
+                "2024-02-29 12:34:56.789"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "2024-02-29 12:34:56.789"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "timestamptz",
+            "sql": "SELECT $1::timestamptz AS v",
+            "params": [
+                "2024-02-29 12:34:56.789+00"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "2024-02-29 12:34:56.789+00"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "varchar",
+            "sql": "SELECT $1::varchar AS v",
+            "params": [
+                "abc"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "abc"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "uuid",
+            "sql": "SELECT $1::uuid AS v",
+            "params": [
+                "0f8fad5b-d9cb-469f-a165-70867728950e"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "0f8fad5b-d9cb-469f-a165-70867728950e"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "jsonb",
+            "sql": "SELECT $1::jsonb AS v",
+            "params": [
+                "{\"a\":1,\"b\":[2,3]}"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "{\"a\": 1, \"b\": [2, 3]}"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "declared-int4",
+            "sql": "SELECT $1 AS v",
+            "params": [
+                "42"
+            ],
+            "types": [
+                "int4"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "42"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "declared-int8",
+            "sql": "SELECT $1 AS v",
+            "params": [
+                "9223372036854775807"
+            ],
+            "types": [
+                "int8"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "9223372036854775807"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "declared-bool",
+            "sql": "SELECT $1 AS v",
+            "params": [
+                "true"
+            ],
+            "types": [
+                "bool"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "t"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "declared-bytea",
+            "sql": "SELECT $1 AS v",
+            "params": [
+                "\\x0041FF"
+            ],
+            "types": [
+                "bytea"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "\\x0041ff"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "declared-text",
+            "sql": "SELECT $1 AS v",
+            "params": [
+                "héllo"
+            ],
+            "types": [
+                "text"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "héllo"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "declared-numeric",
+            "sql": "SELECT $1 AS v",
+            "params": [
+                "1.234567890123456789"
+            ],
+            "types": [
+                "numeric"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "1.234567890123456789"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "declared-timestamptz",
+            "sql": "SELECT $1 AS v",
+            "params": [
+                "2024-02-29 12:34:56.789+00"
+            ],
+            "types": [
+                "timestamptz"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "2024-02-29 12:34:56.789+00"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "two-values",
+            "sql": "SELECT $1::int4 + $2::int4 AS total",
+            "params": [
+                "2",
+                "3"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "total"
+                    ],
+                    "rows": [
+                        [
+                            "5"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "repeated-param",
+            "sql": "SELECT $1::int4 AS a, $1::int4 + 1 AS b",
+            "params": [
+                "5"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "a",
+                        "b"
+                    ],
+                    "rows": [
+                        [
+                            "5",
+                            "6"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "null-and-value",
+            "sql": "SELECT $1::text AS a, $2::int4 AS b",
+            "params": [
+                null,
+                "7"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "a",
+                        "b"
+                    ],
+                    "rows": [
+                        [
+                            null,
+                            "7"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "text-concat",
+            "sql": "SELECT $1::text || $2::text AS v",
+            "params": [
+                "ab",
+                "cd"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "abcd"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "gap-second",
+            "sql": "SELECT $2::text AS v",
+            "params": [
+                "a",
+                "b"
+            ],
+            "types": [
+                "text",
+                "text"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "b"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "gap-second-null",
+            "sql": "SELECT $2::text AS v",
+            "params": [
+                "a",
+                null
+            ],
+            "types": [
+                "text",
+                "text"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            null
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "gap-second-declared",
+            "sql": "SELECT $2 AS v",
+            "params": [
+                "a",
+                "b"
+            ],
+            "types": [
+                "text",
+                "text"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "b"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "gap-third",
+            "sql": "SELECT $3::int4 AS v",
+            "params": [
+                "a",
+                "b",
+                "9"
+            ],
+            "types": [
+                "text",
+                "text",
+                "int4"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "9"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "literal-lookalike",
+            "sql": "SELECT '$1' AS lit, $1::int4 AS bound",
+            "params": [
+                "7"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "lit",
+                        "bound"
+                    ],
+                    "rows": [
+                        [
+                            "$1",
+                            "7"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "dollar-quoted-lookalike",
+            "sql": "SELECT $$abc $1$$ AS lit, $1::int4 AS bound",
+            "params": [
+                "7"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "lit",
+                        "bound"
+                    ],
+                    "rows": [
+                        [
+                            "abc $1",
+                            "7"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "comment-lookalike",
+            "sql": "SELECT $1::int4 AS v /* $2 */",
+            "params": [
+                "3"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "3"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "untyped-select",
+            "sql": "SELECT $1 AS v",
+            "params": [
+                "x"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "v"
+                    ],
+                    "rows": [
+                        [
+                            "x"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        },
+        {
+            "name": "values-rows",
+            "sql": "SELECT * FROM (VALUES ($1::int4), ($2::int4)) AS t(x)",
+            "params": [
+                "1",
+                "2"
+            ],
+            "types": [],
+            "expect": [
+                {
+                    "columns": [
+                        "x"
+                    ],
+                    "rows": [
+                        [
+                            "1"
+                        ],
+                        [
+                            "2"
+                        ]
+                    ],
+                    "tag": "SELECT 2"
+                }
+            ]
+        },
+        {
+            "name": "empty-statement",
+            "sql": "",
+            "params": [],
+            "types": [],
+            "expect": []
+        },
+        {
+            "name": "insert-params",
+            "setup": [
+                "DROP TABLE IF EXISTS pg_param_case",
+                "CREATE TABLE pg_param_case (id int4 PRIMARY KEY, name text)"
+            ],
+            "sql": "INSERT INTO pg_param_case (id, name) VALUES ($1, $2)",
+            "params": [
+                "1",
+                "alice"
+            ],
+            "types": [],
+            "teardown": [
+                "DROP TABLE pg_param_case"
+            ],
+            "expect": [
+                {
+                    "columns": [],
+                    "rows": [],
+                    "tag": "INSERT 0 1"
+                }
+            ]
+        },
+        {
+            "name": "update-params",
+            "setup": [
+                "DROP TABLE IF EXISTS pg_param_case",
+                "CREATE TABLE pg_param_case (id int4 PRIMARY KEY, name text)",
+                "INSERT INTO pg_param_case VALUES (1, 'alice'), (2, 'bob')"
+            ],
+            "sql": "UPDATE pg_param_case SET name = $2 WHERE id = $1",
+            "params": [
+                "1",
+                "carol"
+            ],
+            "types": [],
+            "teardown": [
+                "DROP TABLE pg_param_case"
+            ],
+            "expect": [
+                {
+                    "columns": [],
+                    "rows": [],
+                    "tag": "UPDATE 1"
+                }
+            ]
+        },
+        {
+            "name": "delete-params",
+            "setup": [
+                "DROP TABLE IF EXISTS pg_param_case",
+                "CREATE TABLE pg_param_case (id int4 PRIMARY KEY, name text)",
+                "INSERT INTO pg_param_case VALUES (1, 'alice'), (2, 'bob')"
+            ],
+            "sql": "DELETE FROM pg_param_case WHERE id = $1",
+            "params": [
+                "2"
+            ],
+            "types": [],
+            "teardown": [
+                "DROP TABLE pg_param_case"
+            ],
+            "expect": [
+                {
+                    "columns": [],
+                    "rows": [],
+                    "tag": "DELETE 1"
+                }
+            ]
+        },
+        {
+            "name": "select-from-table",
+            "setup": [
+                "DROP TABLE IF EXISTS pg_param_case",
+                "CREATE TABLE pg_param_case (id int4 PRIMARY KEY, name text)",
+                "INSERT INTO pg_param_case VALUES (1, 'alice'), (2, 'bob')"
+            ],
+            "sql": "SELECT name FROM pg_param_case WHERE id = $1",
+            "params": [
+                "1"
+            ],
+            "types": [],
+            "teardown": [
+                "DROP TABLE pg_param_case"
+            ],
+            "expect": [
+                {
+                    "columns": [
+                        "name"
+                    ],
+                    "rows": [
+                        [
+                            "alice"
+                        ]
+                    ],
+                    "tag": "SELECT 1"
+                }
+            ]
+        }
+    ],
+    "errors": [
+        {
+            "name": "too-few",
+            "sql": "SELECT $1::int4, $2::int4",
+            "params": [
+                "1"
+            ],
+            "types": [],
+            "error": {
+                "code": "08P01",
+                "messageContains": "bind message supplies 1 parameters, but prepared statement \"\" requires 2"
+            }
+        },
+        {
+            "name": "too-many",
+            "sql": "SELECT $1::int4",
+            "params": [
+                "1",
+                "2"
+            ],
+            "types": [],
+            "error": {
+                "code": "08P01",
+                "messageContains": "bind message supplies 2 parameters, but prepared statement \"\" requires 1"
+            }
+        },
+        {
+            "name": "position-zero",
+            "sql": "SELECT $0::int4",
+            "params": [],
+            "types": [],
+            "error": {
+                "code": "42P02",
+                "messageContains": "there is no parameter $0"
+            }
+        },
+        {
+            "name": "position-negative",
+            "sql": "SELECT $-1::int4",
+            "params": [],
+            "types": [],
+            "error": {
+                "code": "42601",
+                "messageContains": "syntax error at or near \"$\""
+            }
+        },
+        {
+            "name": "position-huge",
+            "sql": "SELECT $100000::int4",
+            "params": [],
+            "types": [],
+            "error": {
+                "code": "42P18",
+                "messageContains": "could not determine data type of parameter $1"
+            }
+        },
+        {
+            "name": "literal-only",
+            "sql": "SELECT '$1' AS lit",
+            "params": [
+                "9"
+            ],
+            "types": [],
+            "error": {
+                "code": "08P01",
+                "messageContains": "bind message supplies 1 parameters, but prepared statement \"\" requires 0"
+            }
+        },
+        {
+            "name": "int4-mismatch",
+            "sql": "SELECT $1::int4",
+            "params": [
+                "abc"
+            ],
+            "types": [],
+            "error": {
+                "code": "22P02",
+                "messageContains": "invalid input syntax for type integer: \"abc\""
+            }
+        },
+        {
+            "name": "bool-mismatch",
+            "sql": "SELECT $1::bool",
+            "params": [
+                "maybe"
+            ],
+            "types": [],
+            "error": {
+                "code": "22P02",
+                "messageContains": "invalid input syntax for type boolean: \"maybe\""
+            }
+        },
+        {
+            "name": "int4-overflow",
+            "sql": "SELECT $1::int4",
+            "params": [
+                "9999999999"
+            ],
+            "types": [],
+            "error": {
+                "code": "22003",
+                "messageContains": "value \"9999999999\" is out of range for type integer"
+            }
+        },
+        {
+            "name": "date-invalid",
+            "sql": "SELECT $1::date",
+            "params": [
+                "2024-02-30"
+            ],
+            "types": [],
+            "error": {
+                "code": "22008",
+                "messageContains": "date/time field value out of range: \"2024-02-30\""
+            }
+        },
+        {
+            "name": "numeric-invalid",
+            "sql": "SELECT $1::numeric",
+            "params": [
+                "1.2.3"
+            ],
+            "types": [],
+            "error": {
+                "code": "22P02",
+                "messageContains": "invalid input syntax for type numeric: \"1.2.3\""
+            }
+        },
+        {
+            "name": "gap-undeclared",
+            "sql": "SELECT $2::text AS v",
+            "params": [],
+            "types": [],
+            "error": {
+                "code": "42P18",
+                "messageContains": "could not determine data type of parameter $1"
+            }
+        },
+        {
+            "name": "gap-too-few",
+            "sql": "SELECT $2::text AS v",
+            "params": [
+                "a"
+            ],
+            "types": [
+                "text",
+                "text"
+            ],
+            "error": {
+                "code": "08P01",
+                "messageContains": "bind message supplies 1 parameters, but prepared statement \"\" requires 2"
+            }
+        }
+    ],
+    "prepare": [
+        {
+            "name": "select-expression",
+            "sql": "SELECT $1::int4 + 1 AS v",
+            "types": [],
+            "expectParameters": [
+                23
+            ],
+            "expectColumns": [
+                "v"
+            ]
+        },
+        {
+            "name": "declared-parameter",
+            "sql": "SELECT $1 AS v",
+            "types": [
+                "text"
+            ],
+            "expectParameters": [
+                25
+            ],
+            "expectColumns": [
+                "v"
+            ]
+        },
+        {
+            "name": "gap-parameters",
+            "sql": "SELECT $2::text AS v",
+            "types": [
+                "text",
+                "text"
+            ],
+            "expectParameters": [
+                25,
+                25
+            ],
+            "expectColumns": [
+                "v"
+            ]
+        },
+        {
+            "name": "gap-declared",
+            "sql": "SELECT $2 AS v",
+            "types": [
+                "text",
+                "text"
+            ],
+            "expectParameters": [
+                25,
+                25
+            ],
+            "expectColumns": [
+                "v"
+            ]
+        },
+        {
+            "name": "no-parameters",
+            "sql": "SELECT 1 AS v",
+            "types": [],
+            "expectParameters": [],
+            "expectColumns": [
+                "v"
+            ]
+        },
+        {
+            "name": "empty-statement",
+            "sql": "",
+            "types": [],
+            "expectParameters": [],
+            "expectColumns": []
+        },
+        {
+            "name": "insert-without-result-set",
+            "setup": [
+                "DROP TABLE IF EXISTS pg_param_case",
+                "CREATE TABLE pg_param_case (id int4 PRIMARY KEY, name text)"
+            ],
+            "sql": "INSERT INTO pg_param_case (id) VALUES ($1)",
+            "types": [],
+            "teardown": [
+                "DROP TABLE pg_param_case"
+            ],
+            "expectParameters": [
+                23
+            ],
+            "expectColumns": []
+        },
+        {
+            "name": "inferred-text",
+            "sql": "SELECT $1 AS v",
+            "types": [],
+            "expectParameters": [
+                25
+            ],
+            "expectColumns": [
+                "v"
+            ]
+        },
+        {
+            "name": "multi-statement",
+            "sql": "SELECT 1; SELECT 2",
+            "types": [],
+            "expectError": {
+                "code": "42601",
+                "messageContains": "cannot insert multiple commands into a prepared statement"
+            }
+        }
+    ],
+    "lifecycle": [
+        {
+            "name": "repeated-and-closed",
+            "setup": [],
+            "teardown": [],
+            "ops": [
+                {
+                    "op": "prepare",
+                    "sql": "SELECT $1::int4 * 2 AS v",
+                    "types": [],
+                    "expectParameters": [
+                        23
+                    ],
+                    "expectColumns": [
+                        "v"
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 0,
+                    "params": [
+                        "21"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    "42"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 0,
+                    "params": [
+                        "4"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    "8"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 0,
+                    "params": [
+                        null
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    null
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "close",
+                    "stmt": 0
+                },
+                {
+                    "op": "close",
+                    "stmt": 0
+                },
+                {
+                    "op": "executeError",
+                    "stmt": 0,
+                    "params": [],
+                    "message": "statement is closed"
+                },
+                {
+                    "op": "executePreparedError",
+                    "stmt": 0,
+                    "params": [],
+                    "code": "26000",
+                    "messageContains": "does not exist"
+                },
+                {
+                    "op": "query",
+                    "sql": "SELECT 1 AS n",
+                    "expect": [
+                        {
+                            "columns": [
+                                "n"
+                            ],
+                            "rows": [
+                                [
+                                    "1"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "interleaved",
+            "setup": [],
+            "teardown": [],
+            "ops": [
+                {
+                    "op": "prepare",
+                    "sql": "SELECT $1::text || $2::text AS v",
+                    "types": [],
+                    "expectParameters": [
+                        25,
+                        25
+                    ],
+                    "expectColumns": [
+                        "v"
+                    ]
+                },
+                {
+                    "op": "prepare",
+                    "sql": "SELECT $1::int4 * 10 AS v",
+                    "types": [],
+                    "expectParameters": [
+                        23
+                    ],
+                    "expectColumns": [
+                        "v"
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 0,
+                    "params": [
+                        "x",
+                        "-a"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    "x-a"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 1,
+                    "params": [
+                        "4"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    "40"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 0,
+                    "params": [
+                        "y",
+                        "-b"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    "y-b"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 1,
+                    "params": [
+                        "12"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    "120"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "close",
+                    "stmt": 0
+                },
+                {
+                    "op": "close",
+                    "stmt": 1
+                }
+            ]
+        },
+        {
+            "name": "same-sql-twice",
+            "setup": [],
+            "teardown": [],
+            "ops": [
+                {
+                    "op": "prepare",
+                    "sql": "SELECT $1::int4 AS v",
+                    "types": [],
+                    "expectParameters": [
+                        23
+                    ],
+                    "expectColumns": [
+                        "v"
+                    ]
+                },
+                {
+                    "op": "prepare",
+                    "sql": "SELECT $1::int4 AS v",
+                    "types": [],
+                    "expectParameters": [
+                        23
+                    ],
+                    "expectColumns": [
+                        "v"
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 0,
+                    "params": [
+                        "1"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    "1"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 1,
+                    "params": [
+                        "2"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    "2"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "close",
+                    "stmt": 1
+                },
+                {
+                    "op": "execute",
+                    "stmt": 0,
+                    "params": [
+                        "3"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [
+                                "v"
+                            ],
+                            "rows": [
+                                [
+                                    "3"
+                                ]
+                            ],
+                            "tag": "SELECT 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "close",
+                    "stmt": 0
+                }
+            ]
+        },
+        {
+            "name": "dml-lifecycle",
+            "setup": [
+                "DROP TABLE IF EXISTS pg_param_life",
+                "CREATE TABLE pg_param_life (id int4 PRIMARY KEY, name text)"
+            ],
+            "teardown": [
+                "DROP TABLE pg_param_life"
+            ],
+            "ops": [
+                {
+                    "op": "prepare",
+                    "sql": "INSERT INTO pg_param_life (id, name) VALUES ($1, $2)",
+                    "types": [],
+                    "expectParameters": [
+                        23,
+                        25
+                    ],
+                    "expectColumns": []
+                },
+                {
+                    "op": "execute",
+                    "stmt": 0,
+                    "params": [
+                        "1",
+                        "alice"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [],
+                            "rows": [],
+                            "tag": "INSERT 0 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "execute",
+                    "stmt": 0,
+                    "params": [
+                        "2",
+                        "bob"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [],
+                            "rows": [],
+                            "tag": "INSERT 0 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "prepare",
+                    "sql": "UPDATE pg_param_life SET name = $2 WHERE id = $1",
+                    "types": [],
+                    "expectParameters": [
+                        23,
+                        25
+                    ],
+                    "expectColumns": []
+                },
+                {
+                    "op": "execute",
+                    "stmt": 1,
+                    "params": [
+                        "1",
+                        "carol"
+                    ],
+                    "expect": [
+                        {
+                            "columns": [],
+                            "rows": [],
+                            "tag": "UPDATE 1"
+                        }
+                    ]
+                },
+                {
+                    "op": "query",
+                    "sql": "SELECT name FROM pg_param_life ORDER BY id",
+                    "expect": [
+                        {
+                            "columns": [
+                                "name"
+                            ],
+                            "rows": [
+                                [
+                                    "carol"
+                                ],
+                                [
+                                    "bob"
+                                ]
+                            ],
+                            "tag": "SELECT 2"
+                        }
+                    ]
+                },
+                {
+                    "op": "close",
+                    "stmt": 0
+                },
+                {
+                    "op": "close",
+                    "stmt": 1
+                }
+            ]
+        },
+        {
+            "name": "close-unknown",
+            "setup": [],
+            "teardown": [],
+            "ops": [
+                {
+                    "op": "closeNamed",
+                    "name": "pg_missing_statement"
+                }
+            ]
+        }
+    ],
+    "leak": {
+        "sql": "SELECT $1::int4 AS v",
+        "types": [],
+        "boundParams": [
+            "7"
+        ],
+        "preparedDelta": 3,
+        "afterUnnamedDelta": 3,
+        "closedDelta": 0
+    }
+}

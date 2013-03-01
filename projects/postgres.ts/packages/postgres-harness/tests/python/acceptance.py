@@ -178,6 +178,275 @@ errors_executed = counters["executed"]
 connection.close()
 
 # -------------------------------------------------------------------------------
+# Parameter binding, extended-protocol frames and prepared statement lifecycle.
+# -------------------------------------------------------------------------------
+params = load_case("params.json")
+params_connection = native.connect(CONFIG["host"], CONFIG["port"], CONFIG["user"], CONFIG["database"])
+
+
+def type_oids(names):
+    oids = []
+    for name in names:
+        oid = native.parameter_type_oid(name)
+        if oid is None:
+            raise AssertionError(f"unknown parameter type {name}")
+        oids.append(oid)
+    return oids
+
+
+def split_error(message):
+    separator = message.find(": ")
+    return message[:separator] if separator > 0 else "client"
+
+
+def count_prepared():
+    results = params_connection.execute("SELECT count(*) AS n FROM pg_prepared_statements")
+    return int(results[0].rows[0][0])
+
+
+def encode_message(item):
+    kind = item["kind"]
+    if kind == "parse":
+        return native.encode_parse_message(item["name0"], item["sql"], item["types"])
+    if kind == "bind":
+        return native.encode_bind_message(item["portal"], item["statement"], item["params"], item["resultFormat"])
+    if kind == "describe":
+        return native.encode_describe_message(item["target"], item["name0"])
+    if kind == "execute":
+        return native.encode_execute_message(item["portal"], item["maxRows"])
+    if kind == "sync":
+        return native.encode_sync_message()
+    if kind == "close":
+        return native.encode_close_message(item["target"], item["name0"])
+    raise AssertionError(f"unknown message kind {kind}")
+
+
+def reject_message(item):
+    if "count" in item:
+        if item["kind"] == "parse":
+            return native.encode_parse_message("", "SELECT 1", [23] * item["count"])
+        return native.encode_bind_message("", "", [None] * item["count"], 0)
+    return encode_message(item)
+
+
+def expect_results(key, results, expected):
+    expect_equal(f"{key}/result-count", len(results), len(expected))
+    for index, entry in enumerate(expected):
+        result = results[index]
+        expect_equal(f"{key}/{index}/columns", result["columns"], entry["columns"])
+        expect_equal(f"{key}/{index}/rows", result["rows"], entry["rows"])
+        expect_equal(f"{key}/{index}/tag", result["tag"], entry["tag"])
+
+
+for item in params["messages"]["encode"]:
+    key = f"params/message/{item['name']}"
+    packet = to_bytes(encode_message(item))
+    actual[key] = {"hex": packet.hex(), "length": len(packet)}
+    expect_equal(f"{key}/bytes", packet.hex(), item["expectHex"])
+    expect_equal(f"{key}/length", len(packet), len(item["expectHex"]) // 2)
+    expect_equal(f"{key}/length-field", int.from_bytes(packet[1:5], "big"), len(packet) - 1)
+
+for item in params["messages"]["decode"]:
+    key = f"params/parameter-description/{item['name']}"
+    payload = bytes.fromhex(item["payloadHex"])
+    try:
+        oids = native.decode_parameter_description(payload)
+        actual[key] = {"oids": oids}
+        expect_equal(f"{key}/oids", oids, item["expect"])
+    except PostgresError as error:
+        actual[key] = {"error": str(error)}
+        expect_equal(f"{key}/error", str(error), item["expectError"])
+
+for item in params["messages"]["reject"]:
+    key = f"params/reject/{item['name']}"
+    raised = None
+    try:
+        reject_message(item)
+    except PostgresError as error:
+        raised = str(error)
+    actual[key] = {"error": raised}
+    expect_equal(f"{key}/error", raised, item["expectError"])
+
+for item in params["messages"]["types"]:
+    key = f"params/type-oid/{item['name']}"
+    oid = native.parameter_type_oid(item["type"])
+    actual[key] = oid
+    expect_equal(f"{key}/oid", oid, item["oid"])
+
+for item in params["messages"]["bytea"]:
+    key = f"params/bytea/{item['name']}"
+    encoded = native.encode_bytea(bytes(item["bytes"]))
+    actual[key] = encoded
+    expect_equal(f"{key}/text", encoded, item["expect"])
+
+for item in params["binding"]:
+    key = f"params/binding/{item['name']}"
+    try:
+        for statement in item.get("setup", []):
+            params_connection.execute(statement)
+        results = normalize(params_connection.execute_with_params(item["sql"], item["params"], type_oids(item["types"])))
+        actual[key] = results
+        expect_results(key, results, item["expect"])
+        for statement in item.get("teardown", []):
+            params_connection.execute(statement)
+    except Exception as error:  # noqa: BLE001
+        actual[key] = {"error": str(error)}
+        check(f"{key}/run", lambda error=error: (_ for _ in ()).throw(AssertionError(str(error))))
+
+for item in params["errors"]:
+    key = f"params/error/{item['name']}"
+    raised = None
+    try:
+        params_connection.execute_with_params(item["sql"], item["params"], type_oids(item["types"]))
+    except PostgresError as error:
+        raised = error
+    if raised is None:
+        actual[key] = {"error": "expected an error, none was raised"}
+        check(f"{key}/run", lambda: (_ for _ in ()).throw(AssertionError("expected an error, none was raised")))
+    else:
+        actual[key] = {"code": split_error(str(raised))}
+        expect_equal(f"{key}/code", split_error(str(raised)), item["error"]["code"])
+        check(
+            f"{key}/message",
+            lambda raised=raised: None if item["error"]["messageContains"] in str(raised) else (_ for _ in ()).throw(
+                AssertionError(f"expected '{item['error']['messageContains']}' in '{str(raised)}'")
+            ),
+        )
+        check(
+            f"{key}/recovery",
+            lambda: None
+            if normalize(params_connection.execute("SELECT 1 AS n"))[0]["rows"] == [["1"]]
+            else (_ for _ in ()).throw(AssertionError("recovery query did not return 1")),
+        )
+
+for item in params["prepare"]:
+    key = f"params/prepare/{item['name']}"
+    for statement in item.get("setup", []):
+        params_connection.execute(statement)
+    try:
+        prepared = params_connection.prepare(item["sql"], type_oids(item["types"]))
+        metadata = {"parameters": prepared.parameters, "columns": [column.name for column in prepared.columns]}
+        actual[key] = metadata
+        expect_equal(f"{key}/parameters", metadata["parameters"], item["expectParameters"])
+        expect_equal(f"{key}/columns", metadata["columns"], item["expectColumns"])
+        prepared.close()
+        expect_equal(f"{key}/closed", prepared.is_closed, True)
+    except PostgresError as error:
+        actual[key] = {"code": split_error(str(error))}
+        if "expectError" not in item:
+            check(f"{key}/run", lambda error=error: (_ for _ in ()).throw(AssertionError(str(error))))
+        else:
+            expect_equal(f"{key}/code", split_error(str(error)), item["expectError"]["code"])
+            check(
+                f"{key}/message",
+                lambda error=error: None if item["expectError"]["messageContains"] in str(error) else (_ for _ in ()).throw(
+                    AssertionError(f"expected '{item['expectError']['messageContains']}' in '{str(error)}'")
+                ),
+            )
+    for statement in item.get("teardown", []):
+        params_connection.execute(statement)
+
+for item in params["lifecycle"]:
+    for statement in item.get("setup", []):
+        params_connection.execute(statement)
+    statements = []
+    for index, op in enumerate(item["ops"]):
+        key = f"params/lifecycle/{item['name']}/{index}-{op['op']}"
+        try:
+            if op["op"] == "prepare":
+                prepared = params_connection.prepare(op["sql"], type_oids(op["types"]))
+                statements.append(prepared)
+                metadata = {"parameters": prepared.parameters, "columns": [column.name for column in prepared.columns]}
+                actual[key] = metadata
+                expect_equal(f"{key}/parameters", metadata["parameters"], op["expectParameters"])
+                expect_equal(f"{key}/columns", metadata["columns"], op["expectColumns"])
+            elif op["op"] == "execute":
+                results = normalize(statements[op["stmt"]].execute(op["params"]))
+                actual[key] = results
+                expect_results(key, results, op["expect"])
+            elif op["op"] == "close":
+                statements[op["stmt"]].close()
+                actual[key] = {"closed": statements[op["stmt"]].is_closed}
+                expect_equal(f"{key}/closed", statements[op["stmt"]].is_closed, True)
+            elif op["op"] == "executeError":
+                raised = None
+                try:
+                    statements[op["stmt"]].execute(op["params"])
+                except PostgresError as error:
+                    raised = str(error)
+                actual[key] = {"error": raised}
+                expect_equal(f"{key}/error", raised, op["message"])
+            elif op["op"] == "executePreparedError":
+                raised = None
+                try:
+                    params_connection.execute_prepared(statements[op["stmt"]].name, op["params"])
+                except PostgresError as error:
+                    raised = error
+                actual[key] = {"code": None if raised is None else split_error(str(raised))}
+                expect_equal(f"{key}/code", None if raised is None else split_error(str(raised)), op["code"])
+                check(
+                    f"{key}/message",
+                    lambda raised=raised: None if raised is not None and op["messageContains"] in str(raised) else (_ for _ in ()).throw(
+                        AssertionError(f"expected '{op['messageContains']}' in '{raised}'")
+                    ),
+                )
+            elif op["op"] == "closeNamed":
+                params_connection.close_prepared(op["name"])
+                actual[key] = {"closed": True}
+            elif op["op"] == "query":
+                results = normalize(params_connection.execute(op["sql"]))
+                actual[key] = results
+                expect_results(key, results, op["expect"])
+            else:
+                raise AssertionError(f"unknown lifecycle op {op['op']}")
+        except Exception as error:  # noqa: BLE001
+            actual[key] = {"error": str(error)}
+            check(f"{key}/run", lambda error=error: (_ for _ in ()).throw(AssertionError(str(error))))
+    for statement in item.get("teardown", []):
+        params_connection.execute(statement)
+
+# A statement outliving its connection fails locally instead of writing to a
+# closed socket.
+key = "params/lifecycle/connection-close"
+temporary = native.connect(CONFIG["host"], CONFIG["port"], CONFIG["user"], CONFIG["database"])
+prepared = temporary.prepare("SELECT $1::int4 AS v", [23])
+temporary.close()
+execute_error = None
+try:
+    prepared.execute(["1"])
+except PostgresError as error:
+    execute_error = str(error)
+prepare_error = None
+try:
+    temporary.prepare("SELECT 1", [])
+except PostgresError as error:
+    prepare_error = str(error)
+prepared.close()
+actual[key] = {"executeError": execute_error, "prepareError": prepare_error, "statementClosed": prepared.is_closed}
+expect_equal(f"{key}/execute", execute_error, "connection is closed")
+expect_equal(f"{key}/prepare", prepare_error, "connection is closed")
+expect_equal(f"{key}/closed", prepared.is_closed, True)
+
+# Unnamed one-shot statements never stay in `pg_prepared_statements`; named
+# ones do until they are closed.
+key = "params/leak"
+baseline = count_prepared()
+statements = [params_connection.prepare(params["leak"]["sql"], type_oids(params["leak"]["types"])) for _ in range(3)]
+prepared_delta = count_prepared() - baseline
+statements[0].execute(params["leak"]["boundParams"])
+after_unnamed_delta = count_prepared() - baseline
+for statement in statements:
+    statement.close()
+closed_delta = count_prepared() - baseline
+actual[key] = {"preparedDelta": prepared_delta, "afterUnnamedDelta": after_unnamed_delta, "closedDelta": closed_delta}
+expect_equal(f"{key}/prepared", prepared_delta, params["leak"]["preparedDelta"])
+expect_equal(f"{key}/unnamed", after_unnamed_delta, params["leak"]["afterUnnamedDelta"])
+expect_equal(f"{key}/closed", closed_delta, params["leak"]["closedDelta"])
+
+params_connection.close()
+params_executed = counters["executed"]
+
+# -------------------------------------------------------------------------------
 # Command line parsing and rendering.
 # -------------------------------------------------------------------------------
 psql = load_case("psql.json")
@@ -508,7 +777,8 @@ summary = {
     "sections": {
         "sql": sql_executed,
         "errors": errors_executed - sql_executed,
-        "cli": cli_executed - errors_executed,
+        "params": params_executed - errors_executed,
+        "cli": cli_executed - params_executed,
         "protocol": protocol_executed - cli_executed,
         "store": store_executed - protocol_executed,
         "stress": counters["executed"] - store_executed,

@@ -136,6 +136,325 @@ const errorsExecuted = counters.executed;
 connection.close();
 
 // -------------------------------------------------------------------------------
+// Parameter binding, extended-protocol frames and prepared statement lifecycle.
+// --------------------------------------------------------------------------
+const params = loadCase('params.json');
+const paramsConnection = native.connect(config);
+
+function typeOids(names) {
+    return names.map((name) => {
+        const oid = native.parameterTypeOid(name);
+        if (oid === null) throw new Error(`unknown parameter type ${name}`);
+        return oid;
+    });
+}
+
+function normalizeResults(results) {
+    return results.map((result) => ({
+        columns: result.columns.map((column) => column.name),
+        rows: result.rows.map((row) => row.values.map(text)),
+        tag: result.tag,
+    }));
+}
+
+function splitError(message) {
+    const separator = message.indexOf(': ');
+    return separator > 0 ? message.slice(0, separator) : 'client';
+}
+
+function countPrepared() {
+    const results = paramsConnection.execute('SELECT count(*) AS n FROM pg_prepared_statements');
+    return Number(results[0].rows[0].values[0]);
+}
+
+function encodeMessage(item) {
+    switch (item.kind) {
+        case 'parse':
+            return native.encodeParseMessage(item.name0, item.sql, item.types);
+        case 'bind':
+            return native.encodeBindMessage(item.portal, item.statement, item.params, item.resultFormat);
+        case 'describe':
+            return native.encodeDescribeMessage(item.target, item.name0);
+        case 'execute':
+            return native.encodeExecuteMessage(item.portal, item.maxRows);
+        case 'sync':
+            return native.encodeSyncMessage();
+        case 'close':
+            return native.encodeCloseMessage(item.target, item.name0);
+        default:
+            throw new Error(`unknown message kind ${item.kind}`);
+    }
+}
+
+function rejectMessage(item) {
+    if (item.count !== undefined) {
+        if (item.kind === 'parse') return native.encodeParseMessage('', 'SELECT 1', Array(item.count).fill(23));
+        return native.encodeBindMessage('', '', Array(item.count).fill(null), 0);
+    }
+    return encodeMessage(item);
+}
+
+for (const item of params.messages.encode) {
+    const key = `params/message/${item.name}`;
+    const packet = encodeMessage(item);
+    actual[key] = { hex: packet.toString('hex'), length: packet.length };
+    expectEqual(`${key}/bytes`, packet.toString('hex'), item.expectHex);
+    expectEqual(`${key}/length`, packet.length, item.expectHex.length / 2);
+    expectEqual(`${key}/length-field`, packet.readUInt32BE(1), packet.length - 1);
+}
+
+for (const item of params.messages.decode) {
+    const key = `params/parameter-description/${item.name}`;
+    const payload = Buffer.from(item.payloadHex, 'hex');
+    try {
+        const oids = native.decodeParameterDescription(payload);
+        actual[key] = { oids };
+        expectEqual(`${key}/oids`, oids, item.expect);
+    } catch (error) {
+        actual[key] = { error: error.message };
+        expectEqual(`${key}/error`, error.message, item.expectError);
+    }
+}
+
+for (const item of params.messages.reject) {
+    const key = `params/reject/${item.name}`;
+    let raised = null;
+    try {
+        rejectMessage(item);
+    } catch (error) {
+        raised = error.message;
+    }
+    actual[key] = { error: raised };
+    expectEqual(`${key}/error`, raised, item.expectError);
+}
+
+for (const item of params.messages.types) {
+    const key = `params/type-oid/${item.name}`;
+    const oid = native.parameterTypeOid(item.type);
+    actual[key] = oid;
+    expectEqual(`${key}/oid`, oid, item.oid);
+}
+
+for (const item of params.messages.bytea) {
+    const key = `params/bytea/${item.name}`;
+    const encoded = native.encodeBytea(Buffer.from(item.bytes));
+    actual[key] = encoded;
+    expectEqual(`${key}/text`, encoded, item.expect);
+}
+
+for (const item of params.binding) {
+    const key = `params/binding/${item.name}`;
+    try {
+        for (const statement of item.setup ?? []) paramsConnection.execute(statement);
+        const results = normalizeResults(paramsConnection.executeWithParams(item.sql, item.params, typeOids(item.types)));
+        actual[key] = results;
+        expectEqual(`${key}/result-count`, results.length, item.expect.length);
+        item.expect.forEach((expected, index) => {
+            expectEqual(`${key}/${index}/columns`, results[index]?.columns, expected.columns);
+            expectEqual(`${key}/${index}/rows`, results[index]?.rows, expected.rows);
+            expectEqual(`${key}/${index}/tag`, results[index]?.tag, expected.tag);
+        });
+        for (const statement of item.teardown ?? []) paramsConnection.execute(statement);
+    } catch (error) {
+        actual[key] = { error: error.message };
+        check(`${key}/run`, () => {
+            throw new Error(error.message);
+        });
+    }
+}
+
+for (const item of params.errors) {
+    const key = `params/error/${item.name}`;
+    let raised = null;
+    try {
+        paramsConnection.executeWithParams(item.sql, item.params, typeOids(item.types));
+    } catch (error) {
+        raised = error;
+    }
+    if (!raised) {
+        actual[key] = { error: 'expected an error, none was raised' };
+        check(`${key}/run`, () => {
+            throw new Error('expected an error, none was raised');
+        });
+    } else {
+        actual[key] = { code: splitError(raised.message) };
+        expectEqual(`${key}/code`, splitError(raised.message), item.error.code);
+        check(`${key}/message`, () => {
+            if (!raised.message.includes(item.error.messageContains)) {
+                throw new Error(`expected '${item.error.messageContains}' in '${raised.message}'`);
+            }
+        });
+        check(`${key}/recovery`, () => {
+            const rows = normalizeResults(paramsConnection.execute('SELECT 1 AS n'))[0].rows;
+            if (!same(rows, [['1']])) throw new Error(`recovery returned ${JSON.stringify(rows)}`);
+        });
+    }
+}
+
+for (const item of params.prepare) {
+    const key = `params/prepare/${item.name}`;
+    for (const statement of item.setup ?? []) paramsConnection.execute(statement);
+    try {
+        const prepared = paramsConnection.prepare(item.sql, typeOids(item.types));
+        const metadata = { parameters: prepared.parameters(), columns: prepared.columns().map((column) => column.name) };
+        actual[key] = metadata;
+        expectEqual(`${key}/parameters`, metadata.parameters, item.expectParameters);
+        expectEqual(`${key}/columns`, metadata.columns, item.expectColumns);
+        prepared.close();
+        expectEqual(`${key}/closed`, prepared.isClosed(), true);
+    } catch (error) {
+        actual[key] = { code: splitError(error.message) };
+        if (!item.expectError) {
+            check(`${key}/run`, () => {
+                throw new Error(error.message);
+            });
+        } else {
+            expectEqual(`${key}/code`, splitError(error.message), item.expectError.code);
+            check(`${key}/message`, () => {
+                if (!error.message.includes(item.expectError.messageContains)) {
+                    throw new Error(`expected '${item.expectError.messageContains}' in '${error.message}'`);
+                }
+            });
+        }
+    }
+    for (const statement of item.teardown ?? []) paramsConnection.execute(statement);
+}
+
+function expectResults(key, results, expected) {
+    expectEqual(`${key}/result-count`, results.length, expected.length);
+    expected.forEach((entry, index) => {
+        expectEqual(`${key}/${index}/columns`, results[index]?.columns, entry.columns);
+        expectEqual(`${key}/${index}/rows`, results[index]?.rows, entry.rows);
+        expectEqual(`${key}/${index}/tag`, results[index]?.tag, entry.tag);
+    });
+}
+
+for (const item of params.lifecycle) {
+    for (const statement of item.setup ?? []) paramsConnection.execute(statement);
+    const statements = [];
+    item.ops.forEach((op, index) => {
+        const key = `params/lifecycle/${item.name}/${index}-${op.op}`;
+        try {
+            switch (op.op) {
+                case 'prepare': {
+                    const prepared = paramsConnection.prepare(op.sql, typeOids(op.types));
+                    statements.push(prepared);
+                    const metadata = { parameters: prepared.parameters(), columns: prepared.columns().map((column) => column.name) };
+                    actual[key] = metadata;
+                    expectEqual(`${key}/parameters`, metadata.parameters, op.expectParameters);
+                    expectEqual(`${key}/columns`, metadata.columns, op.expectColumns);
+                    break;
+                }
+                case 'execute': {
+                    const results = normalizeResults(statements[op.stmt].execute(op.params));
+                    actual[key] = results;
+                    expectResults(key, results, op.expect);
+                    break;
+                }
+                case 'close': {
+                    statements[op.stmt].close();
+                    actual[key] = { closed: statements[op.stmt].isClosed() };
+                    expectEqual(`${key}/closed`, statements[op.stmt].isClosed(), true);
+                    break;
+                }
+                case 'executeError': {
+                    let raised = null;
+                    try {
+                        statements[op.stmt].execute(op.params);
+                    } catch (error) {
+                        raised = error.message;
+                    }
+                    actual[key] = { error: raised };
+                    expectEqual(`${key}/error`, raised, op.message);
+                    break;
+                }
+                case 'executePreparedError': {
+                    let raised = null;
+                    try {
+                        paramsConnection.executePrepared(statements[op.stmt].name(), op.params);
+                    } catch (error) {
+                        raised = error;
+                    }
+                    actual[key] = { code: raised === null ? null : splitError(raised.message) };
+                    expectEqual(`${key}/code`, raised === null ? null : splitError(raised.message), op.code);
+                    check(`${key}/message`, () => {
+                        if (raised === null || !raised.message.includes(op.messageContains)) {
+                            throw new Error(`expected '${op.messageContains}' in '${raised?.message}'`);
+                        }
+                    });
+                    break;
+                }
+                case 'closeNamed': {
+                    paramsConnection.closePrepared(op.name);
+                    actual[key] = { closed: true };
+                    break;
+                }
+                case 'query': {
+                    const results = normalizeResults(paramsConnection.execute(op.sql));
+                    actual[key] = results;
+                    expectResults(key, results, op.expect);
+                    break;
+                }
+                default:
+                    throw new Error(`unknown lifecycle op ${op.op}`);
+            }
+        } catch (error) {
+            actual[key] = { error: error.message };
+            check(`${key}/run`, () => {
+                throw new Error(error.message);
+            });
+        }
+    });
+    for (const statement of item.teardown ?? []) paramsConnection.execute(statement);
+}
+
+// A statement outliving its connection fails locally instead of writing to a
+// closed socket.
+{
+    const key = 'params/lifecycle/connection-close';
+    const temporary = native.connect(config);
+    const prepared = temporary.prepare('SELECT $1::int4 AS v', [23]);
+    temporary.close();
+    let executeError = null;
+    try {
+        prepared.execute(['1']);
+    } catch (error) {
+        executeError = error.message;
+    }
+    let prepareError = null;
+    try {
+        temporary.prepare('SELECT 1', []);
+    } catch (error) {
+        prepareError = error.message;
+    }
+    prepared.close();
+    actual[key] = { executeError, prepareError, statementClosed: prepared.isClosed() };
+    expectEqual(`${key}/execute`, executeError, 'connection is closed');
+    expectEqual(`${key}/prepare`, prepareError, 'connection is closed');
+    expectEqual(`${key}/closed`, prepared.isClosed(), true);
+}
+
+// Unnamed one-shot statements never stay in `pg_prepared_statements`; named
+// ones do until they are closed.
+{
+    const key = 'params/leak';
+    const baseline = countPrepared();
+    const statements = [0, 1, 2].map(() => paramsConnection.prepare(params.leak.sql, typeOids(params.leak.types)));
+    const preparedDelta = countPrepared() - baseline;
+    statements[0].execute(params.leak.boundParams);
+    const afterUnnamedDelta = countPrepared() - baseline;
+    for (const statement of statements) statement.close();
+    const closedDelta = countPrepared() - baseline;
+    actual[key] = { preparedDelta, afterUnnamedDelta, closedDelta };
+    expectEqual(`${key}/prepared`, preparedDelta, params.leak.preparedDelta);
+    expectEqual(`${key}/unnamed`, afterUnnamedDelta, params.leak.afterUnnamedDelta);
+    expectEqual(`${key}/closed`, closedDelta, params.leak.closedDelta);
+}
+
+paramsConnection.close();
+const paramsExecuted = counters.executed;
+
+// -------------------------------------------------------------------------------
 // Command line parsing and rendering.
 // --------------------------------------------------------------------------
 const psql = loadCase('psql.json');
@@ -490,7 +809,8 @@ const summary = {
     sections: {
         sql: sqlExecuted,
         errors: errorsExecuted - sqlExecuted,
-        cli: cliExecuted - errorsExecuted,
+        params: paramsExecuted - errorsExecuted,
+        cli: cliExecuted - paramsExecuted,
         protocol: protocolExecuted - cliExecuted,
         store: storeExecuted - protocolExecuted,
         stress: counters.executed - storeExecuted,
