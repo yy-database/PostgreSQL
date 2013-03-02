@@ -1,10 +1,12 @@
 //! `.yyds` catalog plus `.yykv` shard persistence.
 //!
-//! The layout is fixed and versioned so callers can verify it byte by byte:
+//! The catalog is the shared contract-layout codec from `yyds-formats` (the
+//! same bytes Redis and MongoDB write): magic `YYDS\x01`, little-endian
+//! version, schema slot, routing slot, shard registrations, resolved contract
+//! and owners. The catalog owns the shard id: `<id>.yykv` next to it.
 //!
-//! `.yyds` (big endian): magic `YYDS\x01`, version `u32`, schema `u32`,
-//! shard count `u32`, shard id length `u32` with the id bytes, then two zero
-//! `u32` terminators.
+//! Legacy big-endian PostgreSQL catalogs (`postgres-0.yyds`) are rejected
+//! explicitly; they are never sniffed or guessed.
 //!
 //! `.yykv` (little endian): magic `YYKV\x03`, FNV-1a checksum `u64` over the
 //! body, then `next_revision u64`, record count `u32`, and records made of
@@ -17,15 +19,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use yyds_formats::{decode_catalog, encode_catalog, CATALOG_MAGIC};
+use yyds_types::{Error as YydsError, ShardId};
+
 use crate::error::PostgresError;
 
 const SHARD_MAGIC: &[u8] = b"YYKV\x03";
 const LEGACY_SHARD_MAGIC: &[u8] = b"YYKV\x02";
-const CATALOG_MAGIC: &[u8] = b"YYDS\x01";
-const CATALOG_VERSION: u32 = 0;
-const SHARD_ID: &str = "postgres-0";
-const SHARD_FILE: &str = "postgres-0.yykv";
-const CATALOG_FILE: &str = "postgres-0.yyds";
+const DEFAULT_SHARD_ID: &str = "local-0";
+const CATALOG_FILE: &str = "local-0.yyds";
+const LEGACY_CATALOG_FILE: &str = "postgres-0.yyds";
 
 fn io_error(error: impl std::fmt::Display) -> PostgresError {
     PostgresError::Io(error.to_string())
@@ -187,54 +190,58 @@ fn decode_shard(bytes: &[u8]) -> Result<(BTreeMap<(String, Vec<u8>), Record>, u6
     Ok((records, next_revision))
 }
 
-fn encode_catalog() -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(CATALOG_MAGIC);
-    bytes.extend_from_slice(&CATALOG_VERSION.to_be_bytes());
-    bytes.extend_from_slice(&0_u32.to_be_bytes());
-    bytes.extend_from_slice(&1_u32.to_be_bytes());
-    bytes.extend_from_slice(&(SHARD_ID.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(SHARD_ID.as_bytes());
-    bytes.extend_from_slice(&0_u32.to_be_bytes());
-    bytes.extend_from_slice(&0_u32.to_be_bytes());
-    bytes
+fn encode_catalog_bytes(shard_id: &str) -> Result<Vec<u8>, PostgresError> {
+    let message = match encode_catalog(None, None, &[ShardId(shard_id.to_owned())], None, &[]) {
+        Ok(bytes) => return Ok(bytes),
+        Err(error) => format!("cannot encode .yyds catalog: {error}"),
+    };
+    Err(protocol(&message))
 }
 
-fn decode_catalog(bytes: &[u8]) -> Result<String, PostgresError> {
-    if bytes.len() < CATALOG_MAGIC.len() + 4 {
-        return Err(protocol("truncated catalog header"));
-    }
-    if &bytes[..CATALOG_MAGIC.len()] != CATALOG_MAGIC {
-        return Err(protocol("unknown .yyds catalog header"));
-    }
-    let version = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
-    if version != CATALOG_VERSION {
-        return Err(protocol("catalog version requires regeneration"));
-    }
-    let read = |offset: usize| -> Result<u32, PostgresError> {
-        if offset + 4 > bytes.len() {
-            return Err(protocol("truncated catalog header"));
+fn decode_catalog_shard_id(bytes: &[u8]) -> Result<String, PostgresError> {
+    let result = decode_catalog(bytes);
+    let (_, _, shards, _, _) = match result {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            if legacy_catalog_bytes(bytes) {
+                return Err(protocol("legacy PostgreSQL catalog layout: delete the store directory and reinitialize"));
+            }
+            return Err(protocol(&format!("invalid .yyds catalog: {}", catalog_reason(error))));
         }
-        Ok(u32::from_be_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]))
     };
-    let _schema = read(9)?;
-    let shard_count = read(13)?;
-    if shard_count != 1 {
+    if shards.len() != 1 {
         return Err(protocol("unsupported catalog shard count"));
     }
-    let id_length = read(17)? as usize;
-    if 21 + id_length + 8 > bytes.len() {
-        return Err(protocol("truncated catalog header"));
-    }
-    let shard_id = String::from_utf8(bytes[21..21 + id_length].to_vec()).map_err(|_| protocol("catalog shard id is not utf8"))?;
-    let terminator = 21 + id_length;
-    if read(terminator)? != 0 || read(terminator + 4)? != 0 {
-        return Err(protocol("trailing catalog bytes"));
-    }
-    if terminator + 8 != bytes.len() {
-        return Err(protocol("trailing catalog bytes"));
+    let shard_id = shards[0].0.clone();
+    if !valid_shard_id(&shard_id) {
+        return Err(protocol("catalog shard id is unusable"));
     }
     Ok(shard_id)
+}
+
+fn catalog_reason(error: YydsError) -> String {
+    match error {
+        YydsError::Corrupt(reason) | YydsError::Unsupported(reason) => reason.to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// Pre-contract PostgreSQL catalogs encoded the shard count as big-endian
+/// `1` where the contract stores the routing presence flag. They are rejected
+/// outright; the bytes are never interpreted as a little-endian catalog.
+fn legacy_catalog_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= 17
+        && bytes.starts_with(CATALOG_MAGIC)
+        && bytes[5..9] == [0, 0, 0, 0]
+        && bytes[9..13] == [0, 0, 0, 0]
+        && bytes[13..17] == [0, 0, 0, 1]
+}
+
+fn valid_shard_id(shard_id: &str) -> bool {
+    !shard_id.is_empty()
+        && shard_id != "."
+        && shard_id != ".."
+        && !shard_id.contains(['/', '\\', '\0'])
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PostgresError> {
@@ -253,6 +260,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PostgresError> {
 /// A durable namespace/key store backed by one `.yyds` catalog and one `.yykv` shard.
 pub struct Store {
     dir: PathBuf,
+    catalog: PathBuf,
+    shard: PathBuf,
     inner: Mutex<Inner>,
 }
 
@@ -262,12 +271,19 @@ impl Store {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(io_error)?;
         let catalog = dir.join(CATALOG_FILE);
-        let shard = dir.join(SHARD_FILE);
-        if catalog.exists() {
+        let legacy = dir.join(LEGACY_CATALOG_FILE);
+        if legacy.exists() {
+            return Err(protocol("legacy PostgreSQL catalog layout: delete the store directory and reinitialize"));
+        }
+        let shard_id = if catalog.exists() {
             let bytes = fs::read(&catalog).map_err(io_error)?;
-            decode_catalog(&bytes)?;
+            decode_catalog_shard_id(&bytes)?
         } else {
-            write_atomic(&catalog, &encode_catalog())?;
+            DEFAULT_SHARD_ID.to_owned()
+        };
+        let shard = dir.join(format!("{shard_id}.yykv"));
+        if !catalog.exists() {
+            write_atomic(&catalog, &encode_catalog_bytes(&shard_id)?)?;
         }
         let inner = if shard.exists() {
             let bytes = fs::read(&shard).map_err(io_error)?;
@@ -279,7 +295,7 @@ impl Store {
         if !shard.exists() {
             write_atomic(&shard, &inner.encode_shard())?;
         }
-        Ok(Self { dir, inner: Mutex::new(inner) })
+        Ok(Self { dir, catalog, shard, inner: Mutex::new(inner) })
     }
 
     /// Absolute directory the store lives in.
@@ -289,12 +305,12 @@ impl Store {
 
     /// Absolute `.yykv` shard path.
     pub fn shard_path(&self) -> String {
-        self.dir.join(SHARD_FILE).display().to_string()
+        self.shard.display().to_string()
     }
 
     /// Absolute `.yyds` catalog path.
     pub fn catalog_path(&self) -> String {
-        self.dir.join(CATALOG_FILE).display().to_string()
+        self.catalog.display().to_string()
     }
 
     /// Writes one row, assigning the next revision.
@@ -307,7 +323,7 @@ impl Store {
             .records
             .insert((namespace.to_owned(), key.to_vec()), Record { revision, deadline: 0, tag: 0, value: value.to_vec() });
         let bytes = inner.encode_shard();
-        write_atomic(&self.dir.join(SHARD_FILE), &bytes)
+        write_atomic(&self.shard, &bytes)
     }
 
     /// Reads one row, or `None` when the key is absent.
@@ -322,7 +338,7 @@ impl Store {
         let removed = inner.records.remove(&(namespace.to_owned(), key.to_vec())).is_some();
         if removed {
             let bytes = inner.encode_shard();
-            write_atomic(&self.dir.join(SHARD_FILE), &bytes)?;
+            write_atomic(&self.shard, &bytes)?;
         }
         Ok(removed)
     }
@@ -374,7 +390,7 @@ impl Store {
         let removed = before - inner.records.len();
         if removed > 0 {
             let bytes = inner.encode_shard();
-            write_atomic(&self.dir.join(SHARD_FILE), &bytes)?;
+            write_atomic(&self.shard, &bytes)?;
         }
         Ok(removed)
     }
@@ -430,9 +446,27 @@ mod tests {
     }
 
     #[test]
-    fn catalog_layout_is_stable() {
-        let bytes = encode_catalog();
+    fn catalog_matches_shared_contract_layout() {
+        let bytes = encode_catalog_bytes(DEFAULT_SHARD_ID).unwrap();
         assert_eq!(&bytes[..5], CATALOG_MAGIC);
-        assert_eq!(decode_catalog(&bytes).unwrap(), SHARD_ID);
+        assert_eq!(&bytes[5..9], &[0, 0, 0, 0], "version is little endian");
+        assert_eq!(&bytes[9..13], &[0, 0, 0, 0], "schema slot absent");
+        assert_eq!(&bytes[13..17], &[0, 0, 0, 0], "routing slot absent");
+        assert_eq!(&bytes[17..21], &[1, 0, 0, 0], "one shard registration");
+        assert_eq!(&bytes[21..25], &[7, 0, 0, 0], "shard id length");
+        assert_eq!(&bytes[25..32], b"local-0");
+        assert_eq!(&bytes[32..36], &[0, 0, 0, 0], "resolved contract absent");
+        assert_eq!(&bytes[36..40], &[0, 0, 0, 0], "no owners");
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(decode_catalog_shard_id(&bytes).unwrap(), DEFAULT_SHARD_ID);
+    }
+
+    #[test]
+    fn legacy_big_endian_catalog_is_rejected() {
+        let legacy = b"YYDS\x01\0\0\0\0\0\0\0\0\0\0\0\x01\0\0\0\x0apostgres-0\0\0\0\0\0\0\0\0".to_vec();
+        assert_eq!(
+            decode_catalog_shard_id(&legacy).unwrap_err().message(),
+            "legacy PostgreSQL catalog layout: delete the store directory and reinitialize"
+        );
     }
 }

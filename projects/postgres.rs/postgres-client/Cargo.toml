@@ -14,3 +14,5 @@ name = "postgres_client"
 crate-type = ["rlib"]
 
 [dependencies]
+yyds-formats = { git = "https://github.com/oovm/database.rs.git", rev = "5cae6652413f98bb32371178ac7dc8ece1c95587" }
+yyds-types = { git = "https://github.com/oovm/database.rs.git", rev = "5cae6652413f98bb32371178ac7dc8ece1c95587" }
