@@ -64,6 +64,6 @@ export async function runNodeSuite(repositoryRoot, harnessDir, env) {
         name: 'node',
         output,
         counts: { executed: summary.executed, skipped: summary.skipped ?? 0, failed },
-        floor: 1018,
+        floor: 1048,
     };
 }

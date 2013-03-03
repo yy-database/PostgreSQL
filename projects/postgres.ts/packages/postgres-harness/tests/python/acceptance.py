@@ -613,6 +613,80 @@ def parse_shard(path):
     return {"nextRevision": next_revision, "records": records}
 
 
+def parse_catalog(path):
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if data[:5] != b"YYDS\x01":
+        raise AssertionError("bad catalog magic")
+    offset = 5
+    version = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    schema_flag = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    schema = None
+    if schema_flag == 1:
+        schema_version = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        length = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        schema = {"version": schema_version, "document": data[offset : offset + length].decode("utf-8")}
+        offset += length
+    elif schema_flag != 0:
+        raise AssertionError("bad schema flag")
+    routing_flag = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    routing_epoch = None
+    if routing_flag == 1:
+        routing_epoch = struct.unpack_from("<Q", data, offset)[0]
+        offset += 8
+    elif routing_flag != 0:
+        raise AssertionError("bad routing flag")
+    count = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    shards = []
+    for _ in range(count):
+        length = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        shards.append(data[offset : offset + length].decode("utf-8"))
+        offset += length
+    contract_flag = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    contract = None
+    if contract_flag == 1:
+        length = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        contract = data[offset : offset + length].decode("utf-8")
+        offset += length
+    elif contract_flag != 0:
+        raise AssertionError("bad contract flag")
+    owner_count = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    owners = []
+    for _ in range(owner_count):
+        shard_length = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        shard = data[offset : offset + shard_length].decode("utf-8")
+        offset += shard_length
+        node_length = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        node = data[offset : offset + node_length].decode("utf-8")
+        offset += node_length
+        term = struct.unpack_from("<Q", data, offset)[0]
+        offset += 8
+        owners.append({"shard": shard, "node": node, "term": term})
+    if offset != len(data):
+        raise AssertionError("trailing catalog bytes")
+    return {
+        "magic": "5959445301",
+        "version": version,
+        "schema": schema,
+        "routingEpoch": routing_epoch,
+        "shards": shards,
+        "contract": contract,
+        "owners": owners,
+    }
+
+
 store_cases = load_case("store.json")
 
 for item in store_cases["cases"]:
@@ -661,8 +735,22 @@ for item in store_cases["cases"]:
                 removed = store.flush(op["namespace"])
                 expect_equal(f"store/{item['name']}/flush", removed, op["expectRemoved"])
             elif kind == "expectFiles":
+                expect_equal(
+                    f"store/{item['name']}/catalog-name",
+                    os.path.basename(store.catalog_path()),
+                    op.get("catalogFile", store_cases["catalogFile"]),
+                )
+                expect_equal(
+                    f"store/{item['name']}/shard-name",
+                    os.path.basename(store.shard_path()),
+                    op.get("shardFile", store_cases["shardFile"]),
+                )
                 expect_equal(f"store/{item['name']}/catalog-exists", os.path.exists(store.catalog_path()), True)
                 expect_equal(f"store/{item['name']}/shard-exists", os.path.exists(store.shard_path()), True)
+            elif kind == "verifyCatalog":
+                parsed = parse_catalog(store.catalog_path())
+                record["verifyCatalog"] = parsed
+                expect_equal(f"store/{item['name']}/catalog", parsed, op["expect"])
             elif kind == "verifyShard":
                 parsed = parse_shard(store.shard_path())
                 record["verifyShard"] = parsed
@@ -674,6 +762,9 @@ for item in store_cases["cases"]:
                     ],
                 }
                 expect_equal(f"store/{item['name']}/shard/records", projected, {"nextRevision": op["nextRevision"], "records": op["records"]})
+            elif kind == "writeSibling":
+                with open(os.path.join(directory, op["name"]), "wb") as handle:
+                    handle.write(bytes.fromhex(op["hex"]))
             elif kind in ("writeShard", "writeCatalog"):
                 target = store.shard_path() if kind == "writeShard" else store.catalog_path()
                 with open(target, "wb") as handle:

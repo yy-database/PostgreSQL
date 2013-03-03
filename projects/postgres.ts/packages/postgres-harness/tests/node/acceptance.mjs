@@ -618,6 +618,74 @@ function parseShard(file) {
     return { nextRevision, records };
 }
 
+function parseCatalog(file) {
+    const bytes = fs.readFileSync(file);
+    if (bytes.subarray(0, 5).toString() !== 'YYDS\u0001') throw new Error('bad catalog magic');
+    let offset = 5;
+    const version = bytes.readUInt32LE(offset);
+    offset += 4;
+    const schemaFlag = bytes.readUInt32LE(offset);
+    offset += 4;
+    let schema = null;
+    if (schemaFlag === 1) {
+        const schemaVersion = bytes.readUInt32LE(offset);
+        offset += 4;
+        const length = bytes.readUInt32LE(offset);
+        offset += 4;
+        schema = { version: schemaVersion, document: bytes.subarray(offset, offset + length).toString() };
+        offset += length;
+    } else if (schemaFlag !== 0) {
+        throw new Error('bad schema flag');
+    }
+    const routingFlag = bytes.readUInt32LE(offset);
+    offset += 4;
+    let routingEpoch = null;
+    if (routingFlag === 1) {
+        routingEpoch = Number(bytes.readBigUInt64LE(offset));
+        offset += 8;
+    } else if (routingFlag !== 0) {
+        throw new Error('bad routing flag');
+    }
+    const count = bytes.readUInt32LE(offset);
+    offset += 4;
+    const shards = [];
+    for (let index = 0; index < count; index += 1) {
+        const length = bytes.readUInt32LE(offset);
+        offset += 4;
+        shards.push(bytes.subarray(offset, offset + length).toString());
+        offset += length;
+    }
+    const contractFlag = bytes.readUInt32LE(offset);
+    offset += 4;
+    let contract = null;
+    if (contractFlag === 1) {
+        const length = bytes.readUInt32LE(offset);
+        offset += 4;
+        contract = bytes.subarray(offset, offset + length).toString();
+        offset += length;
+    } else if (contractFlag !== 0) {
+        throw new Error('bad contract flag');
+    }
+    const ownerCount = bytes.readUInt32LE(offset);
+    offset += 4;
+    const owners = [];
+    for (let index = 0; index < ownerCount; index += 1) {
+        const shardLength = bytes.readUInt32LE(offset);
+        offset += 4;
+        const shard = bytes.subarray(offset, offset + shardLength).toString();
+        offset += shardLength;
+        const nodeLength = bytes.readUInt32LE(offset);
+        offset += 4;
+        const node = bytes.subarray(offset, offset + nodeLength).toString();
+        offset += nodeLength;
+        const term = Number(bytes.readBigUInt64LE(offset));
+        offset += 8;
+        owners.push({ shard, node, term });
+    }
+    if (offset !== bytes.length) throw new Error('trailing catalog bytes');
+    return { magic: '5959445301', version, schema, routingEpoch, shards, contract, owners };
+}
+
 function readText(value) {
     return Buffer.from(value).toString();
 }
@@ -687,8 +755,18 @@ for (const item of storeCases.cases) {
                     break;
                 }
                 case 'expectFiles': {
+                    const catalogFile = op.catalogFile ?? storeCases.catalogFile;
+                    const shardFile = op.shardFile ?? storeCases.shardFile;
+                    expectEqual(`store/${item.name}/catalog-name`, path.basename(store.catalogPath()), catalogFile);
+                    expectEqual(`store/${item.name}/shard-name`, path.basename(store.shardPath()), shardFile);
                     expectEqual(`store/${item.name}/catalog-exists`, fs.existsSync(store.catalogPath()), true);
                     expectEqual(`store/${item.name}/shard-exists`, fs.existsSync(store.shardPath()), true);
+                    break;
+                }
+                case 'verifyCatalog': {
+                    const parsed = parseCatalog(store.catalogPath());
+                    record.verifyCatalog = parsed;
+                    expectEqual(`store/${item.name}/catalog`, parsed, op.expect);
                     break;
                 }
                 case 'verifyShard': {
@@ -699,6 +777,10 @@ for (const item of storeCases.cases) {
                         { nextRevision: parsed.nextRevision, records: parsed.records.map(({ namespace, key, value, revision }) => ({ namespace, key, value, revision })) },
                         { nextRevision: op.nextRevision, records: op.records },
                     );
+                    break;
+                }
+                case 'writeSibling': {
+                    fs.writeFileSync(path.join(dir, op.name), Buffer.from(op.hex, 'hex'));
                     break;
                 }
                 case 'writeShard':

@@ -1,12 +1,13 @@
 {
-    "shardFile": "postgres-0.yykv",
-    "catalogFile": "postgres-0.yyds",
+    "shardFile": "local-0.yykv",
+    "catalogFile": "local-0.yyds",
     "cases": [
         {
             "name": "empty-open",
             "ops": [
                 { "op": "open" },
                 { "op": "expectFiles" },
+                { "op": "verifyCatalog", "expect": { "magic": "5959445301", "version": 0, "schema": null, "routingEpoch": null, "shards": ["local-0"], "contract": null, "owners": [] } },
                 { "op": "namespaces", "expectNamespaces": [] },
                 { "op": "len", "namespace": "public.empty", "expectLen": 0 },
                 { "op": "reopen" },
@@ -27,7 +28,8 @@
                 { "op": "verifyShard", "nextRevision": 3, "records": [
                     { "namespace": "public.users", "key": "u1", "value": "alice", "revision": 1 },
                     { "namespace": "public.users", "key": "u2", "value": "bob", "revision": 2 }
-                ] }
+                ] },
+                { "op": "verifyCatalog", "expect": { "magic": "5959445301", "version": 0, "schema": null, "routingEpoch": null, "shards": ["local-0"], "contract": null, "owners": [] } }
             ]
         },
         {
@@ -181,7 +183,7 @@
             "ops": [
                 { "op": "open" },
                 { "op": "writeCatalog", "hex": "5a5a5a5a5a00000000" },
-                { "op": "openExpectError", "expectError": "unknown .yyds catalog header" }
+                { "op": "openExpectError", "expectError": "invalid .yyds catalog: unknown catalog header" }
             ]
         },
         {
@@ -189,7 +191,7 @@
             "ops": [
                 { "op": "open" },
                 { "op": "writeCatalog", "hex": "5959445301010000000000000000000000" },
-                { "op": "openExpectError", "expectError": "catalog version requires regeneration" }
+                { "op": "openExpectError", "expectError": "invalid .yyds catalog: catalog format version requires regeneration" }
             ]
         },
         {
@@ -197,7 +199,120 @@
             "ops": [
                 { "op": "open" },
                 { "op": "writeCatalog", "hex": "5959445301" },
-                { "op": "openExpectError", "expectError": "truncated catalog header" }
+                { "op": "openExpectError", "expectError": "invalid .yyds catalog: unexpected catalog eof" }
+            ]
+        },
+        {
+            "name": "catalog-interop-full-shape-seed",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "59594453010000000001000000010000000d0000007b2276657273696f6e223a317d010000007b0000000000000001000000070000006c6f63616c2d300000000001000000070000006c6f63616c2d30060000006e6f64652d610700000000000000" },
+                { "op": "writeShard", "hex": "59594b5603e42b42c2392d245f010000000000000000000000" },
+                { "op": "reopen" },
+                { "op": "verifyCatalog", "expect": { "magic": "5959445301", "version": 0, "schema": { "version": 1, "document": "{\"version\":1}" }, "routingEpoch": 123, "shards": ["local-0"], "contract": null, "owners": [ { "shard": "local-0", "node": "node-a", "term": 7 } ] } },
+                { "op": "get", "namespace": "public.seed", "key": "absent", "expect": null },
+                { "op": "expectFiles" }
+            ]
+        },
+        {
+            "name": "catalog-authoritative-shard-id",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "59594453010000000000000000000000000100000008000000637573746f6d2d370000000000000000" },
+                { "op": "writeSibling", "name": "custom-7.yykv", "hex": "59594b5603e42b42c2392d245f010000000000000000000000" },
+                { "op": "reopen" },
+                { "op": "expectFiles", "shardFile": "custom-7.yykv" },
+                { "op": "put", "namespace": "public.seed", "key": "k", "value": "v" },
+                { "op": "get", "namespace": "public.seed", "key": "k", "expect": "v" }
+            ]
+        },
+        {
+            "name": "catalog-legacy-big-endian",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "59594453010000000000000000000000010000000a706f7374677265732d300000000000000000" },
+                { "op": "openExpectError", "expectError": "legacy PostgreSQL catalog layout: delete the store directory and reinitialize" }
+            ]
+        },
+        {
+            "name": "catalog-legacy-file-name",
+            "ops": [
+                { "op": "open" },
+                { "op": "removeCatalog" },
+                { "op": "writeSibling", "name": "postgres-0.yyds", "hex": "59594453010000000000000000000000010000000a706f7374677265732d300000000000000000" },
+                { "op": "openExpectError", "expectError": "legacy PostgreSQL catalog layout: delete the store directory and reinitialize" }
+            ]
+        },
+        {
+            "name": "catalog-corrupt-trailing",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "595944530100000000000000000000000001000000070000006c6f63616c2d30000000000000000000000000" },
+                { "op": "openExpectError", "expectError": "invalid .yyds catalog: trailing catalog bytes" }
+            ]
+        },
+        {
+            "name": "catalog-corrupt-count-zero",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "5959445301000000000000000000000000000000000000000000000000" },
+                { "op": "openExpectError", "expectError": "unsupported catalog shard count" }
+            ]
+        },
+        {
+            "name": "catalog-corrupt-count-two",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "595944530100000000000000000000000002000000070000006c6f63616c2d30070000006c6f63616c2d310000000000000000" },
+                { "op": "openExpectError", "expectError": "unsupported catalog shard count" }
+            ]
+        },
+        {
+            "name": "catalog-corrupt-schema-flag",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "5959445301000000000200000000000000" },
+                { "op": "openExpectError", "expectError": "invalid .yyds catalog: invalid catalog schema presence flag" }
+            ]
+        },
+        {
+            "name": "catalog-corrupt-routing-flag",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "5959445301000000000000000002000000" },
+                { "op": "openExpectError", "expectError": "invalid .yyds catalog: invalid catalog routing presence flag" }
+            ]
+        },
+        {
+            "name": "catalog-corrupt-routing-epoch",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "5959445301000000000000000001000000000000000000000001000000070000006c6f63616c2d30" },
+                { "op": "openExpectError", "expectError": "invalid .yyds catalog: invalid catalog routing epoch" }
+            ]
+        },
+        {
+            "name": "catalog-corrupt-contract-flag",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "595944530100000000000000000000000001000000070000006c6f63616c2d3002000000" },
+                { "op": "openExpectError", "expectError": "invalid .yyds catalog: invalid resolved contract presence flag" }
+            ]
+        },
+        {
+            "name": "catalog-corrupt-shard-id",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "595944530100000000000000000000000001000000000000000000000000000000" },
+                { "op": "openExpectError", "expectError": "catalog shard id is unusable" }
+            ]
+        },
+        {
+            "name": "catalog-corrupt-owner-utf8",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeCatalog", "hex": "595944530100000000000000000000000001000000070000006c6f63616c2d30000000000100000001000000ff" },
+                { "op": "openExpectError", "expectError": "invalid .yyds catalog: catalog owner shard utf8" }
             ]
         },
         {
