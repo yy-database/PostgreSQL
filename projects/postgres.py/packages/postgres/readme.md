@@ -1,4 +1,9 @@
-Python surface of the PostgreSQL product.
+Python surface for PostgreSQL protocol-v3 clients.
+
+This package contains no SQL engine. `Connection.execute` sends the statement
+text to the server at `host`/`port` and decodes the reply that server produces;
+in the test harness that server is PGlite. `.yyds`/`.yykv` (`Store`) is a
+separate key/value primitive and is not used by the SQL path.
 
 `import postgres` re-exports the primitives of the `postgres-pyo3` wheel:
 `connect`, `Connection.execute`, `Connection.close`, `StatementResult`,
