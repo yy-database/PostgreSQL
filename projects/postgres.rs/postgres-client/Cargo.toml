@@ -14,5 +14,5 @@ name = "postgres_client"
 crate-type = ["rlib"]
 
 [dependencies]
-database-formats = { git = "https://github.com/oovm/database.rs.git", rev = "bbf58deb3a87553d0bd71f43fd2706133806e55b" }
-database-types = { git = "https://github.com/oovm/database.rs.git", rev = "bbf58deb3a87553d0bd71f43fd2706133806e55b" }
+database-formats = { git = "https://github.com/oovm/database.rs.git", rev = "7efce600171c1c0088da3b1fbc23571b17059087" }
+database-types = { git = "https://github.com/oovm/database.rs.git", rev = "7efce600171c1c0088da3b1fbc23571b17059087" }

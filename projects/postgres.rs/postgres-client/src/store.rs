@@ -1,18 +1,19 @@
 //! `.yyds` catalog plus `.yykv` shard persistence.
 //!
-//! The catalog is the shared contract-layout codec from `database-formats` (the
-//! same bytes Redis and MongoDB write): magic `YYDS\x01`, little-endian
-//! version, schema slot, routing slot, shard registrations, resolved contract
-//! and owners. The catalog owns the shard id: `<id>.yykv` next to it.
+//! Both byte formats are owned by `database-formats`: the catalog is the shared
+//! contract-layout codec (the same bytes Redis and MongoDB write: magic
+//! `YYDS\x01`, little-endian version, schema slot, routing slot, shard
+//! registrations, resolved contract and owners), and the shard is the shared
+//! `.yykv` snapshot codec (magic `YYKV\x03`, FNV-1a body checksum, then
+//! `next_revision u64`, record count `u32`, and records made of namespace, key,
+//! revision `u64`, deadline `u64`, value tag `u8` and value bytes).
 //!
-//! Legacy big-endian PostgreSQL catalogs (`postgres-0.yyds`) are rejected
-//! explicitly; they are never sniffed or guessed.
-//!
-//! `.yykv` (little endian): magic `YYKV\x03`, FNV-1a checksum `u64` over the
-//! body, then `next_revision u64`, record count `u32`, and records made of
-//! namespace, key, revision `u64`, deadline `u64`, tag `u8` and value bytes.
-//! Writes go through a temp file and a rename, so a crash leaves the previous
-//! shard intact.
+//! This module only keeps the PostgreSQL-specific mapping: the catalog owns the
+//! shard id (`<id>.yykv` next to it), the record model stays inline-only, and
+//! every shared-codec failure is re-worded to the message PostgreSQL users
+//! already see. Legacy big-endian PostgreSQL catalogs (`postgres-0.yyds`) are
+//! rejected explicitly; they are never sniffed or guessed. Writes go through a
+//! temp file and a rename, so a crash leaves the previous shard intact.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -20,12 +21,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use database_formats::yy::yyds::{decode_catalog, encode_catalog, CATALOG_MAGIC};
+use database_formats::yy::yykv::{
+    decode_snapshot_strict, encode_snapshot, InlineValue, Key, Record as ShardRecord, Snapshot, StoredValue, KV_LEGACY_MAGIC,
+    KV_MAGIC,
+};
 use database_types::cluster::{Error as ClusterError, ShardId};
+use database_types::ReasonCode;
 
 use crate::error::PostgresError;
 
-const SHARD_MAGIC: &[u8] = b"YYKV\x03";
-const LEGACY_SHARD_MAGIC: &[u8] = b"YYKV\x02";
 const DEFAULT_SHARD_ID: &str = "local-0";
 const CATALOG_FILE: &str = "local-0.yyds";
 const LEGACY_CATALOG_FILE: &str = "postgres-0.yyds";
@@ -38,49 +42,43 @@ fn protocol(message: &str) -> PostgresError {
     PostgresError::Protocol(message.to_owned())
 }
 
-/// FNV-1a 64 bit, used by the shard checksum and by independent verifiers.
-pub fn checksum(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// Re-words a shared `.yykv` codec failure as the PostgreSQL-facing message.
+///
+/// The shared codec names the format without a product prefix; PostgreSQL
+/// messages have always called it `.yykv`, so the mapping keeps the external
+/// wording byte-for-byte while the decoder itself stays in `database-formats`.
+fn shard_error(error: ClusterError) -> PostgresError {
+    match error {
+        ClusterError::Io(error) => io_error(error.to_string()),
+        ClusterError::Corrupt(reason) => protocol(shard_message(reason)),
+        ClusterError::CorruptReason { message, .. } => protocol(shard_message(message)),
+        other => protocol(&other.to_string()),
     }
-    hash
 }
 
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn read_u32(bytes: &[u8], offset: &mut usize, what: &str) -> Result<u32, PostgresError> {
-    if *offset + 4 > bytes.len() {
-        return Err(protocol(&format!("truncated {what}")));
+fn shard_message(message: &'static str) -> &'static str {
+    match message {
+        "unknown yykv header" => "unknown .yykv header",
+        "yykv checksum mismatch" => ".yykv checksum mismatch",
+        "legacy yykv v2 snapshot has no checksum: delete the shard file and let the node recreate it" => {
+            "legacy .yykv v2 snapshot carries no checksum: delete the shard and let the node recreate it"
+        }
+        // The shared decoder reports both pre-contract revision layouts as legacy;
+        // PostgreSQL has always folded them into one message.
+        "legacy yykv revision layout: next_revision is zero" | "legacy yykv revision layout: record sits on next_revision" => {
+            "invalid shard revision"
+        }
+        "shard namespace utf8" => "shard namespace is not utf8",
+        "invalid shard value kind" => "unknown shard record tag",
+        "unexpected shard eof" => "truncated shard record",
+        other => other,
     }
-    let value = u32::from_le_bytes([bytes[*offset], bytes[*offset + 1], bytes[*offset + 2], bytes[*offset + 3]]);
-    *offset += 4;
-    Ok(value)
 }
 
-fn read_u64(bytes: &[u8], offset: &mut usize, what: &str) -> Result<u64, PostgresError> {
-    if *offset + 8 > bytes.len() {
-        return Err(protocol(&format!("truncated {what}")));
-    }
-    let mut buffer = [0_u8; 8];
-    buffer.copy_from_slice(&bytes[*offset..*offset + 8]);
-    *offset += 8;
-    Ok(u64::from_le_bytes(buffer))
-}
-
-/// One stored row.
+/// One stored row: the shard-assigned revision plus its inline bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Record {
     revision: u64,
-    deadline: u64,
-    tag: u8,
     value: Vec<u8>,
 }
 
@@ -90,104 +88,63 @@ struct Inner {
 }
 
 impl Inner {
-    fn encode_shard(&self) -> Vec<u8> {
-        let mut body = Vec::new();
-        push_u64(&mut body, self.next_revision);
-        push_u32(&mut body, self.records.len() as u32);
-        for ((namespace, key), record) in &self.records {
-            push_u32(&mut body, namespace.len() as u32);
-            body.extend_from_slice(namespace.as_bytes());
-            push_u32(&mut body, key.len() as u32);
-            body.extend_from_slice(key);
-            push_u64(&mut body, record.revision);
-            push_u64(&mut body, record.deadline);
-            body.push(record.tag);
-            push_u32(&mut body, record.value.len() as u32);
-            body.extend_from_slice(&record.value);
-        }
-        let mut bytes = Vec::with_capacity(body.len() + 13);
-        bytes.extend_from_slice(SHARD_MAGIC);
-        bytes.extend_from_slice(&checksum(&body).to_le_bytes());
-        bytes.extend_from_slice(&body);
-        bytes
+    fn encode_shard(&self) -> Result<Vec<u8>, PostgresError> {
+        let snapshot = self
+            .records
+            .iter()
+            .map(|((namespace, bytes), record)| {
+                let key = Key::new(namespace.clone(), bytes.clone());
+                let stored = ShardRecord {
+                    key: key.clone(),
+                    value: StoredValue::Inline(InlineValue(record.value.clone())),
+                    revision: record.revision,
+                    expires_at: None,
+                };
+                (key, stored)
+            })
+            .collect::<BTreeMap<_, _>>();
+        encode_snapshot(&snapshot, self.next_revision).map_err(shard_error)
     }
 }
 
 fn decode_shard(bytes: &[u8]) -> Result<(BTreeMap<(String, Vec<u8>), Record>, u64), PostgresError> {
-    if bytes.len() < SHARD_MAGIC.len() {
+    // Header checks stay here so the shared decoder's generic EOF/legacy
+    // classification keeps mapping onto the messages PostgreSQL has always
+    // returned for these shard shapes.
+    if bytes.len() < KV_MAGIC.len() {
         return Err(protocol("truncated .yykv header"));
     }
-    let magic = &bytes[..SHARD_MAGIC.len()];
-    if magic == LEGACY_SHARD_MAGIC {
+    if bytes.starts_with(KV_LEGACY_MAGIC) {
         return Err(protocol(
             "legacy .yykv v2 snapshot carries no checksum: delete the shard and let the node recreate it",
         ));
     }
-    if magic != SHARD_MAGIC {
+    if !bytes.starts_with(KV_MAGIC) {
         return Err(protocol("unknown .yykv header"));
     }
-    if bytes.len() < SHARD_MAGIC.len() + 8 {
+    if bytes.len() < KV_MAGIC.len() + 8 {
         return Err(protocol("truncated shard checksum"));
     }
-    let expected = u64::from_le_bytes([
-        bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
-    ]);
-    let body = &bytes[13..];
-    if checksum(body) != expected {
-        return Err(protocol(".yykv checksum mismatch"));
-    }
-
-    let mut offset = 0;
-    let next_revision = read_u64(body, &mut offset, "shard header")?;
-    if next_revision == 0 {
-        return Err(protocol("invalid shard revision"));
-    }
-    let count = read_u32(body, &mut offset, "shard header")?;
-    let mut records = BTreeMap::new();
-    for _ in 0..count {
-        let namespace_length = read_u32(body, &mut offset, "shard record")? as usize;
-        if offset + namespace_length > body.len() {
-            return Err(protocol("truncated shard record"));
+    let body = &bytes[KV_MAGIC.len() + 8..];
+    let Snapshot { next_revision, records } = decode_snapshot_strict(bytes).map_err(|error| {
+        // The shared decoder reports one generic EOF class; PostgreSQL has always
+        // split it by whether the fixed shard header itself fit.
+        if matches!(error, ClusterError::CorruptReason { reason: ReasonCode::Truncated, .. }) {
+            return protocol(if body.len() < 12 { "truncated shard header" } else { "truncated shard record" });
         }
-        let namespace_bytes = &body[offset..offset + namespace_length];
-        offset += namespace_length;
-        let namespace = String::from_utf8(namespace_bytes.to_vec()).map_err(|_| protocol("shard namespace is not utf8"))?;
-        let key_length = read_u32(body, &mut offset, "shard record")? as usize;
-        if offset + key_length > body.len() {
-            return Err(protocol("truncated shard record"));
-        }
-        let key = body[offset..offset + key_length].to_vec();
-        offset += key_length;
-        let revision = read_u64(body, &mut offset, "shard record")?;
-        let deadline = read_u64(body, &mut offset, "shard record")?;
-        if offset + 1 > body.len() {
-            return Err(protocol("truncated shard record"));
-        }
-        let tag = body[offset];
-        offset += 1;
-        let value_length = read_u32(body, &mut offset, "shard record")? as usize;
-        if offset + value_length > body.len() {
-            return Err(protocol("truncated shard record"));
-        }
-        let value = body[offset..offset + value_length].to_vec();
-        offset += value_length;
-        if revision == 0 || revision >= next_revision {
-            return Err(protocol("invalid shard revision"));
-        }
-        if deadline != 0 {
+        shard_error(error)
+    })?;
+    let mut shard = BTreeMap::new();
+    for (key, record) in records {
+        if record.expires_at.is_some() {
             return Err(protocol("expired shard records are unsupported"));
         }
-        if tag != 0 {
+        let StoredValue::Inline(value) = record.value else {
             return Err(protocol("unknown shard record tag"));
-        }
-        if records.insert((namespace, key), Record { revision, deadline, tag, value }).is_some() {
-            return Err(protocol("duplicate shard key"));
-        }
+        };
+        shard.insert((key.namespace.0, key.bytes), Record { revision: record.revision, value: value.0 });
     }
-    if offset != body.len() {
-        return Err(protocol("trailing shard bytes"));
-    }
-    Ok((records, next_revision))
+    Ok((shard, next_revision))
 }
 
 fn encode_catalog_bytes(shard_id: &str) -> Result<Vec<u8>, PostgresError> {
@@ -293,7 +250,7 @@ impl Store {
             Inner { records: BTreeMap::new(), next_revision: 1 }
         };
         if !shard.exists() {
-            write_atomic(&shard, &inner.encode_shard())?;
+            write_atomic(&shard, &inner.encode_shard()?)?;
         }
         Ok(Self { dir, catalog, shard, inner: Mutex::new(inner) })
     }
@@ -321,8 +278,8 @@ impl Store {
         inner.next_revision += 1;
         inner
             .records
-            .insert((namespace.to_owned(), key.to_vec()), Record { revision, deadline: 0, tag: 0, value: value.to_vec() });
-        let bytes = inner.encode_shard();
+            .insert((namespace.to_owned(), key.to_vec()), Record { revision, value: value.to_vec() });
+        let bytes = inner.encode_shard()?;
         write_atomic(&self.shard, &bytes)
     }
 
@@ -337,7 +294,7 @@ impl Store {
         let mut inner = self.inner.lock().expect("store lock");
         let removed = inner.records.remove(&(namespace.to_owned(), key.to_vec())).is_some();
         if removed {
-            let bytes = inner.encode_shard();
+            let bytes = inner.encode_shard()?;
             write_atomic(&self.shard, &bytes)?;
         }
         Ok(removed)
@@ -389,7 +346,7 @@ impl Store {
         inner.records.retain(|(name, _), _| name != namespace);
         let removed = before - inner.records.len();
         if removed > 0 {
-            let bytes = inner.encode_shard();
+            let bytes = inner.encode_shard()?;
             write_atomic(&self.shard, &bytes)?;
         }
         Ok(removed)
@@ -432,7 +389,7 @@ mod tests {
         assert_eq!(reopened.get("public.users", b"u1"), Some(b"alice".to_vec()));
         assert_eq!(reopened.namespaces(), vec!["public.users".to_owned()]);
         let bytes = fs::read(reopened.shard_path()).unwrap();
-        assert_eq!(&bytes[..5], SHARD_MAGIC);
+        assert_eq!(&bytes[..5], KV_MAGIC);
         let (records, next) = decode_shard(&bytes).unwrap();
         assert_eq!(next, 3);
         assert_eq!(records.len(), 2);
@@ -468,5 +425,76 @@ mod tests {
             decode_catalog_shard_id(&legacy).unwrap_err().message(),
             "legacy PostgreSQL catalog layout: delete the store directory and reinitialize"
         );
+    }
+
+    /// Assembles one shared-codec record, i.e. exactly what a node outside this
+    /// repo writes when `database-formats` owns the shard.
+    fn shared_record(namespace: &str, key: &[u8], value: &[u8], revision: u64) -> (Key, ShardRecord) {
+        let key = Key::new(namespace, key.to_vec());
+        let stored = ShardRecord {
+            key: key.clone(),
+            value: StoredValue::Inline(InlineValue(value.to_vec())),
+            revision,
+            expires_at: None,
+        };
+        (key, stored)
+    }
+
+    #[test]
+    fn shared_codec_decodes_and_reencodes_store_bytes() {
+        let dir = temporary("interop-out");
+        let store = Store::open(&dir).unwrap();
+        store.put("public.users", b"u1", b"alice").unwrap();
+        store.put("public.users", b"u2", b"bob").unwrap();
+        let bytes = fs::read(store.shard_path()).unwrap();
+        let snapshot = decode_snapshot_strict(&bytes).unwrap();
+        assert_eq!(snapshot.next_revision, 3);
+        assert_eq!(
+            snapshot.records[&Key::new("public.users", b"u1".to_vec())].value,
+            StoredValue::Inline(InlineValue(b"alice".to_vec()))
+        );
+        assert_eq!(
+            snapshot.records[&Key::new("public.users", b"u2".to_vec())].value,
+            StoredValue::Inline(InlineValue(b"bob".to_vec()))
+        );
+        assert_eq!(encode_snapshot(&snapshot.records, snapshot.next_revision).unwrap(), bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_codec_snapshot_opens_as_a_store() {
+        let dir = temporary("interop-in");
+        Store::open(&dir).unwrap();
+        let written_by_shared_codec = BTreeMap::from([
+            shared_record("public.seed", b"a", b"1", 1),
+            shared_record("public.seed", b"b", b"2", 2),
+        ]);
+        let bytes = encode_snapshot(&written_by_shared_codec, 3).unwrap();
+        fs::write(dir.join(format!("{DEFAULT_SHARD_ID}.yykv")), &bytes).unwrap();
+
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(store.get("public.seed", b"a"), Some(b"1".to_vec()));
+        assert_eq!(store.get("public.seed", b"b"), Some(b"2".to_vec()));
+        assert_eq!(fs::read(store.shard_path()).unwrap(), bytes, "opening must not rewrite shared bytes");
+
+        store.put("public.seed", b"c", b"3").unwrap();
+        let expected = BTreeMap::from([
+            shared_record("public.seed", b"a", b"1", 1),
+            shared_record("public.seed", b"b", b"2", 2),
+            shared_record("public.seed", b"c", b"3", 3),
+        ]);
+        assert_eq!(fs::read(store.shard_path()).unwrap(), encode_snapshot(&expected, 4).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_shard_matches_the_shared_corpus_bytes() {
+        let dir = temporary("interop-empty");
+        let store = Store::open(&dir).unwrap();
+        let bytes = fs::read(store.shard_path()).unwrap();
+        let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        // Same empty-shard bytes the TS and PY corpora seed in `store.json`.
+        assert_eq!(hex, "59594b5603e42b42c2392d245f010000000000000000000000");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
