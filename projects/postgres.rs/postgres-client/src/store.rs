@@ -1,6 +1,6 @@
 //! `.yyds` catalog plus `.yykv` shard persistence.
 //!
-//! The catalog is the shared contract-layout codec from `yyds-formats` (the
+//! The catalog is the shared contract-layout codec from `database-formats` (the
 //! same bytes Redis and MongoDB write): magic `YYDS\x01`, little-endian
 //! version, schema slot, routing slot, shard registrations, resolved contract
 //! and owners. The catalog owns the shard id: `<id>.yykv` next to it.
@@ -19,8 +19,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use yyds_formats::{decode_catalog, encode_catalog, CATALOG_MAGIC};
-use yyds_types::{Error as YydsError, ShardId};
+use database_formats::cluster::{decode_catalog, encode_catalog, CATALOG_MAGIC};
+use database_types::cluster::{Error as ClusterError, ShardId};
 
 use crate::error::PostgresError;
 
@@ -219,9 +219,9 @@ fn decode_catalog_shard_id(bytes: &[u8]) -> Result<String, PostgresError> {
     Ok(shard_id)
 }
 
-fn catalog_reason(error: YydsError) -> String {
+fn catalog_reason(error: ClusterError) -> String {
     match error {
-        YydsError::Corrupt(reason) | YydsError::Unsupported(reason) => reason.to_owned(),
+        ClusterError::Corrupt(reason) | ClusterError::Unsupported(reason) => reason.to_owned(),
         other => other.to_string(),
     }
 }
