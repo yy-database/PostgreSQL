@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use database_formats::cluster::{decode_catalog, encode_catalog, CATALOG_MAGIC};
+use database_formats::yy::yyds::{decode_catalog, encode_catalog, CATALOG_MAGIC};
 use database_types::cluster::{Error as ClusterError, ShardId};
 
 use crate::error::PostgresError;
