@@ -20,7 +20,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use database_formats::yy::yyds::{decode_catalog, encode_catalog, CATALOG_MAGIC};
+use database_formats::yy::yyds::{
+    decode_catalog_shard_id as shared_catalog_shard_id, encode_catalog, CATALOG_MAGIC,
+};
 use database_formats::yy::yykv::{
     decode_snapshot_strict, encode_snapshot, InlineValue, Key, Record as ShardRecord, Snapshot, StoredValue, KV_LEGACY_MAGIC,
     KV_MAGIC,
@@ -155,25 +157,35 @@ fn encode_catalog_bytes(shard_id: &str) -> Result<Vec<u8>, PostgresError> {
     Err(protocol(&message))
 }
 
+/// Reads the single shard id a catalog registers.
+///
+/// Decoding and single-registration validation come from `database-formats`;
+/// this wrapper only keeps the PostgreSQL-facing wording and the legacy
+/// big-endian pre-check.
 fn decode_catalog_shard_id(bytes: &[u8]) -> Result<String, PostgresError> {
-    let result = decode_catalog(bytes);
-    let (_, _, shards, _, _) = match result {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            if legacy_catalog_bytes(bytes) {
-                return Err(protocol("legacy PostgreSQL catalog layout: delete the store directory and reinitialize"));
-            }
-            return Err(protocol(&format!("invalid .yyds catalog: {}", catalog_reason(error))));
-        }
-    };
-    if shards.len() != 1 {
-        return Err(protocol("unsupported catalog shard count"));
+    if legacy_catalog_bytes(bytes) {
+        return Err(protocol("legacy PostgreSQL catalog layout: delete the store directory and reinitialize"));
     }
-    let shard_id = shards[0].0.clone();
-    if !valid_shard_id(&shard_id) {
+    let shard_id = shared_catalog_shard_id(bytes).map_err(catalog_error)?;
+    // `ShardId::try_new` rejects `.`, `..` and path separators. The id also
+    // becomes a file stem here, so a NUL byte stays unusable even though the
+    // shared constructor does not check for it.
+    if shard_id.0.as_bytes().contains(&0) {
         return Err(protocol("catalog shard id is unusable"));
     }
-    Ok(shard_id)
+    Ok(shard_id.0)
+}
+
+fn catalog_error(error: ClusterError) -> PostgresError {
+    match error {
+        ClusterError::InvalidShardId { .. } => protocol("catalog shard id is unusable"),
+        ClusterError::Unsupported(reason)
+            if reason == "catalog registers no shard" || reason == "catalog registers more than one shard" =>
+        {
+            protocol("unsupported catalog shard count")
+        }
+        other => protocol(&format!("invalid .yyds catalog: {}", catalog_reason(other))),
+    }
 }
 
 fn catalog_reason(error: ClusterError) -> String {
@@ -192,13 +204,6 @@ fn legacy_catalog_bytes(bytes: &[u8]) -> bool {
         && bytes[5..9] == [0, 0, 0, 0]
         && bytes[9..13] == [0, 0, 0, 0]
         && bytes[13..17] == [0, 0, 0, 1]
-}
-
-fn valid_shard_id(shard_id: &str) -> bool {
-    !shard_id.is_empty()
-        && shard_id != "."
-        && shard_id != ".."
-        && !shard_id.contains(['/', '\\', '\0'])
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PostgresError> {
@@ -425,6 +430,47 @@ mod tests {
             decode_catalog_shard_id(&legacy).unwrap_err().message(),
             "legacy PostgreSQL catalog layout: delete the store directory and reinitialize"
         );
+    }
+
+    #[test]
+    fn shared_codec_decodes_and_reencodes_store_catalog_bytes() {
+        let dir = temporary("catalog-interop-out");
+        let store = Store::open(&dir).unwrap();
+        let bytes = fs::read(store.catalog_path()).unwrap();
+        let shard_id = shared_catalog_shard_id(&bytes).unwrap();
+        assert_eq!(shard_id.0, DEFAULT_SHARD_ID);
+        assert_eq!(encode_catalog(None, None, &[shard_id], None, &[]).unwrap(), bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_codec_catalog_opens_as_a_store() {
+        let dir = temporary("catalog-interop-in");
+        let bytes = encode_catalog(None, None, &[ShardId("custom-7".to_owned())], None, &[]).unwrap();
+        let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        // Same catalog bytes the TS and PY corpora seed for `catalog-authoritative-shard-id`.
+        assert_eq!(hex, "59594453010000000000000000000000000100000008000000637573746f6d2d370000000000000000");
+
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(CATALOG_FILE), &bytes).unwrap();
+        let shard = encode_snapshot(&BTreeMap::from([shared_record("public.seed", b"k", b"v", 1)]), 2).unwrap();
+        fs::write(dir.join("custom-7.yykv"), &shard).unwrap();
+
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(Path::new(&store.shard_path()).file_name().unwrap().to_string_lossy(), "custom-7.yykv");
+        assert_eq!(store.get("public.seed", b"k"), Some(b"v".to_vec()));
+        assert_eq!(fs::read(store.catalog_path()).unwrap(), bytes, "opening must not rewrite shared catalog bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nul_shard_id_stays_unusable() {
+        let dir = temporary("catalog-interop-nul");
+        let bytes = encode_catalog(None, None, &[ShardId("a\0b".to_owned())], None, &[]).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(CATALOG_FILE), &bytes).unwrap();
+        assert_eq!(Store::open(&dir).err().unwrap().message(), "catalog shard id is unusable");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Assembles one shared-codec record, i.e. exactly what a node outside this
