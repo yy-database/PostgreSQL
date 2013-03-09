@@ -23,6 +23,7 @@ use std::sync::Mutex;
 use database_formats::yy::yyds::{
     decode_catalog_shard_id as shared_catalog_shard_id, encode_catalog, CATALOG_MAGIC,
 };
+use database_formats::yy::yykv::kv_format::checksum as shard_checksum;
 use database_formats::yy::yykv::{
     decode_snapshot_strict, encode_snapshot, InlineValue, Key, Record as ShardRecord, Snapshot, StoredValue, KV_LEGACY_MAGIC,
     KV_MAGIC,
@@ -77,37 +78,148 @@ fn shard_message(message: &'static str) -> &'static str {
     }
 }
 
-/// One stored row: the shard-assigned revision plus its inline bytes.
+/// Byte length of the shard body header: `next_revision u64` plus count `u32`.
+const SHARD_HEADER_LEN: usize = 12;
+
+/// Fixed prefix the shared snapshot encoder writes before its first record:
+/// magic `5`, checksum `8`, `next_revision` `8` and count `4`.
+const SNAPSHOT_PREFIX_LEN: usize = KV_MAGIC.len() + 8 + 8 + 4;
+
+/// One stored row: the shard-assigned revision, its inline bytes, and where the
+/// encoded record sits inside [`Inner::body`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Record {
     revision: u64,
     value: Vec<u8>,
+    start: usize,
 }
 
 struct Inner {
     records: BTreeMap<(String, Vec<u8>), Record>,
     next_revision: u64,
+    /// Canonical shard body: the 12-byte header followed by every encoded record
+    /// in `records` order. A mutation splices only the affected record, so the
+    /// shard is never re-encoded as a whole.
+    body: Vec<u8>,
 }
 
 impl Inner {
-    fn encode_shard(&self) -> Result<Vec<u8>, PostgresError> {
-        let snapshot = self
-            .records
-            .iter()
-            .map(|((namespace, bytes), record)| {
-                let key = Key::new(namespace.clone(), bytes.clone());
-                let stored = ShardRecord {
-                    key: key.clone(),
-                    value: StoredValue::Inline(InlineValue(record.value.clone())),
-                    revision: record.revision,
-                    expires_at: None,
-                };
-                (key, stored)
-            })
-            .collect::<BTreeMap<_, _>>();
-        encode_snapshot(&snapshot, self.next_revision).map_err(shard_error)
+    fn empty() -> Self {
+        let mut inner = Self {
+            records: BTreeMap::new(),
+            next_revision: 1,
+            body: vec![0; SHARD_HEADER_LEN],
+        };
+        inner.sync_header();
+        inner
+    }
+
+    fn from_decoded(records: BTreeMap<(String, Vec<u8>), Record>, next_revision: u64) -> Result<Self, PostgresError> {
+        let mut inner = Self { records, next_revision, body: Vec::new() };
+        inner.rebuild_body()?;
+        Ok(inner)
+    }
+
+    fn sync_header(&mut self) {
+        self.body[..8].copy_from_slice(&self.next_revision.to_le_bytes());
+        self.body[8..SHARD_HEADER_LEN].copy_from_slice(&(self.records.len() as u32).to_le_bytes());
+    }
+
+    /// Re-encodes every record. Used at open and for namespace-wide removals;
+    /// the steady-state write path never calls it.
+    fn rebuild_body(&mut self) -> Result<(), PostgresError> {
+        let mut body = vec![0_u8; SHARD_HEADER_LEN];
+        for ((namespace, key), record) in &mut self.records {
+            let bytes = encode_record(namespace, key, record.revision, &record.value)?;
+            record.start = body.len();
+            body.extend_from_slice(&bytes);
+        }
+        self.body = body;
+        self.sync_header();
+        Ok(())
+    }
+
+    /// Inserts or overwrites one row and splices only that record into the body.
+    fn write_row(&mut self, namespace: &str, key: &[u8], revision: u64, value: &[u8]) -> Result<(), PostgresError> {
+        let bytes = encode_record(namespace, key, revision, value)?;
+        let lookup = (namespace.to_owned(), key.to_vec());
+        let (offset, replaced) = match self.records.get(&lookup) {
+            Some(record) => {
+                let start = record.start;
+                (start, self.span_end(&lookup) - start)
+            }
+            None => (self.insert_offset(&lookup), 0),
+        };
+        self.body.splice(offset..offset + replaced, bytes.iter().copied());
+        let delta = bytes.len() as isize - replaced as isize;
+        self.shift_starts(&lookup, offset + replaced, delta);
+        self.records.insert(lookup, Record { revision, value: value.to_vec(), start: offset });
+        self.next_revision = revision.saturating_add(1);
+        self.sync_header();
+        Ok(())
+    }
+
+    /// Removes one row and splices its bytes out of the body.
+    fn remove_row(&mut self, key: &(String, Vec<u8>)) -> bool {
+        let (start, end) = match self.records.get(key) {
+            Some(record) => {
+                let start = record.start;
+                (start, self.span_end(key))
+            }
+            None => return false,
+        };
+        self.body.drain(start..end);
+        self.records.remove(key);
+        self.shift_starts(key, end, -((end - start) as isize));
+        self.sync_header();
+        true
+    }
+
+    /// Byte offset where the next record after `key` starts, or the body end.
+    fn span_end(&self, key: &(String, Vec<u8>)) -> usize {
+        self.records.range(key.clone()..).nth(1).map(|(_, record)| record.start).unwrap_or(self.body.len())
+    }
+
+    /// Byte offset a record inserted at `key` would occupy.
+    fn insert_offset(&self, key: &(String, Vec<u8>)) -> usize {
+        self.records.range(key.clone()..).next().map(|(_, record)| record.start).unwrap_or(self.body.len())
+    }
+
+    /// Shifts the cached offsets of every record at or after `threshold`.
+    fn shift_starts(&mut self, key: &(String, Vec<u8>), threshold: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        for (_, record) in self.records.range_mut(key.clone()..) {
+            if record.start >= threshold {
+                record.start = (record.start as isize + delta) as usize;
+            }
+        }
     }
 }
+
+/// Encodes one record by asking the shared codec for a one-record snapshot and
+/// dropping its fixed prefix, so the record layout stays in `database-formats`.
+fn encode_record(namespace: &str, key: &[u8], revision: u64, value: &[u8]) -> Result<Vec<u8>, PostgresError> {
+    let key = Key::new(namespace, key.to_vec());
+    let record = ShardRecord {
+        key: key.clone(),
+        value: StoredValue::Inline(InlineValue(value.to_vec())),
+        revision,
+        expires_at: None,
+    };
+    let snapshot = BTreeMap::from([(key, record)]);
+    // `revision + 1` satisfies the shared guard that every record sits below
+    // `next_revision`.
+    let bytes = encode_snapshot(&snapshot, revision.saturating_add(1)).map_err(shard_error)?;
+    Ok(bytes[SNAPSHOT_PREFIX_LEN..].to_vec())
+}
+
+fn persist(path: &Path, inner: &Inner) -> Result<(), PostgresError> {
+    let checksum = shard_checksum(&inner.body);
+    write_atomic(path, &[KV_MAGIC, &checksum.to_le_bytes(), &inner.body])
+}
+
 
 fn decode_shard(bytes: &[u8]) -> Result<(BTreeMap<(String, Vec<u8>), Record>, u64), PostgresError> {
     // Header checks stay here so the shared decoder's generic EOF/legacy
@@ -144,7 +256,7 @@ fn decode_shard(bytes: &[u8]) -> Result<(BTreeMap<(String, Vec<u8>), Record>, u6
         let StoredValue::Inline(value) = record.value else {
             return Err(protocol("unknown shard record tag"));
         };
-        shard.insert((key.namespace.0, key.bytes), Record { revision: record.revision, value: value.0 });
+        shard.insert((key.namespace.0, key.bytes), Record { revision: record.revision, value: value.0, start: 0 });
     }
     Ok((shard, next_revision))
 }
@@ -206,17 +318,59 @@ fn legacy_catalog_bytes(bytes: &[u8]) -> bool {
         && bytes[13..17] == [0, 0, 0, 1]
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PostgresError> {
+/// Test-only fault points inside [`write_atomic`], so crash safety can be
+/// exercised without killing the process.
+#[cfg(test)]
+mod fault {
+    use std::cell::Cell;
+
+    pub const NONE: u8 = 0;
+    pub const BEFORE_RENAME: u8 = 1;
+    pub const AFTER_RENAME: u8 = 2;
+
+    // Thread-local so parallel unit tests never share an armed fault point.
+    thread_local! {
+        static POINT: Cell<u8> = const { Cell::new(NONE) };
+    }
+
+    pub fn arm(point: u8) {
+        POINT.with(|slot| slot.set(point));
+    }
+
+    pub fn disarm() {
+        POINT.with(|slot| slot.set(NONE));
+    }
+
+    pub fn armed(point: u8) -> bool {
+        POINT.with(|slot| slot.get() == point)
+    }
+}
+
+fn write_atomic(path: &Path, parts: &[&[u8]]) -> Result<(), PostgresError> {
     use std::io::Write;
 
     let mut temp = path.as_os_str().to_owned();
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
     let mut file = fs::File::create(&temp).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
-    file.write_all(bytes).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
+    for part in parts {
+        file.write_all(part).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
+    }
     file.sync_all().map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
     drop(file);
-    fs::rename(&temp, path).map_err(|error| io_error(format!("{} -> {}: {error}", temp.display(), path.display())))
+    // The temp file is complete and durable, but the shard is still untouched.
+    #[cfg(test)]
+    if fault::armed(fault::BEFORE_RENAME) {
+        return Err(io_error(format!("{}: injected failure before rename", temp.display())));
+    }
+    fs::rename(&temp, path).map_err(|error| io_error(format!("{} -> {}: {error}", temp.display(), path.display())))?;
+    // The swap already happened, so the new shard is live even though the call
+    // reports failure.
+    #[cfg(test)]
+    if fault::armed(fault::AFTER_RENAME) {
+        return Err(io_error(format!("{}: injected failure after rename", path.display())));
+    }
+    Ok(())
 }
 
 /// A durable namespace/key store backed by one `.yyds` catalog and one `.yykv` shard.
@@ -245,17 +399,17 @@ impl Store {
         };
         let shard = dir.join(format!("{shard_id}.yykv"));
         if !catalog.exists() {
-            write_atomic(&catalog, &encode_catalog_bytes(&shard_id)?)?;
+            write_atomic(&catalog, &[&encode_catalog_bytes(&shard_id)?])?;
         }
         let inner = if shard.exists() {
             let bytes = fs::read(&shard).map_err(io_error)?;
             let (records, next_revision) = decode_shard(&bytes)?;
-            Inner { records, next_revision }
+            Inner::from_decoded(records, next_revision)?
         } else {
-            Inner { records: BTreeMap::new(), next_revision: 1 }
+            Inner::empty()
         };
         if !shard.exists() {
-            write_atomic(&shard, &inner.encode_shard()?)?;
+            persist(&shard, &inner)?;
         }
         Ok(Self { dir, catalog, shard, inner: Mutex::new(inner) })
     }
@@ -280,12 +434,8 @@ impl Store {
         validate_namespace(namespace)?;
         let mut inner = self.inner.lock().expect("store lock");
         let revision = inner.next_revision;
-        inner.next_revision += 1;
-        inner
-            .records
-            .insert((namespace.to_owned(), key.to_vec()), Record { revision, value: value.to_vec() });
-        let bytes = inner.encode_shard()?;
-        write_atomic(&self.shard, &bytes)
+        inner.write_row(namespace, key, revision, value)?;
+        persist(&self.shard, &inner)
     }
 
     /// Reads one row, or `None` when the key is absent.
@@ -297,10 +447,9 @@ impl Store {
     /// Removes one row and reports whether it existed.
     pub fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, PostgresError> {
         let mut inner = self.inner.lock().expect("store lock");
-        let removed = inner.records.remove(&(namespace.to_owned(), key.to_vec())).is_some();
+        let removed = inner.remove_row(&(namespace.to_owned(), key.to_vec()));
         if removed {
-            let bytes = inner.encode_shard()?;
-            write_atomic(&self.shard, &bytes)?;
+            persist(&self.shard, &inner)?;
         }
         Ok(removed)
     }
@@ -351,8 +500,8 @@ impl Store {
         inner.records.retain(|(name, _), _| name != namespace);
         let removed = before - inner.records.len();
         if removed > 0 {
-            let bytes = inner.encode_shard()?;
-            write_atomic(&self.shard, &bytes)?;
+            inner.rebuild_body()?;
+            persist(&self.shard, &inner)?;
         }
         Ok(removed)
     }
@@ -541,6 +690,83 @@ mod tests {
         let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         // Same empty-shard bytes the TS and PY corpora seed in `store.json`.
         assert_eq!(hex, "59594b5603e42b42c2392d245f010000000000000000000000");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_writes_stay_byte_identical_to_a_full_encode() {
+        let dir = temporary("incremental-bytes");
+        let store = Store::open(&dir).unwrap();
+        let big = [9_u8; 257];
+        let long_key = [3_u8; 40];
+        let steps: Vec<(&str, &[u8], Option<&[u8]>)> = vec![
+            ("public.users", b"u2", Some(b"bob")),
+            ("public.users", b"u1", Some(b"alice")),
+            ("public.users", b"u3", Some(big.as_slice())),
+            ("public.users", b"u2", Some(b"bobby")),
+            ("public.users", b"u2", None),
+            ("public.audit", b"a1", Some(b"")),
+            ("public.audit", b"a0", Some(b"zero")),
+            ("sys.utf8", "雪".as_bytes(), Some(long_key.as_slice())),
+            ("public.users", b"u1", Some(b"alice-again")),
+        ];
+        let mut expected: BTreeMap<(String, Vec<u8>), (u64, Vec<u8>)> = BTreeMap::new();
+        let mut next_revision = 1_u64;
+        for (namespace, key, value) in steps {
+            match value {
+                Some(value) => {
+                    store.put(namespace, key, value).unwrap();
+                    expected.insert((namespace.to_owned(), key.to_vec()), (next_revision, value.to_vec()));
+                    next_revision += 1;
+                }
+                None => {
+                    store.delete(namespace, key).unwrap();
+                    expected.remove(&(namespace.to_owned(), key.to_vec()));
+                }
+            }
+            let written = fs::read(store.shard_path()).unwrap();
+            let snapshot = expected
+                .iter()
+                .map(|((namespace, key), (revision, value))| shared_record(namespace, key, value, *revision))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(written, encode_snapshot(&snapshot, next_revision).unwrap());
+        }
+        drop(store);
+        let reopened = Store::open(&dir).unwrap();
+        assert_eq!(reopened.get("public.users", b"u1"), Some(b"alice-again".to_vec()));
+        assert_eq!(reopened.get("public.users", b"u2"), None);
+        assert_eq!(reopened.get("sys.utf8", "雪".as_bytes()), Some(long_key.to_vec()));
+        drop(reopened);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_rename_leaves_either_the_old_or_the_new_shard() {
+        let dir = temporary("fault-rename");
+        let store = Store::open(&dir).unwrap();
+        store.put("public.users", b"u1", b"alice").unwrap();
+        let old = fs::read(store.shard_path()).unwrap();
+
+        fault::arm(fault::BEFORE_RENAME);
+        let interrupted = store.put("public.users", b"u2", b"bob");
+        fault::disarm();
+        assert!(interrupted.is_err(), "the interrupted write must surface as an error");
+        assert_eq!(fs::read(store.shard_path()).unwrap(), old, "a failure before rename must keep the old shard");
+        let reopened = Store::open(&dir).unwrap();
+        assert_eq!(reopened.get("public.users", b"u1"), Some(b"alice".to_vec()));
+        assert_eq!(reopened.get("public.users", b"u2"), None);
+        drop(reopened);
+
+        fault::arm(fault::AFTER_RENAME);
+        let interrupted = store.put("public.users", b"u2", b"bob");
+        fault::disarm();
+        assert!(interrupted.is_err(), "a failure after the swap still reports an error");
+        let reopened = Store::open(&dir).unwrap();
+        assert_eq!(reopened.get("public.users", b"u1"), Some(b"alice".to_vec()));
+        assert_eq!(reopened.get("public.users", b"u2"), Some(b"bob".to_vec()));
+        let bytes = fs::read(reopened.shard_path()).unwrap();
+        assert_eq!(decode_shard(&bytes).unwrap().0.len(), 2, "the swapped shard must decode cleanly");
+        drop(reopened);
         let _ = fs::remove_dir_all(&dir);
     }
 }

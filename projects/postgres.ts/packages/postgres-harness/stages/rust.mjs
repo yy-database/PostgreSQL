@@ -23,6 +23,6 @@ export async function runRust(repositoryRoot, env) {
         name: 'rust',
         output,
         counts: { executed, skipped, failed: failed + (result.status === 0 ? 0 : 1) },
-        floor: 30,
+        floor: 32,
     };
 }
