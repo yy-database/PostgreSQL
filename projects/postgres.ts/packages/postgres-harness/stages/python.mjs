@@ -58,6 +58,6 @@ export async function runPythonSuite(repositoryRoot, harnessDir, env) {
         name: 'python',
         output,
         counts: { executed: summary.executed, skipped: summary.skipped ?? 0, failed },
-        floor: 1048,
+        floor: 1054,
     };
 }

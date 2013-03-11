@@ -9,7 +9,8 @@
         "postgres-harness": "./cli.mjs"
     },
     "scripts": {
-        "test": "node ./cli.mjs test"
+        "test": "node ./cli.mjs test",
+        "sql-diff": "node ./scripts/sql-diff.mjs"
     },
     "devDependencies": {
         "@electric-sql/pglite": "0.5.15",

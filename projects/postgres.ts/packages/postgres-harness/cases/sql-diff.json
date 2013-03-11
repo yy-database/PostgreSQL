@@ -1,0 +1,31 @@
+[
+    {
+        "name": "known-notice-not-surfaced",
+        "cluster": "gap",
+        "reason": "PGlite sends a NoticeResponse for this statement and the wire reply still carries the DROP TABLE tag. This package has no notice channel, so the notice text is not part of the observable surface.",
+        "pglite": "NOTICE: table \"gap_probe_missing\" does not exist, skipping",
+        "setup": [],
+        "sql": "DROP TABLE IF EXISTS sqldiff.gap_probe_missing",
+        "expect": [
+            { "columns": [], "rows": [], "tag": "DROP TABLE" }
+        ]
+    },
+    {
+        "name": "known-error-fields-reduced",
+        "cluster": "gap",
+        "reason": "PGlite sends C, F, L, M, P, R, S and V in the ErrorResponse. Only the code and the message survive decoding, so position, detail, hint and object names are invisible to callers.",
+        "pglite": "code 22P02 with position P=8 and every other ErrorResponse field",
+        "setup": [],
+        "sql": "SELECT 'oops'::int",
+        "expectError": "22P02: invalid input syntax for type integer: \"oops\""
+    },
+    {
+        "name": "known-partial-results-dropped",
+        "cluster": "gap",
+        "reason": "PGlite returns the SELECT 1 row before it reports division by zero. The public execute call throws on the first error and discards the earlier statement results.",
+        "pglite": "SELECT 1 row [\"1\"] followed by 22012: division by zero",
+        "setup": [],
+        "sql": "SELECT 1 AS a; SELECT 1 / 0",
+        "expectError": "22012: division by zero"
+    }
+]

@@ -97,6 +97,48 @@ for (const item of sqlCases) {
 const sqlExecuted = counters.executed;
 
 // -------------------------------------------------------------------------------
+// Known differences from PGlite, frozen as assertions. `cases/sql-diff.json`
+// records the PGlite reply and the reason next to every entry produced by
+// `scripts/sql-diff.mjs`, so these guard the documented gap instead of hiding it.
+// --------------------------------------------------------------------------
+for (const item of loadCase('sql-diff.json')) {
+    const key = `sql-diff/${item.name}`;
+    try {
+        for (const statement of item.setup ?? []) connection.execute(statement);
+        if (item.expectError) {
+            let observed = null;
+            try {
+                connection.execute(item.sql);
+            } catch (error) {
+                observed = error.message;
+            }
+            actual[key] = observed === null ? { message: null } : { code: observed.slice(0, 5), message: observed };
+            expectEqual(`${key}/error`, observed, item.expectError);
+        } else {
+            const results = connection.execute(item.sql);
+            const normalized = results.map((result) => ({
+                columns: result.columns.map((column) => column.name),
+                rows: result.rows.map((row) => row.values.map(text)),
+                tag: result.tag,
+            }));
+            actual[key] = normalized;
+            expectEqual(`${key}/result-count`, normalized.length, item.expect.length);
+            item.expect.forEach((expected, index) => {
+                expectEqual(`${key}/${index}/columns`, normalized[index]?.columns, expected.columns);
+                expectEqual(`${key}/${index}/rows`, normalized[index]?.rows, expected.rows);
+                expectEqual(`${key}/${index}/tag`, normalized[index]?.tag, expected.tag);
+            });
+        }
+        for (const statement of item.teardown ?? []) connection.execute(statement);
+    } catch (error) {
+        actual[key] = { error: error.message };
+        check(`${key}/run`, () => {
+            throw new Error(error.message);
+        });
+    }
+}
+
+// -------------------------------------------------------------------------------
 // Server errors and recovery on a still-open connection.
 // --------------------------------------------------------------------------
 for (const item of loadCase('errors.json')) {

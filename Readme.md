@@ -56,6 +56,21 @@ unrelated KV primitive: `local-0.yyds` and `local-0.yykv` are written only when
 a caller uses `Store` directly. `postgres-client` neither imports nor calls
 `Store`, so **SQL and the `.yyds`/`.yykv` store are not wired together**.
 
+## SQL compatibility gaps
+
+[`docs/sql-compatibility-gaps.md`](./docs/sql-compatibility-gaps.md) is the
+current gap list. It is regenerated from a seeded corpus by
+
+```shell
+node projects/postgres.ts/packages/postgres-harness/scripts/sql-diff.mjs --seed 20261106
+```
+
+118 statements (ddl 20, dml 22, expr 34, agg 22, cast 20) run serially on the
+`sqldiff` staging schema, never on `public`. Every expected value comes from
+PGlite 0.5.15 through `execProtocolRaw` and an independent protocol decoder, so
+this repository is never its own reference. The same seed rewrites
+byte-identical report files; `--only <case>` reruns one statement.
+
 ## Testing
 
 ```shell
@@ -64,8 +79,8 @@ pnpm test
 
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
-one shared corpus on both language surfaces. Floors: node 1048, python 1048,
-rust 24; TS and Python results must match case by case; `skipped` must stay 0.
+one shared corpus on both language surfaces. Floors: node 1054, python 1054,
+rust 32; TS and Python results must match case by case; `skipped` must stay 0.
 
 ## Wiring SQL onto this repository's storage (not started)
 

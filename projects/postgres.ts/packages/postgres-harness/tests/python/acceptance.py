@@ -144,6 +144,39 @@ for item in load_case("sql.json"):
         actual[key] = {"error": str(error)}
         check(f"{key}/run", lambda error=error: (_ for _ in ()).throw(AssertionError(str(error))))
 
+# -------------------------------------------------------------------------------
+# Known differences from PGlite, frozen as assertions. `cases/sql-diff.json`
+# records the PGlite reply and the reason next to every entry produced by
+# `scripts/sql-diff.mjs`, so these guard the documented gap instead of hiding it.
+# -------------------------------------------------------------------------------
+for item in load_case("sql-diff.json"):
+    key = f"sql-diff/{item['name']}"
+    try:
+        for statement in item.get("setup", []):
+            connection.execute(statement)
+        if "expectError" in item:
+            try:
+                connection.execute(item["sql"])
+                actual[key] = {"message": None}
+                expect_equal(f"{key}/error", None, item["expectError"])
+            except PostgresError as error:
+                actual[key] = {"code": str(error)[:5], "message": str(error)}
+                expect_equal(f"{key}/error", str(error), item["expectError"])
+        else:
+            results = normalize(connection.execute(item["sql"]))
+            actual[key] = results
+            expect_equal(f"{key}/result-count", len(results), len(item["expect"]))
+            for index, expected in enumerate(item["expect"]):
+                result = results[index]
+                expect_equal(f"{key}/{index}/columns", result["columns"], expected["columns"])
+                expect_equal(f"{key}/{index}/rows", result["rows"], expected["rows"])
+                expect_equal(f"{key}/{index}/tag", result["tag"], expected["tag"])
+        for statement in item.get("teardown", []):
+            connection.execute(statement)
+    except Exception as error:  # noqa: BLE001 - a failing case is a failed assertion
+        actual[key] = {"error": str(error)}
+        check(f"{key}/run", lambda error=error: (_ for _ in ()).throw(AssertionError(str(error))))
+
 sql_executed = counters["executed"]
 
 # -------------------------------------------------------------------------------

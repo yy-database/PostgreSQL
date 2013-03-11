@@ -1,0 +1,139 @@
+{
+    "seed": 20261106,
+    "engine": "PGlite 0.5.15 through execProtocolRaw and an independent protocol decoder",
+    "corpus": {
+        "total": 118,
+        "clusters": {
+            "ddl": 20,
+            "dml": 22,
+            "expr": 34,
+            "agg": 22,
+            "cast": 20
+        },
+        "digest": "6825c48b20c7e36d8d74c1d6652cf7ae85969bc6d6cd25ba91538408ab165e03"
+    },
+    "executed": 118,
+    "diffs": [],
+    "boundary": [
+        {
+            "name": "binary-result-format",
+            "feature": "binary result format",
+            "statement": null,
+            "repoError": "unsupported: binary-result-format",
+            "repoResults": null
+        },
+        {
+            "name": "portal-row-limit",
+            "feature": "portal row limit",
+            "statement": null,
+            "repoError": "unsupported: execute-row-limit",
+            "repoResults": null
+        },
+        {
+            "name": "oversized-query",
+            "feature": "query larger than 16MiB",
+            "statement": null,
+            "repoError": "query exceeds the byte limit",
+            "repoResults": null
+        },
+        {
+            "name": "copy-out",
+            "feature": "COPY TO STDOUT",
+            "statement": "COPY (SELECT 1) TO STDOUT",
+            "repoError": "unsupported PostgreSQL response tag 72",
+            "repoResults": null
+        },
+        {
+            "name": "listen-notify",
+            "feature": "NotificationResponse",
+            "statement": "SELECT 1 AS n; NOTIFY sqldiff_chan",
+            "repoError": "unsupported PostgreSQL response tag 65",
+            "repoResults": null
+        },
+        {
+            "name": "copy-in",
+            "feature": "COPY FROM STDIN",
+            "statement": "COPY sqldiff.stage FROM STDIN",
+            "repoError": "unsupported PostgreSQL response tag 71",
+            "repoResults": null
+        }
+    ],
+    "gaps": [
+        {
+            "name": "notice-discarded",
+            "surface": "NoticeResponse",
+            "reason": "Only DataRow, RowDescription, CommandComplete and ErrorResponse reach the caller. NoticeResponse is read off the socket and dropped, so NOTICE and WARNING text can never be shown, although PostgreSQL emits it for routine DDL.",
+            "statement": "DROP TABLE IF EXISTS sqldiff.gap_probe_missing",
+            "repo": [
+                {
+                    "columns": [],
+                    "rows": [],
+                    "tag": "DROP TABLE"
+                }
+            ],
+            "pglite": {
+                "results": [
+                    {
+                        "columns": [],
+                        "rows": [],
+                        "tag": "DROP TABLE"
+                    }
+                ],
+                "notices": [
+                    "table \"gap_probe_missing\" does not exist, skipping"
+                ]
+            }
+        },
+        {
+            "name": "error-fields-dropped",
+            "surface": "ErrorResponse fields",
+            "reason": "ErrorResponse is reduced to C and M. Position P, detail D, hint H and the object name fields never reach the caller, so psql cannot draw an error caret and structured diagnostics are unavailable.",
+            "statement": "SELECT 'oops'::int",
+            "repo": {
+                "code": "22P02",
+                "message": "invalid input syntax for type integer: \"oops\""
+            },
+            "pglite": {
+                "error": "22P02: invalid input syntax for type integer: \"oops\"",
+                "fields": [
+                    "C",
+                    "F",
+                    "L",
+                    "M",
+                    "P",
+                    "R",
+                    "S",
+                    "V"
+                ]
+            }
+        },
+        {
+            "name": "partial-results-dropped",
+            "surface": "multi-statement error",
+            "reason": "execute throws on the first error and discards the StatementResult entries already decoded for earlier statements of the same simple-query batch.",
+            "statement": "SELECT 1 AS a; SELECT 1 / 0",
+            "repo": {
+                "code": "22012",
+                "message": "division by zero"
+            },
+            "pglite": {
+                "results": [
+                    {
+                        "columns": [
+                            "a"
+                        ],
+                        "rows": [
+                            [
+                                "1"
+                            ]
+                        ],
+                        "tag": "SELECT 1"
+                    }
+                ],
+                "error": "22012: division by zero"
+            }
+        }
+    ],
+    "notices": [],
+    "gated": 3
+}
