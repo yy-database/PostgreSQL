@@ -5,19 +5,28 @@
  * it waits for a reply, so the socket server and the oracle both need their own
  * event loop. The runtime hosts two independent PGlite instances:
  *
- * - `oracle` answers expectations through `execProtocolRaw`, decoded here by an
- *   independent protocol reader, so no expectation passes through this
- *   repository's decoder.
+ * - `oracle` answers simple-query expectations through `execProtocolRaw`,
+ *   decoded here by an independent protocol reader, so no expectation passes
+ *   through this repository's decoder.
  * - `server` sits behind `PGLiteSocketServer`; the repository client connects to
  *   it exactly like the acceptance harness does.
+ * - `extended` sits behind a second socket server and is driven by `pg`, an
+ *   independent client that speaks the real Parse/Bind/Execute/Sync flow. It
+ *   answers the extended-query cluster, which `execProtocolRaw` cannot serve
+ *   because it accepts one simple-query message per call.
  *
- * Both instances receive the same statements in the same order, so their state
- * stays in step while the driver compares one reply with the other.
+ * Both simple-query instances receive the same statements in the same order, so
+ * their state stays in step while the driver compares one reply with the other. The
+ * extended instance receives the same setup and teardown, and answers with rows
+ * whose value parsers are disabled so every value stays the server's text.
  */
 import net from 'node:net';
 
 import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
+import pg from 'pg';
+
+const { Client } = pg;
 
 const SESSION_SETTINGS = [
     "SET TimeZone = 'UTC'",
@@ -213,6 +222,30 @@ const port = await freePort();
 const server = new PGLiteSocketServer({ db: serverDb, port, host: '127.0.0.1', maxConnections: 4 });
 await server.start();
 
+// Extended-query oracle. A raw simple-query call on the same PGlite instance
+// would interleave with this socket, so the extended corpus gets its own
+// instance and its own port. `pg` is an independent client, and its value
+// parsers are disabled to keep every value in the server's text form.
+const extendedDb = new PGlite();
+await extendedDb.waitReady;
+const extendedPort = await freePort();
+const extendedServer = new PGLiteSocketServer({ db: extendedDb, port: extendedPort, host: '127.0.0.1', maxConnections: 2 });
+await extendedServer.start();
+const extendedClient = new Client({
+    host: '127.0.0.1',
+    port: extendedPort,
+    user: 'postgres',
+    database: 'postgres',
+    types: { getTypeParser: () => (value) => value },
+});
+await extendedClient.connect();
+// The staging schema exists before the extended cases add their tables.
+await extendedClient.query({ text: 'CREATE SCHEMA IF NOT EXISTS sqldiff', rowMode: 'array' });
+
+function extendedRow(reply) {
+    return { columns: reply.fields.map((field) => field.name), rows: reply.rows, verb: reply.command, rowCount: reply.rowCount };
+}
+
 async function run(sql) {
     try {
         return decodeReply(await oracle.execProtocolRaw(queryBytes(sql)));
@@ -230,7 +263,38 @@ process.on('message', async (message) => {
         process.send({ id: message.id, result: await run(message.sql) });
         return;
     }
+    if (message.op === 'extended-simple') {
+        try {
+            await extendedClient.query({ text: message.sql, rowMode: 'array' });
+            process.send({ id: message.id, result: { error: null } });
+        } catch (error) {
+            process.send({ id: message.id, result: { error: { code: error.code ?? 'client', message: error.message } } });
+        }
+        return;
+    }
+    if (message.op === 'extended') {
+        const results = [];
+        let error = null;
+        try {
+            for (const values of message.paramSets) {
+                const reply = await extendedClient.query({
+                    ...(message.name ? { name: message.name } : {}),
+                    text: message.text,
+                    values,
+                    rowMode: 'array',
+                });
+                results.push(extendedRow(reply));
+            }
+        } catch (failure) {
+            error = { code: failure.code ?? 'client', message: failure.message };
+        }
+        process.send({ id: message.id, result: { results, error, raw: null } });
+        return;
+    }
     if (message.op === 'shutdown') {
+        await extendedClient.end();
+        await extendedServer.stop();
+        await extendedDb.close();
         await server.stop();
         await oracle.close();
         await serverDb.close();

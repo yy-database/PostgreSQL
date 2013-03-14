@@ -2,18 +2,43 @@
     "seed": 20261106,
     "engine": "PGlite 0.5.15 through execProtocolRaw and an independent protocol decoder",
     "corpus": {
-        "total": 118,
+        "total": 212,
         "clusters": {
             "ddl": 20,
             "dml": 22,
             "expr": 34,
             "agg": 22,
-            "cast": 20
+            "cast": 20,
+            "transaction": 20,
+            "cursor": 14,
+            "cast-matrix": 24,
+            "constraint": 20,
+            "extended": 16
         },
-        "digest": "6825c48b20c7e36d8d74c1d6652cf7ae85969bc6d6cd25ba91538408ab165e03"
+        "digest": "1403963a5f5083ea4f6f40234f7c393c32de43ae680e7fcac218036be7a9711a"
     },
-    "executed": 118,
-    "diffs": [],
+    "executed": 212,
+    "diffs": [
+        {
+            "id": 204,
+            "cluster": "extended",
+            "name": "params-missing",
+            "statement": "SELECT $1::int AS n",
+            "params": [
+                []
+            ],
+            "reason": "error-shape",
+            "repo": {
+                "error": "08P01: bind message supplies 0 parameters, but prepared statement \"\" requires 1"
+            },
+            "pglite": {
+                "error": "42P02: there is no parameter $1",
+                "results": [],
+                "raw": null
+            },
+            "repro": "node projects/postgres.ts/packages/postgres-harness/scripts/sql-diff.mjs --seed 20261106 --only params-missing"
+        }
+    ],
     "boundary": [
         {
             "id": "boundary/binary-result-format",
@@ -348,7 +373,23 @@
             "reason": "`executeReport` keeps every completed result before the error, matching the PGlite reply order T, D, C, E, Z."
         }
     ],
-    "notices": [],
+    "notices": [
+        {
+            "cluster": "transaction",
+            "name": "commit-without-begin",
+            "count": 1
+        },
+        {
+            "cluster": "transaction",
+            "name": "rollback-without-begin",
+            "count": 1
+        },
+        {
+            "cluster": "transaction",
+            "name": "begin-twice",
+            "count": 1
+        }
+    ],
     "gated": 3,
     "isolation": {
         "publicObjects": {
@@ -358,12 +399,12 @@
     },
     "baseline": {
         "path": "projects\\postgres.ts\\packages\\postgres-harness\\corpus\\sql-differential-baseline.json",
-        "entries": 6,
+        "entries": 7,
         "reasons": {
             "structured-rejection": 1,
             "not-implemented": 2,
             "out-of-scope": 3,
-            "oracle-disagreement": 0
+            "oracle-disagreement": 1
         }
     }
 }

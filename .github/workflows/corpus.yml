@@ -30,4 +30,4 @@ jobs:
       - name: Build the native binding
         run: node scripts/build-napi.mjs
       - name: Differential corpus gate
-        run: pnpm corpus -- --seed 20261106 --count 118 --check
+        run: pnpm corpus -- --seed 20261106 --count 212 --check

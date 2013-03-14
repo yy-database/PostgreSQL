@@ -65,26 +65,31 @@ current gap list. It is regenerated from a seeded corpus by
 node projects/postgres.ts/packages/postgres-harness/scripts/sql-diff.mjs --seed 20261106
 ```
 
-118 statements (ddl 20, dml 22, expr 34, agg 22, cast 20) run serially on the
-`sqldiff` staging schema, never on `public`. Every expected value comes from
-PGlite 0.5.15 through `execProtocolRaw` and an independent protocol decoder, so
-this repository is never its own reference. The same seed rewrites
-byte-identical report files; `--only <case>` reruns one statement and does not
-rewrite the checked-in report.
+212 statements (ddl 20, dml 22, expr 34, agg 22, cast 20, transaction 20, cursor 14,
+cast-matrix 24, constraint 20, extended 16) run serially on the `sqldiff` staging
+schema, never on `public`. Every expected value comes from PGlite 0.5.15 through
+`execProtocolRaw` and an independent protocol decoder, so this repository is never
+its own reference. The `extended` cluster covers parameterized execution,
+prepared-statement reuse and portal rebinding, and is answered by the `pg` driver
+over a real Parse/Bind/Execute/Sync session against a separate PGlite socket,
+because `execProtocolRaw` accepts one simple-query message per call. The same seed
+rewrites byte-identical report files; `--only <case>` reruns one statement and does
+not rewrite the checked-in report.
 
 The `differential corpus` CI job gates the same run:
 
 ```shell
-pnpm corpus -- --seed 20261106 --count 118 --check
+pnpm corpus -- --seed 20261106 --count 212 --check
 ```
 
-`corpus/sql-differential-baseline.json` pins the seed, the count, the corpus
-digest and the only allowed differences, each classified as a structured
+`corpus/sql-differential-baseline.json` pins the seed, the count, the corpus digest
+`1403963a5f5083ea4f6f40234f7c393c32de43ae680e7fcac218036be7a9711a`
+and the only allowed differences, each classified as a structured
 rejection, a not-implemented feature, an out-of-scope wire feature or an oracle
 disagreement. The gate verifies the identity before any engine starts, rejects
 an unlisted difference with the statement, this repository's output and the raw
 PGlite reply, rejects a changed signal, and rejects a baseline entry that no
-longer differs. `pnpm corpus -- --seed 20261106 --count 118 --update-baseline`
+longer differs. `pnpm corpus -- --seed 20261106 --count 212 --update-baseline`
 regenerates the baseline and drops fixed entries.
 
 The client-surface gaps found by that run are fixed: `Connection::execute_report`

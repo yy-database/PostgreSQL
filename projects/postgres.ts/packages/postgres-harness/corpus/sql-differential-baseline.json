@@ -1,8 +1,8 @@
 {
   "version": 1,
   "seed": 20261106,
-  "count": 118,
-  "digest": "6825c48b20c7e36d8d74c1d6652cf7ae85969bc6d6cd25ba91538408ab165e03",
+  "count": 212,
+  "digest": "1403963a5f5083ea4f6f40234f7c393c32de43ae680e7fcac218036be7a9711a",
   "engines": {
     "pglite": "0.5.15"
   },
@@ -77,6 +77,23 @@
       "detail": "outside the declared surface: portal row limit",
       "signal": [
         "repo error unsupported: execute-row-limit"
+      ]
+    },
+    {
+      "id": 204,
+      "cluster": "extended",
+      "name": "params-missing",
+      "statement": "SELECT $1::int AS n",
+      "params": [
+        []
+      ],
+      "kind": "difference",
+      "reason": "oracle-disagreement",
+      "detail": "both engines reject the statement with different replies: this repository 08P01: bind message supplies 0 parameters, but prepared statement \"\" requires 1, PGlite 42P02: there is no parameter $1",
+      "signal": [
+        "repo error 08P01: bind message supplies 0 parameters, but prepared statement \"\" requires 1",
+        "pglite error 42P02: there is no parameter $1",
+        "raw none"
       ]
     }
   ]

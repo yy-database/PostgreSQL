@@ -41,7 +41,7 @@ const reportMarkdown = path.join(repositoryRoot, 'docs', 'sql-compatibility-gaps
 const knownCases = path.join(harnessDir, 'cases', 'sql-diff.json');
 
 const DEFAULT_SEED = 20261106;
-const DEFAULT_COUNT = 118;
+const DEFAULT_COUNT = 212;
 const PGLITE_VERSION = '0.5.15';
 
 const BASELINE_VERSION = 1;
@@ -520,6 +520,591 @@ function castCluster(gen) {
     return cases;
 }
 
+function transactionCluster(gen) {
+    const cases = [];
+    const table = (index) => `sqldiff.tx_${index}`;
+    const create = (index, body = 'id int PRIMARY KEY, note text') => [`CREATE TABLE ${table(index)} (${body})`];
+    const seed = (index, rows) => [`INSERT INTO ${table(index)} VALUES ${rows.join(', ')}`];
+    const drop = (index) => [`DROP TABLE IF EXISTS ${table(index)} CASCADE`];
+
+    cases.push({
+        name: 'begin-commit-insert',
+        setup: create(1),
+        sql: `BEGIN; INSERT INTO ${table(1)} VALUES (1, '${gen.pick(WORDS)}'); COMMIT; SELECT count(*) AS n FROM ${table(1)}`,
+        teardown: drop(1),
+    });
+    cases.push({
+        name: 'begin-rollback-insert',
+        setup: create(2),
+        sql: `BEGIN; INSERT INTO ${table(2)} VALUES (1, '${gen.pick(WORDS)}'); ROLLBACK; SELECT count(*) AS n FROM ${table(2)}`,
+        teardown: drop(2),
+    });
+    {
+        const rows = seededRows(gen, 3);
+        cases.push({
+            name: 'begin-rollback-multiple',
+            setup: create(3),
+            sql: `BEGIN; INSERT INTO ${table(3)} VALUES ${rows.map((row) => `(${row.id}, '${row.label}')`).join(', ')}; ROLLBACK; SELECT count(*) AS n FROM ${table(3)}`,
+            teardown: drop(3),
+        });
+    }
+    cases.push({
+        name: 'savepoint-rollback-to',
+        setup: create(4),
+        sql: `BEGIN; INSERT INTO ${table(4)} VALUES (1, 'keep'); SAVEPOINT s1; INSERT INTO ${table(4)} VALUES (2, 'drop'); ROLLBACK TO SAVEPOINT s1; COMMIT; SELECT count(*) AS n FROM ${table(4)}`,
+        teardown: drop(4),
+    });
+    cases.push({
+        name: 'savepoint-release',
+        setup: create(5),
+        sql: `BEGIN; INSERT INTO ${table(5)} VALUES (1, 'a'); SAVEPOINT s1; INSERT INTO ${table(5)} VALUES (2, 'b'); RELEASE SAVEPOINT s1; COMMIT; SELECT count(*) AS n FROM ${table(5)}`,
+        teardown: drop(5),
+    });
+    cases.push({
+        name: 'savepoint-nested-rollback',
+        setup: create(6),
+        sql: `BEGIN; SAVEPOINT outer_s; INSERT INTO ${table(6)} VALUES (1, 'a'); SAVEPOINT inner_s; INSERT INTO ${table(6)} VALUES (2, 'b'); ROLLBACK TO SAVEPOINT inner_s; INSERT INTO ${table(6)} VALUES (3, 'c'); RELEASE SAVEPOINT outer_s; COMMIT; SELECT count(*) AS n FROM ${table(6)}`,
+        teardown: drop(6),
+    });
+    cases.push({
+        name: 'savepoint-same-name',
+        setup: create(7),
+        sql: `BEGIN; SAVEPOINT s; INSERT INTO ${table(7)} VALUES (1, 'a'); SAVEPOINT s; INSERT INTO ${table(7)} VALUES (2, 'b'); ROLLBACK TO SAVEPOINT s; COMMIT; SELECT count(*) AS n FROM ${table(7)}`,
+        teardown: drop(7),
+    });
+    cases.push({
+        name: 'implicit-autocommit',
+        setup: create(8),
+        sql: `INSERT INTO ${table(8)} VALUES (1, 'a'); INSERT INTO ${table(8)} VALUES (2, 'b'); SELECT count(*) AS n FROM ${table(8)}`,
+        teardown: drop(8),
+    });
+    cases.push({
+        name: 'commit-without-begin',
+        setup: create(9),
+        sql: `COMMIT; SELECT count(*) AS n FROM ${table(9)}`,
+        teardown: drop(9),
+    });
+    cases.push({
+        name: 'rollback-without-begin',
+        setup: create(10),
+        sql: `ROLLBACK; SELECT count(*) AS n FROM ${table(10)}`,
+        teardown: drop(10),
+    });
+    cases.push({
+        name: 'begin-twice',
+        setup: create(11),
+        sql: `BEGIN; BEGIN; INSERT INTO ${table(11)} VALUES (1, 'a'); ROLLBACK; SELECT count(*) AS n FROM ${table(11)}`,
+        teardown: drop(11),
+    });
+    cases.push({
+        name: 'set-transaction-isolation',
+        setup: create(12),
+        sql: `BEGIN; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT count(*) AS n FROM ${table(12)}; COMMIT`,
+        teardown: drop(12),
+    });
+    cases.push({
+        name: 'read-only-select',
+        setup: create(13),
+        sql: `BEGIN READ ONLY; SELECT count(*) AS n FROM ${table(13)}; COMMIT`,
+        teardown: drop(13),
+    });
+    cases.push({
+        name: 'read-only-write-error',
+        setup: create(14),
+        sql: `BEGIN READ ONLY; INSERT INTO ${table(14)} VALUES (1, 'nope')`,
+        teardown: drop(14),
+    });
+    cases.push({
+        name: 'rollback-ddl',
+        setup: [],
+        sql: `BEGIN; CREATE TABLE sqldiff.tx_15_tmp (id int); ROLLBACK; SELECT count(*) AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sqldiff' AND c.relname = 'tx_15_tmp'`,
+        teardown: ['DROP TABLE IF EXISTS sqldiff.tx_15_tmp CASCADE'],
+    });
+    cases.push({
+        name: 'commit-ddl',
+        setup: [],
+        sql: `BEGIN; CREATE TABLE sqldiff.tx_16_tmp (id int); COMMIT; SELECT count(*) AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sqldiff' AND c.relname = 'tx_16_tmp'`,
+        teardown: ['DROP TABLE IF EXISTS sqldiff.tx_16_tmp CASCADE'],
+    });
+    cases.push({
+        name: 'truncate-rollback',
+        setup: [...create(17), ...seed(17, ['(1, \'a\')', '(2, \'b\')', '(3, \'c\')'])],
+        sql: `BEGIN; TRUNCATE ${table(17)}; ROLLBACK; SELECT count(*) AS n FROM ${table(17)}`,
+        teardown: drop(17),
+    });
+    cases.push({
+        name: 'update-rollback',
+        setup: [...create(18), ...seed(18, ['(1, \'one\')', '(2, \'two\')'])],
+        sql: `BEGIN; UPDATE ${table(18)} SET note = 'changed'; ROLLBACK; SELECT note FROM ${table(18)} ORDER BY id`,
+        teardown: drop(18),
+    });
+    cases.push({
+        name: 'delete-commit',
+        setup: [...create(19), ...seed(19, ['(1, \'a\')', '(2, \'b\')'])],
+        sql: `BEGIN; DELETE FROM ${table(19)} WHERE id = 2; COMMIT; SELECT count(*) AS n FROM ${table(19)}`,
+        teardown: drop(19),
+    });
+    cases.push({
+        name: 'upsert-rollback',
+        setup: [...create(20), ...seed(20, ['(1, \'before\')'])],
+        sql: `BEGIN; INSERT INTO ${table(20)} VALUES (1, 'after') ON CONFLICT (id) DO UPDATE SET note = excluded.note; ROLLBACK; SELECT note FROM ${table(20)}`,
+        teardown: drop(20),
+    });
+    return cases.map((item) => ({ cluster: 'transaction', setup: [], teardown: [], ...item }));
+}
+
+function cursorCluster(gen) {
+    const cases = [];
+    const table = (index) => `sqldiff.cur_${index}`;
+    const setup = (index) => [
+        `CREATE TABLE ${table(index)} (id int PRIMARY KEY, label text)`,
+        `INSERT INTO ${table(index)} VALUES (1, 'alpha'), (2, 'bravo'), (3, 'charlie'), (4, 'delta'), (5, 'echo')`,
+    ];
+    const drop = (index) => [`DROP TABLE IF EXISTS ${table(index)} CASCADE`];
+    const forward = (index) => `DECLARE c CURSOR FOR SELECT id, label FROM ${table(index)} ORDER BY id`;
+
+    cases.push({
+        name: 'declare-fetch-all',
+        setup: setup(1),
+        sql: `BEGIN; ${forward(1)}; FETCH ALL FROM c; COMMIT`,
+        teardown: drop(1),
+    });
+    cases.push({
+        name: 'fetch-forward-two',
+        setup: setup(2),
+        sql: `BEGIN; ${forward(2)}; FETCH 2 FROM c; FETCH 2 FROM c; FETCH 2 FROM c; COMMIT`,
+        teardown: drop(2),
+    });
+    cases.push({
+        name: 'fetch-next',
+        setup: setup(3),
+        sql: `BEGIN; ${forward(3)}; FETCH NEXT FROM c; FETCH NEXT FROM c; COMMIT`,
+        teardown: drop(3),
+    });
+    cases.push({
+        name: 'scroll-fetch-prior',
+        setup: setup(4),
+        sql: `BEGIN; DECLARE c SCROLL CURSOR FOR SELECT id, label FROM ${table(4)} ORDER BY id; FETCH 3 FROM c; FETCH PRIOR FROM c; FETCH LAST FROM c; COMMIT`,
+        teardown: drop(4),
+    });
+    cases.push({
+        name: 'scroll-move-backward',
+        setup: setup(5),
+        sql: `BEGIN; DECLARE c SCROLL CURSOR FOR SELECT id FROM ${table(5)} ORDER BY id; MOVE FORWARD 4 FROM c; MOVE BACKWARD 2 FROM c; FETCH NEXT FROM c; COMMIT`,
+        teardown: drop(5),
+    });
+    cases.push({
+        name: 'move-forward',
+        setup: setup(6),
+        sql: `BEGIN; ${forward(6)}; MOVE FORWARD 2 FROM c; FETCH 2 FROM c; COMMIT`,
+        teardown: drop(6),
+    });
+    cases.push({
+        name: 'move-all',
+        setup: setup(7),
+        sql: `BEGIN; ${forward(7)}; MOVE ALL FROM c; FETCH NEXT FROM c; COMMIT`,
+        teardown: drop(7),
+    });
+    cases.push({
+        name: 'close-cursor',
+        setup: setup(8),
+        sql: `BEGIN; ${forward(8)}; FETCH 1 FROM c; CLOSE c; COMMIT`,
+        teardown: drop(8),
+    });
+    cases.push({
+        name: 'fetch-after-close',
+        setup: setup(9),
+        sql: `BEGIN; ${forward(9)}; CLOSE c; FETCH 1 FROM c`,
+        teardown: drop(9),
+    });
+    cases.push({
+        name: 'declare-with-hold',
+        setup: setup(10),
+        sql: `BEGIN; DECLARE c CURSOR WITH HOLD FOR SELECT id FROM ${table(10)} ORDER BY id; COMMIT; FETCH 2 FROM c`,
+        teardown: ['CLOSE c', ...drop(10)],
+    });
+    cases.push({
+        name: 'declare-no-hold-after-commit',
+        setup: setup(11),
+        sql: `BEGIN; ${forward(11)}; COMMIT; FETCH 1 FROM c`,
+        teardown: drop(11),
+    });
+    cases.push({
+        name: 'declare-outside-transaction',
+        setup: setup(12),
+        sql: `DECLARE c CURSOR FOR SELECT id FROM ${table(12)}`,
+        teardown: drop(12),
+    });
+    cases.push({
+        name: 'fetch-unknown-cursor',
+        setup: setup(13),
+        sql: `BEGIN; FETCH 1 FROM missing_cursor`,
+        teardown: drop(13),
+    });
+    cases.push({
+        name: 'fetch-backward-without-scroll',
+        setup: setup(14),
+        sql: `BEGIN; ${forward(14)}; FETCH 3 FROM c; FETCH PRIOR FROM c`,
+        teardown: drop(14),
+    });
+    return cases.map((item) => ({ cluster: 'cursor', setup: [], teardown: [], ...item }));
+}
+
+function castMatrixCluster(gen) {
+    const cases = [];
+    const n = gen.int(2, 9);
+    const cases_ = [
+        ['int-overflow', 'SELECT 2147483648::int AS v'],
+        ['int-underflow', 'SELECT (-2147483649)::int AS v'],
+        ['bigint-text-overflow', "SELECT '9223372036854775808'::bigint AS v"],
+        ['numeric-to-int-overflow', "SELECT '99999999999.9'::numeric::int AS v"],
+        ['numeric-scale-overflow', "SELECT 1234.56::numeric(3,2) AS v"],
+        ['text-to-int-invalid', "SELECT 'abc'::int AS v"],
+        ['text-to-int-whitespace', "SELECT ' 42 '::int AS v"],
+        ['text-to-numeric-invalid', "SELECT '1.2.3'::numeric AS v"],
+        ['numeric-rounding', 'SELECT 2.5::numeric(10,0) AS v'],
+        ['float-to-int-overflow', 'SELECT 1e20::float8::int AS v'],
+        ['text-to-date-invalid', "SELECT '2024-02-30'::date AS v"],
+        ['text-to-date-format', "SELECT '01/02/2024'::date AS v"],
+        ['text-to-timestamp-invalid', "SELECT 'not a time'::timestamp AS v"],
+        ['timestamp-to-date', "SELECT '2024-03-04 12:34:56'::timestamp::date AS v"],
+        ['date-to-timestamp', "SELECT '2024-03-04'::date::timestamp AS v"],
+        ['text-to-timestamptz', "SELECT '2024-03-04 12:34:56+02'::timestamptz AS v"],
+        ['text-to-jsonb-invalid', "SELECT 'not json'::jsonb AS v"],
+        ['jsonb-to-int', `SELECT ('{"a": ${n}}'::jsonb ->> 'a')::int AS v`],
+        ['jsonb-array-index', "SELECT '[1,2,3]'::jsonb -> 2 AS v"],
+        ['implicit-int-text-comparison', "SELECT 1 = '1' AS v"],
+        ['implicit-int-text-invalid', "SELECT 1 = 'abc' AS v"],
+        ['explicit-cast-chain', "SELECT '42'::text::int::numeric AS v"],
+        ['boolean-text-cast', "SELECT 'yes'::boolean AS v"],
+        ['boolean-invalid', "SELECT 'maybe'::boolean AS v"],
+    ];
+    for (const [name, sql] of cases_) cases.push({ cluster: 'cast-matrix', name, setup: [], sql, teardown: [] });
+    return cases;
+}
+
+function constraintCluster(gen) {
+    const cases = [];
+    const table = (index) => `sqldiff.con_${index}`;
+    const drop = (index) => [`DROP TABLE IF EXISTS ${table(index)} CASCADE`];
+
+    cases.push({
+        name: 'unique-violation',
+        setup: [`CREATE TABLE ${table(1)} (id int, label text UNIQUE)`, `INSERT INTO ${table(1)} VALUES (1, 'taken')`],
+        sql: `INSERT INTO ${table(1)} VALUES (2, 'taken')`,
+        teardown: drop(1),
+    });
+    cases.push({
+        name: 'primary-key-violation',
+        setup: [`CREATE TABLE ${table(2)} (id int PRIMARY KEY, label text)`, `INSERT INTO ${table(2)} VALUES (1, 'a')`],
+        sql: `INSERT INTO ${table(2)} VALUES (1, 'b')`,
+        teardown: drop(2),
+    });
+    cases.push({
+        name: 'check-violation',
+        setup: [`CREATE TABLE ${table(3)} (id int CHECK (id > 0))`],
+        sql: `INSERT INTO ${table(3)} VALUES (-1)`,
+        teardown: drop(3),
+    });
+    cases.push({
+        name: 'not-null-violation',
+        setup: [`CREATE TABLE ${table(4)} (id int, label text NOT NULL)`],
+        sql: `INSERT INTO ${table(4)} VALUES (1, NULL)`,
+        teardown: drop(4),
+    });
+    cases.push({
+        name: 'foreign-key-insert-violation',
+        setup: [
+            `CREATE TABLE ${table(5)}_parent (id int PRIMARY KEY)`,
+            `CREATE TABLE ${table(5)}_child (id int, parent_id int REFERENCES ${table(5)}_parent (id))`,
+        ],
+        sql: `INSERT INTO ${table(5)}_child VALUES (1, 99)`,
+        teardown: [`DROP TABLE IF EXISTS ${table(5)}_child CASCADE`, `DROP TABLE IF EXISTS ${table(5)}_parent CASCADE`],
+    });
+    cases.push({
+        name: 'foreign-key-delete-restrict',
+        setup: [
+            `CREATE TABLE ${table(6)}_parent (id int PRIMARY KEY)`,
+            `CREATE TABLE ${table(6)}_child (id int, parent_id int REFERENCES ${table(6)}_parent (id))`,
+            `INSERT INTO ${table(6)}_parent VALUES (1)`,
+            `INSERT INTO ${table(6)}_child VALUES (1, 1)`,
+        ],
+        sql: `DELETE FROM ${table(6)}_parent WHERE id = 1`,
+        teardown: [`DROP TABLE IF EXISTS ${table(6)}_child CASCADE`, `DROP TABLE IF EXISTS ${table(6)}_parent CASCADE`],
+    });
+    cases.push({
+        name: 'foreign-key-cascade-delete',
+        setup: [
+            `CREATE TABLE ${table(7)}_parent (id int PRIMARY KEY)`,
+            `CREATE TABLE ${table(7)}_child (id int, parent_id int REFERENCES ${table(7)}_parent (id) ON DELETE CASCADE)`,
+            `INSERT INTO ${table(7)}_parent VALUES (1), (2)`,
+            `INSERT INTO ${table(7)}_child VALUES (1, 1), (2, 1), (3, 2)`,
+        ],
+        sql: `DELETE FROM ${table(7)}_parent WHERE id = 1; SELECT count(*) AS n FROM ${table(7)}_child`,
+        teardown: [`DROP TABLE IF EXISTS ${table(7)}_child CASCADE`, `DROP TABLE IF EXISTS ${table(7)}_parent CASCADE`],
+    });
+    cases.push({
+        name: 'foreign-key-set-null',
+        setup: [
+            `CREATE TABLE ${table(8)}_parent (id int PRIMARY KEY)`,
+            `CREATE TABLE ${table(8)}_child (id int, parent_id int REFERENCES ${table(8)}_parent (id) ON DELETE SET NULL)`,
+            `INSERT INTO ${table(8)}_parent VALUES (1)`,
+            `INSERT INTO ${table(8)}_child VALUES (1, 1)`,
+        ],
+        sql: `DELETE FROM ${table(8)}_parent WHERE id = 1; SELECT parent_id FROM ${table(8)}_child`,
+        teardown: [`DROP TABLE IF EXISTS ${table(8)}_child CASCADE`, `DROP TABLE IF EXISTS ${table(8)}_parent CASCADE`],
+    });
+    cases.push({
+        name: 'foreign-key-deferred-commit',
+        setup: [
+            `CREATE TABLE ${table(9)}_parent (id int PRIMARY KEY)`,
+            `CREATE TABLE ${table(9)}_child (id int, parent_id int REFERENCES ${table(9)}_parent (id) DEFERRABLE INITIALLY IMMEDIATE)`,
+        ],
+        sql: `BEGIN; SET CONSTRAINTS ALL DEFERRED; INSERT INTO ${table(9)}_child VALUES (1, 99); COMMIT`,
+        teardown: [`DROP TABLE IF EXISTS ${table(9)}_child CASCADE`, `DROP TABLE IF EXISTS ${table(9)}_parent CASCADE`],
+    });
+    cases.push({
+        name: 'foreign-key-deferred-ok',
+        setup: [
+            `CREATE TABLE ${table(10)}_parent (id int PRIMARY KEY)`,
+            `CREATE TABLE ${table(10)}_child (id int, parent_id int REFERENCES ${table(10)}_parent (id) DEFERRABLE INITIALLY IMMEDIATE)`,
+        ],
+        sql: `BEGIN; SET CONSTRAINTS ALL DEFERRED; INSERT INTO ${table(10)}_child VALUES (1, 7); INSERT INTO ${table(10)}_parent VALUES (7); COMMIT; SELECT count(*) AS n FROM ${table(10)}_child`,
+        teardown: [`DROP TABLE IF EXISTS ${table(10)}_child CASCADE`, `DROP TABLE IF EXISTS ${table(10)}_parent CASCADE`],
+    });
+    cases.push({
+        name: 'unique-null-allowed',
+        setup: [`CREATE TABLE ${table(11)} (id int, label text UNIQUE)`],
+        sql: `INSERT INTO ${table(11)} VALUES (1, NULL), (2, NULL); SELECT count(*) AS n FROM ${table(11)}`,
+        teardown: drop(11),
+    });
+    cases.push({
+        name: 'unique-multicolumn-violation',
+        setup: [`CREATE TABLE ${table(12)} (a int, b int, UNIQUE (a, b))`, `INSERT INTO ${table(12)} VALUES (1, 1)`],
+        sql: `INSERT INTO ${table(12)} VALUES (1, 1)`,
+        teardown: drop(12),
+    });
+    cases.push({
+        name: 'on-conflict-do-nothing',
+        setup: [`CREATE TABLE ${table(13)} (id int PRIMARY KEY, label text)`, `INSERT INTO ${table(13)} VALUES (1, 'a')`],
+        sql: `INSERT INTO ${table(13)} VALUES (1, 'b') ON CONFLICT DO NOTHING; SELECT label FROM ${table(13)}`,
+        teardown: drop(13),
+    });
+    cases.push({
+        name: 'on-conflict-do-update',
+        setup: [`CREATE TABLE ${table(14)} (id int PRIMARY KEY, label text)`, `INSERT INTO ${table(14)} VALUES (1, 'a')`],
+        sql: `INSERT INTO ${table(14)} VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET label = excluded.label; SELECT label FROM ${table(14)}`,
+        teardown: drop(14),
+    });
+    cases.push({
+        name: 'check-not-valid-then-validate',
+        setup: [
+            `CREATE TABLE ${table(15)} (id int)`,
+            `INSERT INTO ${table(15)} VALUES (-1)`,
+            `ALTER TABLE ${table(15)} ADD CONSTRAINT con_15_check CHECK (id > 0) NOT VALID`,
+        ],
+        sql: `ALTER TABLE ${table(15)} VALIDATE CONSTRAINT con_15_check`,
+        teardown: drop(15),
+    });
+    cases.push({
+        name: 'drop-constraint-then-insert',
+        setup: [`CREATE TABLE ${table(16)} (id int, label text UNIQUE)`, `INSERT INTO ${table(16)} VALUES (1, 'taken')`, `ALTER TABLE ${table(16)} DROP CONSTRAINT ${table(16)}_label_key`],
+        sql: `INSERT INTO ${table(16)} VALUES (2, 'taken'); SELECT count(*) AS n FROM ${table(16)}`,
+        teardown: drop(16),
+    });
+    cases.push({
+        name: 'create-unique-index-violation',
+        setup: [`CREATE TABLE ${table(17)} (id int, label text)`, `INSERT INTO ${table(17)} VALUES (1, 'dup'), (2, 'dup')`],
+        sql: `CREATE UNIQUE INDEX con_17_label ON ${table(17)} (label)`,
+        teardown: drop(17),
+    });
+    cases.push({
+        name: 'partial-unique-index-allows',
+        setup: [
+            `CREATE TABLE ${table(18)} (id int, label text, flag boolean)`,
+            `CREATE UNIQUE INDEX con_18_label ON ${table(18)} (label) WHERE flag`,
+            `INSERT INTO ${table(18)} VALUES (1, 'dup', true)`,
+        ],
+        sql: `INSERT INTO ${table(18)} VALUES (2, 'dup', false); SELECT count(*) AS n FROM ${table(18)}`,
+        teardown: drop(18),
+    });
+    cases.push({
+        name: 'foreign-key-on-update-cascade',
+        setup: [
+            `CREATE TABLE ${table(19)}_parent (id int PRIMARY KEY)`,
+            `CREATE TABLE ${table(19)}_child (id int, parent_id int REFERENCES ${table(19)}_parent (id) ON UPDATE CASCADE)`,
+            `INSERT INTO ${table(19)}_parent VALUES (1)`,
+            `INSERT INTO ${table(19)}_child VALUES (1, 1)`,
+        ],
+        sql: `UPDATE ${table(19)}_parent SET id = 11 WHERE id = 1; SELECT parent_id FROM ${table(19)}_child`,
+        teardown: [`DROP TABLE IF EXISTS ${table(19)}_child CASCADE`, `DROP TABLE IF EXISTS ${table(19)}_parent CASCADE`],
+    });
+    cases.push({
+        name: 'check-violation-on-update',
+        setup: [
+            `CREATE TABLE ${table(20)} (id int CHECK (id > 0), label text)`,
+            `INSERT INTO ${table(20)} VALUES (1, 'a')`,
+        ],
+        sql: `UPDATE ${table(20)} SET id = -1 WHERE id = 1`,
+        teardown: drop(20),
+    });
+    return cases.map((item) => ({ cluster: 'constraint', setup: [], teardown: [], ...item }));
+}
+
+function extendedCluster(gen) {
+    const cases = [];
+    const table = (index) => `sqldiff.ext_${index}`;
+    const drop = (index) => [`DROP TABLE IF EXISTS ${table(index)} CASCADE`];
+
+    cases.push({
+        name: 'params-int-add',
+        mode: 'params',
+        sql: 'SELECT $1::int + $2::int AS total',
+        params: ['41', '1'],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'params-text-concat',
+        mode: 'params',
+        sql: "SELECT $1::text || '-' || $2::text AS label",
+        params: ['alpha', 'bravo'],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'params-null',
+        mode: 'params',
+        sql: 'SELECT $1::text IS NULL AS empty',
+        params: [null],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'params-boolean',
+        mode: 'params',
+        sql: 'SELECT $1::boolean AND $2::boolean AS both',
+        params: ['true', 'false'],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'params-numeric',
+        mode: 'params',
+        sql: 'SELECT $1::numeric(10,2) + $2::numeric AS total',
+        params: ['1.25', '2.5'],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'params-timestamp',
+        mode: 'params',
+        sql: "SELECT $1::timestamp AT TIME ZONE 'UTC' AS ts",
+        params: ['2024-03-04 12:34:56'],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'params-jsonb',
+        mode: 'params',
+        sql: "SELECT $1::jsonb ->> 'a' AS a",
+        params: ['{"a": "x"}'],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'params-invalid-int',
+        mode: 'params',
+        sql: 'SELECT $1::int AS n',
+        params: ['abc'],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'params-missing',
+        mode: 'params',
+        sql: 'SELECT $1::int AS n',
+        params: [],
+        setup: [],
+        teardown: [],
+    });
+    {
+        const rows = seededRows(gen, 3);
+        cases.push({
+            name: 'params-where-table',
+            mode: 'params',
+            setup: [
+                `CREATE TABLE ${table(10)} (id int PRIMARY KEY, label text)`,
+                `INSERT INTO ${table(10)} VALUES ${rows.map((row) => `(${row.id}, '${row.label}')`).join(', ')}`,
+            ],
+            sql: `SELECT label FROM ${table(10)} WHERE id = $1`,
+            params: ['2'],
+            teardown: drop(10),
+        });
+    }
+    cases.push({
+        name: 'prepare-reuse-add',
+        mode: 'prepare',
+        sql: 'SELECT $1::int * 2 AS doubled',
+        params: ['21'],
+        reuse: [['7'], ['0']],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'prepare-reuse-text',
+        mode: 'prepare',
+        sql: "SELECT $1::text || '!' AS shout",
+        params: ['hi'],
+        reuse: [['yo']],
+        setup: [],
+        teardown: [],
+    });
+    cases.push({
+        name: 'prepare-reuse-null',
+        mode: 'prepare',
+        sql: "SELECT coalesce($1::text, 'fallback') AS v",
+        params: [null],
+        reuse: [['x']],
+        setup: [],
+        teardown: [],
+    });
+    {
+        const rows = seededRows(gen, 2);
+        cases.push({
+            name: 'prepare-insert-returning',
+            mode: 'prepare',
+            setup: [`CREATE TABLE ${table(15)} (id int PRIMARY KEY, label text)`],
+            sql: `INSERT INTO ${table(15)} VALUES ($1::int, $2::text) RETURNING id, label`,
+            params: ['1', rows[0].label],
+            reuse: [['2', rows[1].label]],
+            teardown: drop(15),
+        });
+    }
+    cases.push({
+        name: 'prepare-update-returning',
+        mode: 'prepare',
+        setup: [
+            `CREATE TABLE ${table(16)} (id int PRIMARY KEY, label text)`,
+            `INSERT INTO ${table(16)} VALUES (1, 'one'), (2, 'two')`,
+        ],
+        sql: `UPDATE ${table(16)} SET label = $2::text WHERE id = $1::int RETURNING id, label`,
+        params: ['1', 'uno'],
+        reuse: [['2', 'dos']],
+        teardown: drop(16),
+    });
+    cases.push({
+        name: 'portal-rebind',
+        mode: 'params',
+        sql: 'SELECT $1::int AS n',
+        params: ['1'],
+        reuse: [['2'], ['3']],
+        setup: [],
+        teardown: [],
+    });
+    return cases.map((item) => ({ cluster: 'extended', setup: [], teardown: [], ...item }));
+}
+
 function generateCorpus(seed) {
     const gen = factory(seed);
     const cases = [
@@ -528,6 +1113,11 @@ function generateCorpus(seed) {
         ...exprCluster(gen),
         ...aggCluster(gen),
         ...castCluster(gen),
+        ...transactionCluster(gen),
+        ...cursorCluster(gen),
+        ...castMatrixCluster(gen),
+        ...constraintCluster(gen),
+        ...extendedCluster(gen),
     ];
     return cases.map((item, index) => ({ index, setup: [], teardown: [], ...item }));
 }
@@ -738,11 +1328,20 @@ function normalizeRepo(results) {
     }));
 }
 
+function repoFields(fields) {
+    return fields.map((field) => [field.kind, field.value]);
+}
+
 function runRepo(sql) {
     try {
-        return { results: normalizeRepo(connection.execute(sql)), error: null };
+        const report = connection.executeReport(sql);
+        return {
+            results: normalizeRepo(report.results),
+            error: report.error ? { code: report.error.code, message: report.error.message } : null,
+            fields: report.error ? repoFields(report.error.fields) : [],
+        };
     } catch (error) {
-        return { results: [], error: repoErrorOf(error) };
+        return { results: [], error: repoErrorOf(error), fields: [] };
     }
 }
 
@@ -757,15 +1356,17 @@ function statementDiff(item, oracle, repo) {
     if (oracle.error || repo.error) {
         const left = oracle.error ? `${oracle.error.code}: ${oracle.error.message}` : 'ok';
         const right = repo.error ? `${repo.error.code}: ${repo.error.message}` : 'ok';
-        if (left === right && oracle.error && repo.error) {
+        const oracleFields = oracle.error?.ordered ?? [];
+        const fieldsMatch = oracle.error && repo.error && JSON.stringify(repo.fields) === JSON.stringify(oracleFields);
+        if (left === right && fieldsMatch) {
             return { matched: true, noticeCount: oracle.notices.length };
         }
         return {
             matched: false,
             reason: oracle.error ? 'error-shape' : 'error-missing',
             statement,
-            repo: repo.error ? { error: right } : { results: repo.results },
-            pglite: { error: left, results: oracle.results, raw: oracle.raw ?? null },
+            repo: repo.error ? { error: right, fields: repo.fields } : { results: repo.results },
+            pglite: { error: left, fields: oracleFields, results: oracle.results, raw: oracle.raw ?? null },
         };
     }
     const matched = JSON.stringify(repo.results) === JSON.stringify(oracle.results);
@@ -774,6 +1375,91 @@ function statementDiff(item, oracle, repo) {
         matched: false,
         reason: 'result-shape',
         statement,
+        repo: { results: repo.results },
+        pglite: { results: oracle.results, raw: oracle.raw ?? null },
+    };
+}
+
+// -------------------------------------------------------------------------------
+// Extended-query comparison. The oracle is `pg` against its own PGlite socket,
+// so parameters, prepared-statement reuse and portal rebinding all travel over
+// real Parse/Bind/Execute/Sync frames. `pg` reports the command verb and row
+// count separately, so the repository tag is normalized to the same pair.
+// -------------------------------------------------------------------------------
+function tagRowCount(tag) {
+    const parts = tag.split(' ');
+    const last = parts[parts.length - 1];
+    if (parts.length >= 2 && /^\d+$/.test(last)) return Number(last);
+    return null;
+}
+
+function normalizeExtendedRepo(results) {
+    return results.map((result) => ({
+        columns: result.columns.map((column) => column.name),
+        rows: result.rows.map((row) => row.values),
+        verb: result.tag.split(' ')[0],
+        rowCount: tagRowCount(result.tag),
+    }));
+}
+
+async function bothExtended(sql) {
+    const oracle = await call('extended-simple', { sql });
+    let failure = null;
+    try {
+        connection.execute(sql);
+    } catch (error) {
+        failure = repoErrorOf(error);
+    }
+    if (oracle.error || failure) {
+        throw new Error(
+            `extended setup failed on '${sql}': oracle ${oracle.error ? `${oracle.error.code}: ${oracle.error.message}` : 'ok'} / repository ${failure ? `${failure.code}: ${failure.message}` : 'ok'}`,
+        );
+    }
+}
+
+async function runExtended(item) {
+    const paramSets = [item.params, ...(item.reuse ?? [])];
+    const name = item.mode === 'prepare' ? `sqldiff_ext_${item.index}` : null;
+    const oracle = await call('extended', { text: item.sql, paramSets, name });
+    let repo;
+    try {
+        if (name) {
+            const statement = connection.prepare(item.sql, []);
+            const rounds = [];
+            for (const values of paramSets) rounds.push(...normalizeExtendedRepo(statement.execute(values)));
+            statement.close();
+            repo = { results: rounds, error: null };
+        } else {
+            const rounds = [];
+            for (const values of paramSets) rounds.push(...normalizeExtendedRepo(connection.executeWithParams(item.sql, values, [])));
+            repo = { results: rounds, error: null };
+        }
+    } catch (error) {
+        repo = { results: [], error: repoErrorOf(error) };
+    }
+    return { oracle, repo };
+}
+
+function extendedDiff(item, paramSets, oracle, repo) {
+    if (oracle.error || repo.error) {
+        const left = oracle.error ? `${oracle.error.code}: ${oracle.error.message}` : 'ok';
+        const right = repo.error ? `${repo.error.code}: ${repo.error.message}` : 'ok';
+        if (left === right && oracle.error && repo.error) return { matched: true, noticeCount: 0 };
+        return {
+            matched: false,
+            reason: oracle.error ? 'error-shape' : 'error-missing',
+            statement: item.sql,
+            params: paramSets,
+            repo: repo.error ? { error: right } : { results: repo.results },
+            pglite: { error: left, results: oracle.results, raw: oracle.raw ?? null },
+        };
+    }
+    if (JSON.stringify(repo.results) === JSON.stringify(oracle.results)) return { matched: true, noticeCount: 0 };
+    return {
+        matched: false,
+        reason: 'result-shape',
+        statement: item.sql,
+        params: paramSets,
         repo: { results: repo.results },
         pglite: { results: oracle.results, raw: oracle.raw ?? null },
     };
@@ -793,10 +1479,18 @@ const notices = [];
 let executed = 0;
 
 for (const item of selected) {
-    for (const sql of item.setup) await both(sql);
-    const measured = await both(item.sql);
+    const extended = item.cluster === 'extended';
+    for (const sql of item.setup) await (extended ? bothExtended(sql) : both(sql));
     executed += 1;
-    const outcome = statementDiff(item, measured.oracle, measured.repo);
+    let outcome;
+    if (extended) {
+        const paramSets = [item.params, ...(item.reuse ?? [])];
+        const measured = await runExtended(item);
+        outcome = extendedDiff(item, paramSets, measured.oracle, measured.repo);
+    } else {
+        const measured = await both(item.sql);
+        outcome = statementDiff(item, measured.oracle, measured.repo);
+    }
     if (outcome.noticeCount > 0) {
         notices.push({ cluster: item.cluster, name: item.name, count: outcome.noticeCount });
     }
@@ -805,14 +1499,18 @@ for (const item of selected) {
             id: item.index,
             cluster: item.cluster,
             name: item.name,
-            statement: item.sql,
+            statement: outcome.statement,
+            ...(outcome.params ? { params: outcome.params } : {}),
             reason: outcome.reason,
             repo: outcome.repo,
             pglite: outcome.pglite,
             repro: `node projects/postgres.ts/packages/postgres-harness/scripts/sql-diff.mjs --seed ${options.seed} --only ${item.name}`,
         });
     }
-    for (const sql of item.teardown) await both(sql);
+    // A failed batch inside BEGIN leaves the session aborted on both sides.
+    // End it before teardown so the next case starts from the same state.
+    if (!extended) await both('ROLLBACK');
+    for (const sql of item.teardown) await (extended ? bothExtended(sql) : both(sql));
 }
 
 // Isolation assertion: the corpus is only allowed to touch `sqldiff`. Both
@@ -827,10 +1525,6 @@ const isolation = await both(PUBLIC_OBJECTS);
 // `fixed` status means the ordered fields and bytes agree.
 // -------------------------------------------------------------------------------
 const gaps = [];
-
-function repoFields(fields) {
-    return fields.map((field) => [field.kind, field.value]);
-}
 
 {
     const sql = 'DROP TABLE IF EXISTS gap_probe_missing';
@@ -959,11 +1653,11 @@ function sha256(value) {
 }
 
 function repoText(side) {
-    return side.error ? `error ${side.error.error}` : `results ${JSON.stringify(side.results)}`;
+    return side.error ? `error ${side.error}` : `results ${JSON.stringify(side.results)}`;
 }
 
 function pgliteText(side) {
-    return side.error ? `error ${side.error.error}` : `results ${JSON.stringify(side.results)}`;
+    return side.error ? `error ${side.error}` : `results ${JSON.stringify(side.results)}`;
 }
 
 function corpusEntry(diff) {
@@ -971,15 +1665,15 @@ function corpusEntry(diff) {
     const signal = [`repo ${repoText(diff.repo)}`, `pglite ${pgliteText(diff.pglite)}`, raw == null ? 'raw none' : `raw sha256:${sha256(raw)}`];
     let reason;
     let detail;
-    if (raw == null) {
-        reason = 'oracle-disagreement';
-        detail = 'the PGlite reply could not be decoded, so the oracle itself is the difference';
+    if (diff.repo.error && diff.pglite.error) {
+        reason = diff.repo.error.includes('unsupported:') ? 'not-implemented' : 'oracle-disagreement';
+        detail = `both engines reject the statement with different replies: this repository ${diff.repo.error}, PGlite ${diff.pglite.error}`;
     } else if (diff.repo.error) {
-        reason = diff.repo.error.error.includes('unsupported:') ? 'not-implemented' : 'structured-rejection';
-        detail = `this repository rejects the statement: ${diff.repo.error.error}`;
+        reason = 'structured-rejection';
+        detail = `this repository rejects the statement: ${diff.repo.error}`;
     } else if (diff.pglite.error) {
         reason = 'oracle-disagreement';
-        detail = `PGlite rejects the statement while this repository accepts it: ${diff.pglite.error.error}`;
+        detail = `PGlite rejects the statement while this repository accepts it: ${diff.pglite.error}`;
     } else {
         reason = 'oracle-disagreement';
         detail = 'both sides answer the statement but decode different values';
@@ -989,6 +1683,7 @@ function corpusEntry(diff) {
         cluster: diff.cluster,
         name: diff.name,
         statement: diff.statement,
+        ...(diff.params ? { params: diff.params } : {}),
         kind: 'difference',
         reason,
         detail,
@@ -1031,6 +1726,7 @@ function observedOutput(observed) {
     } else {
         const diff = observed.diff;
         lines.push(`  statement: ${diff.statement}`);
+        if (diff.params) lines.push(`  parameters: ${JSON.stringify(diff.params)}`);
         lines.push(`  this repository: ${repoText(diff.repo)}`);
         lines.push(`  PGlite: ${pgliteText(diff.pglite)}`);
         lines.push(`  PGlite raw reply: ${diff.pglite.raw ?? 'none'}`);
@@ -1212,8 +1908,10 @@ const lines = [
     '',
     `Generated by \`projects/postgres.ts/packages/postgres-harness/scripts/sql-diff.mjs --seed ${report.seed}\`.`,
     'Expectations are read from PGlite 0.5.15 through `execProtocolRaw` with an independent',
-    'protocol decoder; the repository side is the installed client from `projects/postgres.ts`,',
-    'so this repository is never its own reference.',
+    'protocol decoder. The `extended` cluster is answered by the `pg` driver over a real',
+    'Parse/Bind/Execute/Sync session against a separate PGlite socket. The repository side',
+    'is the installed client from `projects/postgres.ts`, so this repository is never its',
+    'own reference.',
     '',
     '## Corpus',
     '',
@@ -1262,8 +1960,8 @@ const lines = [
     `- fixed seed \`${report.seed}\` and count \`${corpus.length}\`, corpus digest \`${digest}\``,
     `- known-difference baseline: ${baselineEntries.length} entries (${Object.entries(reasonCounts(baselineEntries)).map(([reason, count]) => `${reason} ${count}`).join(', ')})`,
     `- client-surface assertions frozen in \`cases/sql-diff.json\`: ${gated}`,
-    '- run `pnpm corpus -- --seed 20261106 --count 118 --check` in CI',
-    '- regenerate with `pnpm corpus -- --seed 20261106 --count 118 --update-baseline`',
+    `- run \`pnpm corpus -- --seed ${report.seed} --count ${options.count} --check\` in CI`,
+    `- regenerate with \`pnpm corpus -- --seed ${report.seed} --count ${options.count} --update-baseline\``,
     '',
 ];
 
