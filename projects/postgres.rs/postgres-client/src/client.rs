@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::error::PostgresError;
+use crate::error::{Notice, PostgresError};
 use crate::protocol::{self, MAX_MESSAGE_BYTES};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,6 +81,18 @@ pub struct Connection {
     stream: TcpStream,
     session_tag: u32,
     statements: u64,
+    notices: Vec<Notice>,
+}
+
+/// One simple-query round trip that keeps the statements that already finished.
+///
+/// `execute` throws the error and drops them. [`Report`] keeps both, matching
+/// the order the server sent: every completed result first, then the error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    pub results: Vec<QueryResult>,
+    pub error: Option<PostgresError>,
+    pub notices: Vec<Notice>,
 }
 
 /// Response of one extended-protocol round trip.
@@ -88,6 +100,12 @@ struct ExtendedOutcome {
     results: Vec<QueryResult>,
     parameters: Vec<u32>,
     described: Vec<Column>,
+}
+
+/// One simple-query reply once `ReadyForQuery` arrived.
+struct SimpleOutcome {
+    results: Vec<QueryResult>,
+    error: Option<PostgresError>,
 }
 
 impl Connection {
@@ -107,7 +125,7 @@ impl Connection {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.subsec_nanos())
             .unwrap_or(0);
-        let mut connection = Self { stream, session_tag, statements: 0 };
+        let mut connection = Self { stream, session_tag, statements: 0, notices: Vec::new() };
         connection.startup(config)?;
         Ok(connection)
     }
@@ -136,7 +154,8 @@ impl Connection {
                     }
                     return Ok(());
                 }
-                b'S' | b'K' | b'N' => {}
+                b'S' | b'K' => {}
+                b'N' => self.record_notice(&payload)?,
                 other => return Err(PostgresError::Protocol(format!("unsupported PostgreSQL startup response tag {other}"))),
             }
         }
@@ -144,6 +163,36 @@ impl Connection {
 
     /// Runs one simple-query statement and returns every result it produced.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>, PostgresError> {
+        let outcome = self.run_simple(sql)?;
+        match outcome.error {
+            Some(error) => Err(error),
+            None => Ok(outcome.results),
+        }
+    }
+
+    /// Runs one simple-query batch and keeps the statements that already finished.
+    ///
+    /// The reply order is the server order: every completed result first, then
+    /// the error, then every notice the server emitted for this batch. Notices
+    /// of earlier batches stay buffered for `take_notices`.
+    pub fn execute_report(&mut self, sql: &str) -> Result<Report, PostgresError> {
+        let start = self.notices.len();
+        let outcome = self.run_simple(sql)?;
+        let notices = self.notices.split_off(start);
+        Ok(Report { results: outcome.results, error: outcome.error, notices })
+    }
+
+    /// Drains every notice received so far, in wire order.
+    pub fn take_notices(&mut self) -> Vec<Notice> {
+        std::mem::take(&mut self.notices)
+    }
+
+    fn record_notice(&mut self, payload: &[u8]) -> Result<(), PostgresError> {
+        self.notices.push(protocol::notice_response(payload)?);
+        Ok(())
+    }
+
+    fn run_simple(&mut self, sql: &str) -> Result<SimpleOutcome, PostgresError> {
         self.stream.write_all(&protocol::query_packet(sql)?).map_err(io_error)?;
         let mut results = Vec::new();
         let mut current: Option<(Vec<String>, Vec<Vec<Option<String>>>)> = None;
@@ -157,7 +206,7 @@ impl Connection {
                     if payload.len() != 1 {
                         return Err(PostgresError::Protocol("invalid ReadyForQuery".into()));
                     }
-                    return Err(failure.expect("checked above"));
+                    return Ok(SimpleOutcome { results, error: failure });
                 }
                 continue;
             }
@@ -198,9 +247,10 @@ impl Connection {
                     if payload.len() != 1 {
                         return Err(PostgresError::Protocol("invalid ReadyForQuery".into()));
                     }
-                    return Ok(results);
+                    return Ok(SimpleOutcome { results, error: None });
                 }
-                b'S' | b'K' | b'N' => {}
+                b'S' | b'K' => {}
+                b'N' => self.record_notice(&payload)?,
                 other => return Err(PostgresError::Protocol(format!("unsupported PostgreSQL response tag {other}"))),
             }
         }
@@ -332,7 +382,8 @@ impl Connection {
                     }
                     return Ok(ExtendedOutcome { results, parameters, described });
                 }
-                b'S' | b'K' | b'N' => {}
+                b'S' | b'K' => {}
+                b'N' => self.record_notice(&payload)?,
                 other => return Err(PostgresError::Protocol(format!("unsupported PostgreSQL response tag {other}"))),
             }
         }

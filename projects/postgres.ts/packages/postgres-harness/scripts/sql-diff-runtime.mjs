@@ -110,6 +110,21 @@ function errorFields(payload) {
     return fields;
 }
 
+/** Same fields as `errorFields`, kept as `[kind, value]` in wire order. */
+function orderedFields(payload) {
+    const fields = [];
+    let offset = 0;
+    while (offset < payload.length && payload[offset] !== 0) {
+        const kind = String.fromCharCode(payload[offset]);
+        offset += 1;
+        const end = payload.indexOf(0, offset);
+        if (end < 0) break;
+        fields.push([kind, payload.subarray(offset, end).toString('utf8')]);
+        offset = end + 1;
+    }
+    return fields;
+}
+
 /** Decodes one simple-query reply using the protocol chapter, not this repo. */
 function decodeReply(bytes) {
     const messages = parsePayloads(Buffer.from(bytes));
@@ -140,11 +155,21 @@ function decodeReply(bytes) {
                 break;
             case 'E': {
                 const fields = errorFields(message.payload);
-                error = { code: fields.C ?? 'unknown', message: fields.M ?? '', fields };
+                error = {
+                    code: fields.C ?? 'unknown',
+                    message: fields.M ?? '',
+                    fields,
+                    ordered: orderedFields(message.payload),
+                    raw: message.payload.toString('hex'),
+                };
                 break;
             }
             case 'N':
-                notices.push(errorFields(message.payload));
+                notices.push({
+                    fields: errorFields(message.payload),
+                    ordered: orderedFields(message.payload),
+                    raw: message.payload.toString('hex'),
+                });
                 break;
             default:
                 break;

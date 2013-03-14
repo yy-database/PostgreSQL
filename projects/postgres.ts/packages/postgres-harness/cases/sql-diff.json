@@ -1,31 +1,166 @@
 [
     {
-        "name": "known-notice-not-surfaced",
-        "cluster": "gap",
-        "reason": "PGlite sends a NoticeResponse for this statement and the wire reply still carries the DROP TABLE tag. This package has no notice channel, so the notice text is not part of the observable surface.",
-        "pglite": "NOTICE: table \"gap_probe_missing\" does not exist, skipping",
+        "name": "notice-surfaced",
+        "cluster": "fixed",
+        "reason": "NoticeResponse now reaches the caller: `executeReport` returns it under `notices` and `takeNotices` drains it after `execute`. Fields stay in PGlite wire order.",
+        "sql": "DROP TABLE IF EXISTS gap_probe_missing",
         "setup": [],
-        "sql": "DROP TABLE IF EXISTS sqldiff.gap_probe_missing",
-        "expect": [
-            { "columns": [], "rows": [], "tag": "DROP TABLE" }
+        "teardown": [],
+        "expectResults": [
+            {
+                "columns": [],
+                "rows": [],
+                "tag": "DROP TABLE"
+            }
+        ],
+        "expectError": null,
+        "expectNotices": [
+            [
+                [
+                    "S",
+                    "NOTICE"
+                ],
+                [
+                    "V",
+                    "NOTICE"
+                ],
+                [
+                    "C",
+                    "00000"
+                ],
+                [
+                    "M",
+                    "table \"gap_probe_missing\" does not exist, skipping"
+                ],
+                [
+                    "F",
+                    "tablecmds.c"
+                ],
+                [
+                    "L",
+                    "1506"
+                ],
+                [
+                    "R",
+                    "DropErrorMsgNonExistent"
+                ]
+            ]
+        ],
+        "rawNoticePayloads": [
+            "534e4f5449434500564e4f5449434500433030303030004d7461626c6520226761705f70726f62655f6d697373696e672220646f6573206e6f742065786973742c20736b697070696e6700467461626c65636d64732e63004c31353036005244726f704572726f724d73674e6f6e4578697374656e740000"
         ]
     },
     {
-        "name": "known-error-fields-reduced",
-        "cluster": "gap",
-        "reason": "PGlite sends C, F, L, M, P, R, S and V in the ErrorResponse. Only the code and the message survive decoding, so position, detail, hint and object names are invisible to callers.",
-        "pglite": "code 22P02 with position P=8 and every other ErrorResponse field",
-        "setup": [],
+        "name": "error-fields-kept",
+        "cluster": "fixed",
+        "reason": "ErrorResponse keeps every field PGlite sent, in wire order: severity S and V, code C, message M, position P, file F, line L and routine R.",
         "sql": "SELECT 'oops'::int",
-        "expectError": "22P02: invalid input syntax for type integer: \"oops\""
+        "setup": [],
+        "teardown": [],
+        "expectResults": [],
+        "expectError": {
+            "code": "22P02",
+            "message": "invalid input syntax for type integer: \"oops\"",
+            "fields": [
+                [
+                    "S",
+                    "ERROR"
+                ],
+                [
+                    "V",
+                    "ERROR"
+                ],
+                [
+                    "C",
+                    "22P02"
+                ],
+                [
+                    "M",
+                    "invalid input syntax for type integer: \"oops\""
+                ],
+                [
+                    "P",
+                    "8"
+                ],
+                [
+                    "F",
+                    "numutils.c"
+                ],
+                [
+                    "L",
+                    "618"
+                ],
+                [
+                    "R",
+                    "pg_strtoint32_safe"
+                ]
+            ]
+        },
+        "expectNotices": [],
+        "rawErrorPayload": "534552524f5200564552524f5200433232503032004d696e76616c696420696e7075742073796e74617820666f72207479706520696e74656765723a20226f6f70732200503800466e756d7574696c732e63004c363138005270675f737472746f696e7433325f736166650000"
     },
     {
-        "name": "known-partial-results-dropped",
-        "cluster": "gap",
-        "reason": "PGlite returns the SELECT 1 row before it reports division by zero. The public execute call throws on the first error and discards the earlier statement results.",
-        "pglite": "SELECT 1 row [\"1\"] followed by 22012: division by zero",
-        "setup": [],
+        "name": "partial-results-kept",
+        "cluster": "fixed",
+        "reason": "A later statement failing no longer discards the statements that already finished: the report carries the SELECT 1 result and then the error, matching the PGlite reply order T, D, C, E, Z.",
         "sql": "SELECT 1 AS a; SELECT 1 / 0",
-        "expectError": "22012: division by zero"
+        "setup": [],
+        "teardown": [],
+        "expectResults": [
+            {
+                "columns": [
+                    "a"
+                ],
+                "rows": [
+                    [
+                        "1"
+                    ]
+                ],
+                "tag": "SELECT 1"
+            }
+        ],
+        "expectError": {
+            "code": "22012",
+            "message": "division by zero",
+            "fields": [
+                [
+                    "S",
+                    "ERROR"
+                ],
+                [
+                    "V",
+                    "ERROR"
+                ],
+                [
+                    "C",
+                    "22012"
+                ],
+                [
+                    "M",
+                    "division by zero"
+                ],
+                [
+                    "F",
+                    "int.c"
+                ],
+                [
+                    "L",
+                    "872"
+                ],
+                [
+                    "R",
+                    "int4div"
+                ]
+            ]
+        },
+        "expectNotices": [],
+        "rawErrorPayload": "534552524f5200564552524f5200433232303132004d6469766973696f6e206279207a65726f0046696e742e63004c3837320052696e74346469760000",
+        "rawResponseTags": [
+            "T",
+            "D",
+            "C",
+            "E",
+            "Z"
+        ]
     }
 ]

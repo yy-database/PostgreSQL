@@ -13,7 +13,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 
 use postgres_client::psql::{format_results, parse_arguments, PsqlOptions as CoreOptions};
-use postgres_client::{Column, PostgresError as CoreError, QueryResult};
+use postgres_client::{Column, MessageField, Notice, PostgresError as CoreError, QueryResult};
 
 create_exception!(postgres_pyo3, PostgresError, PyException);
 
@@ -50,6 +50,84 @@ impl StatementResult {
     #[new]
     fn new(columns: Vec<ColumnInfo>, rows: Vec<Vec<Option<String>>>, tag: String) -> Self {
         Self { columns, rows, tag }
+    }
+}
+
+/// One `ErrorResponse` or `NoticeResponse` field, kept in wire order.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct MessageFieldInfo {
+    /// One-byte selector from the protocol, such as `C` or `P`.
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    value: String,
+}
+
+#[pymethods]
+impl MessageFieldInfo {
+    #[new]
+    fn new(kind: String, value: String) -> Self {
+        Self { kind, value }
+    }
+}
+
+/// A server error together with every field the server sent, in wire order.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct ErrorInfo {
+    #[pyo3(get)]
+    code: String,
+    #[pyo3(get)]
+    message: String,
+    #[pyo3(get)]
+    fields: Vec<MessageFieldInfo>,
+}
+
+#[pymethods]
+impl ErrorInfo {
+    #[new]
+    fn new(code: String, message: String, fields: Vec<MessageFieldInfo>) -> Self {
+        Self { code, message, fields }
+    }
+}
+
+/// One `NoticeResponse` the server emitted while a statement ran.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct NoticeInfo {
+    #[pyo3(get)]
+    fields: Vec<MessageFieldInfo>,
+}
+
+#[pymethods]
+impl NoticeInfo {
+    #[new]
+    fn new(fields: Vec<MessageFieldInfo>) -> Self {
+        Self { fields }
+    }
+}
+
+/// Outcome of one simple-query batch.
+///
+/// `results` holds every statement that finished, `error` the failure that
+/// stopped the batch, and `notices` every notice in wire order.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct ExecutionReport {
+    #[pyo3(get)]
+    results: Vec<StatementResult>,
+    #[pyo3(get)]
+    error: Option<ErrorInfo>,
+    #[pyo3(get)]
+    notices: Vec<NoticeInfo>,
+}
+
+#[pymethods]
+impl ExecutionReport {
+    #[new]
+    fn new(results: Vec<StatementResult>, error: Option<ErrorInfo>, notices: Vec<NoticeInfo>) -> Self {
+        Self { results, error, notices }
     }
 }
 
@@ -156,6 +234,32 @@ impl Connection {
             return Err(closed_error());
         };
         connection.execute(sql).map(|results| results.into_iter().map(statement).collect()).map_err(native)
+    }
+
+    /// Runs one simple-query batch and keeps the statements that already finished.
+    ///
+    /// Unlike `execute`, a failure in a later statement does not discard earlier
+    /// results: the report carries results, error and notices in server order.
+    fn execute_report(&self, sql: &str) -> PyResult<ExecutionReport> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        let report = connection.execute_report(sql).map_err(native)?;
+        Ok(ExecutionReport {
+            results: report.results.into_iter().map(statement).collect(),
+            error: report.error.as_ref().and_then(error_info),
+            notices: report.notices.iter().map(notice_info).collect(),
+        })
+    }
+
+    /// Drains every notice received by `execute` calls so far, in wire order.
+    fn take_notices(&self) -> PyResult<Vec<NoticeInfo>> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        Ok(connection.take_notices().iter().map(notice_info).collect())
     }
 
     /// Runs one parameterised statement through an unnamed prepared statement.
@@ -337,9 +441,25 @@ fn encode_query_packet(sql: &str) -> PyResult<Vec<u8>> {
 #[pyfunction]
 fn decode_error_response(payload: Vec<u8>) -> PyResult<(String, String)> {
     match postgres_client::protocol::error_response(&payload) {
-        CoreError::Server { code, message } => Ok((code, message)),
+        CoreError::Server { code, message, .. } => Ok((code, message)),
         other => Err(native(other)),
     }
+}
+
+/// Decodes the ordered fields of an `ErrorResponse` payload.
+#[pyfunction]
+fn decode_error_fields(payload: Vec<u8>) -> PyResult<Vec<MessageFieldInfo>> {
+    postgres_client::protocol::message_fields(&payload)
+        .map(|fields| fields.iter().map(message_field_info).collect())
+        .map_err(native)
+}
+
+/// Decodes the ordered fields of a `NoticeResponse` payload.
+#[pyfunction]
+fn decode_notice_fields(payload: Vec<u8>) -> PyResult<Vec<MessageFieldInfo>> {
+    postgres_client::protocol::notice_response(&payload)
+        .map(|notice| notice.fields.iter().map(message_field_info).collect())
+        .map_err(native)
 }
 
 /// Decodes the column names of a `RowDescription`.
@@ -519,6 +639,25 @@ fn statement(result: QueryResult) -> StatementResult {
     }
 }
 
+fn message_field_info(field: &MessageField) -> MessageFieldInfo {
+    MessageFieldInfo { kind: String::from_utf8_lossy(&[field.kind]).into_owned(), value: field.value.clone() }
+}
+
+fn notice_info(notice: &Notice) -> NoticeInfo {
+    NoticeInfo { fields: notice.fields.iter().map(message_field_info).collect() }
+}
+
+fn error_info(error: &CoreError) -> Option<ErrorInfo> {
+    match error {
+        CoreError::Server { code, message, fields } => Some(ErrorInfo {
+            code: code.clone(),
+            message: message.clone(),
+            fields: fields.iter().map(message_field_info).collect(),
+        }),
+        _ => None,
+    }
+}
+
 fn query_result(result: StatementResult) -> QueryResult {
     QueryResult {
         columns: result.columns.into_iter().map(|column| Column { name: column.name }).collect(),
@@ -553,6 +692,10 @@ fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PreparedStatement>()?;
     module.add_class::<ColumnInfo>()?;
     module.add_class::<StatementResult>()?;
+    module.add_class::<MessageFieldInfo>()?;
+    module.add_class::<ErrorInfo>()?;
+    module.add_class::<NoticeInfo>()?;
+    module.add_class::<ExecutionReport>()?;
     module.add_class::<PsqlOptions>()?;
     module.add_class::<Store>()?;
     module.add_class::<StoreRow>()?;
@@ -564,6 +707,8 @@ fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(encode_startup_packet, module)?)?;
     module.add_function(wrap_pyfunction!(encode_query_packet, module)?)?;
     module.add_function(wrap_pyfunction!(decode_error_response, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_error_fields, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_notice_fields, module)?)?;
     module.add_function(wrap_pyfunction!(decode_row_description, module)?)?;
     module.add_function(wrap_pyfunction!(decode_data_row, module)?)?;
     module.add_function(wrap_pyfunction!(decode_command_tag, module)?)?;

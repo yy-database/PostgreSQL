@@ -61,6 +61,20 @@ function text(value) {
     return value === null ? null : value;
 }
 
+function fieldPairs(fields) {
+    return fields.map((field) => [field.kind, field.value]);
+}
+
+/** Re-serializes ordered fields into the PGlite payload bytes. */
+function fieldBytes(fields) {
+    const parts = [];
+    for (const field of fields) {
+        parts.push(Buffer.from(field.kind, 'utf8'), Buffer.from(field.value, 'utf8'), Buffer.from([0]));
+    }
+    parts.push(Buffer.from([0]));
+    return Buffer.concat(parts);
+}
+
 // -------------------------------------------------------------------------------
 // SQL statement surface, executed against the live PostgreSQL core of the harness.
 // --------------------------------------------------------------------------
@@ -97,38 +111,61 @@ for (const item of sqlCases) {
 const sqlExecuted = counters.executed;
 
 // -------------------------------------------------------------------------------
-// Known differences from PGlite, frozen as assertions. `cases/sql-diff.json`
-// records the PGlite reply and the reason next to every entry produced by
-// `scripts/sql-diff.mjs`, so these guard the documented gap instead of hiding it.
+// Client-observable surface, frozen against PGlite. `cases/sql-diff.json`
+// carries the raw `execProtocolRaw` payloads, so every ordering claim is checked
+// byte for byte instead of against the protocol chapter.
 // --------------------------------------------------------------------------
 for (const item of loadCase('sql-diff.json')) {
     const key = `sql-diff/${item.name}`;
     try {
         for (const statement of item.setup ?? []) connection.execute(statement);
-        if (item.expectError) {
-            let observed = null;
-            try {
-                connection.execute(item.sql);
-            } catch (error) {
-                observed = error.message;
-            }
-            actual[key] = observed === null ? { message: null } : { code: observed.slice(0, 5), message: observed };
-            expectEqual(`${key}/error`, observed, item.expectError);
-        } else {
-            const results = connection.execute(item.sql);
-            const normalized = results.map((result) => ({
-                columns: result.columns.map((column) => column.name),
-                rows: result.rows.map((row) => row.values.map(text)),
-                tag: result.tag,
-            }));
-            actual[key] = normalized;
-            expectEqual(`${key}/result-count`, normalized.length, item.expect.length);
-            item.expect.forEach((expected, index) => {
-                expectEqual(`${key}/${index}/columns`, normalized[index]?.columns, expected.columns);
-                expectEqual(`${key}/${index}/rows`, normalized[index]?.rows, expected.rows);
-                expectEqual(`${key}/${index}/tag`, normalized[index]?.tag, expected.tag);
-            });
+        // `execute` leaves notices buffered across batches; drop earlier ones.
+        connection.takeNotices();
+        const report = connection.executeReport(item.sql);
+        const results = report.results.map((result) => ({
+            columns: result.columns.map((column) => column.name),
+            rows: result.rows.map((row) => row.values.map(text)),
+            tag: result.tag,
+        }));
+        const error = report.error
+            ? { code: report.error.code, message: report.error.message, fields: fieldPairs(report.error.fields) }
+            : null;
+        const notices = report.notices.map((notice) => fieldPairs(notice.fields));
+        actual[key] = { results, error, notices };
+
+        expectEqual(`${key}/results`, results, item.expectResults);
+        expectEqual(`${key}/error`, error, item.expectError);
+        expectEqual(`${key}/notices`, notices, item.expectNotices);
+
+        if (item.rawErrorPayload) {
+            expectEqual(`${key}/error/bytes`, fieldBytes(report.error.fields).toString('hex'), item.rawErrorPayload);
+            expectEqual(
+                `${key}/error/decoded-bytes`,
+                fieldBytes(native.decodeErrorFields(Buffer.from(item.rawErrorPayload, 'hex'))).toString('hex'),
+                item.rawErrorPayload,
+            );
         }
+        for (const [index, payload] of (item.rawNoticePayloads ?? []).entries()) {
+            expectEqual(`${key}/notice/${index}/bytes`, fieldBytes(report.notices[index].fields).toString('hex'), payload);
+            expectEqual(
+                `${key}/notice/${index}/decoded-bytes`,
+                fieldBytes(native.decodeNoticeFields(Buffer.from(payload, 'hex'))).toString('hex'),
+                payload,
+            );
+        }
+
+        // `execute` keeps the same notices for callers that do not take a report.
+        try {
+            connection.execute(item.sql);
+        } catch {
+            // the failing batch still drains to ReadyForQuery
+        }
+        expectEqual(
+            `${key}/execute-notices`,
+            connection.takeNotices().map((notice) => fieldPairs(notice.fields)),
+            item.expectNotices,
+        );
+
         for (const statement of item.teardown ?? []) connection.execute(statement);
     } catch (error) {
         actual[key] = { error: error.message };

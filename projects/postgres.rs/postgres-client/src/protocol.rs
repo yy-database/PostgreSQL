@@ -3,7 +3,7 @@
 //! Every function is a pure transformation over bytes, so callers can be tested
 //! without a socket.
 
-use crate::error::PostgresError;
+use crate::error::{MessageField, Notice, PostgresError};
 
 /// Protocol 3.0 as encoded in the startup packet.
 pub const PROTOCOL_VERSION: u32 = 196_608;
@@ -51,26 +51,47 @@ pub fn query_packet(sql: &str) -> Result<Vec<u8>, PostgresError> {
     Ok(packet)
 }
 
-/// Decodes an `ErrorResponse` payload into the server error shape.
-pub fn error_response(payload: &[u8]) -> PostgresError {
-    let mut code = "unknown".to_owned();
-    let mut message = "PostgreSQL error".to_owned();
+/// Decodes the ordered fields of an `ErrorResponse` or `NoticeResponse` payload.
+///
+/// The field order is the wire order, and values are decoded byte for byte,
+/// because callers compare them with the raw payload.
+pub fn message_fields(payload: &[u8]) -> Result<Vec<MessageField>, PostgresError> {
+    let mut fields = Vec::new();
     let mut offset = 0;
     while offset < payload.len() && payload[offset] != 0 {
-        let field = payload[offset];
+        let kind = payload[offset];
         offset += 1;
         let Some(end) = payload[offset..].iter().position(|byte| *byte == 0).map(|index| index + offset) else {
-            return PostgresError::Protocol("malformed PostgreSQL error response".into());
+            return Err(PostgresError::Protocol("malformed PostgreSQL error response".into()));
         };
-        let value = String::from_utf8_lossy(&payload[offset..end]).into_owned();
-        match field {
-            b'C' => code = value,
-            b'M' => message = value,
-            _ => {}
-        }
+        fields.push(MessageField::new(kind, String::from_utf8_lossy(&payload[offset..end]).into_owned()));
         offset = end + 1;
     }
-    PostgresError::Server { code, message }
+    Ok(fields)
+}
+
+/// Decodes one `NoticeResponse` payload, keeping every field in wire order.
+pub fn notice_response(payload: &[u8]) -> Result<Notice, PostgresError> {
+    message_fields(payload).map(Notice::new)
+}
+
+/// Decodes an `ErrorResponse` payload into the server error shape.
+pub fn error_response(payload: &[u8]) -> PostgresError {
+    let fields = match message_fields(payload) {
+        Ok(fields) => fields,
+        Err(error) => return error,
+    };
+    let code = fields
+        .iter()
+        .find(|field| field.kind == b'C')
+        .map(|field| field.value.clone())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let message = fields
+        .iter()
+        .find(|field| field.kind == b'M')
+        .map(|field| field.value.clone())
+        .unwrap_or_else(|| "PostgreSQL error".to_owned());
+    PostgresError::Server { code, message, fields }
 }
 
 /// Column names carried by a `RowDescription`. Binary formats are rejected.
@@ -336,6 +357,41 @@ mod tests {
         let error = error_response(b"SERROR\0C42P01\0Mrelation does not exist\0\0");
         assert_eq!(error.code(), Some("42P01"));
         assert_eq!(error.message(), "relation does not exist");
+    }
+
+    #[test]
+    fn message_fields_keep_wire_order_and_every_selector() {
+        let payload = b"SERROR\0VERROR\0C22P02\0Minvalid input syntax\0P8\0Ddetail text\0Hhint text\0\0";
+        let fields = message_fields(payload).unwrap();
+        let ordered: Vec<(u8, &str)> = fields.iter().map(|field| (field.kind, field.value.as_str())).collect();
+        assert_eq!(
+            ordered,
+            vec![
+                (b'S', "ERROR"),
+                (b'V', "ERROR"),
+                (b'C', "22P02"),
+                (b'M', "invalid input syntax"),
+                (b'P', "8"),
+                (b'D', "detail text"),
+                (b'H', "hint text"),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_response_exposes_position_detail_and_hint() {
+        let error = error_response(b"SERROR\0VERROR\0C22P02\0Minvalid input\0P8\0Ddetail\0Hhint\0\0");
+        assert_eq!(error.field(b'P'), Some("8"));
+        assert_eq!(error.field(b'D'), Some("detail"));
+        assert_eq!(error.field(b'H'), Some("hint"));
+    }
+
+    #[test]
+    fn notice_response_keeps_severity_code_and_message() {
+        let notice = notice_response(b"SNOTICE\0VNOTICE\0C00000\0Mtable \"x\" does not exist, skipping\0\0").unwrap();
+        assert_eq!(notice.severity(), Some("NOTICE"));
+        assert_eq!(notice.code(), Some("00000"));
+        assert_eq!(notice.message(), Some("table \"x\" does not exist, skipping"));
     }
 
     #[test]

@@ -697,47 +697,73 @@ for (const item of selected) {
 }
 
 // -------------------------------------------------------------------------------
-// Gaps: replies the repository client cannot surface. The oracle side still
-// comes from PGlite, so the missing part is shown next to what PGlite sent.
+// Client-observable gaps. Each probe reads the same reply twice: from PGlite
+// through `execProtocolRaw` and from this client through `executeReport`. A
+// `fixed` status means the ordered fields and bytes agree.
 // -------------------------------------------------------------------------------
 const gaps = [];
 
+function repoFields(fields) {
+    return fields.map((field) => [field.kind, field.value]);
+}
+
 {
-    const oracleNotice = await call('query', { sql: 'DROP TABLE IF EXISTS sqldiff.gap_probe_missing' });
-    const repoNotice = runRepo('DROP TABLE IF EXISTS sqldiff.gap_probe_missing');
+    const sql = 'DROP TABLE IF EXISTS gap_probe_missing';
+    const oracleNotice = await call('query', { sql });
+    const report = connection.executeReport(sql);
+    const repoNotices = report.notices.map((notice) => repoFields(notice.fields));
+    const pgliteNotices = oracleNotice.notices.map((notice) => notice.ordered);
     gaps.push({
-        name: 'notice-discarded',
+        name: 'notice-surfaced',
         surface: 'NoticeResponse',
-        reason: 'Only DataRow, RowDescription, CommandComplete and ErrorResponse reach the caller. NoticeResponse is read off the socket and dropped, so NOTICE and WARNING text can never be shown, although PostgreSQL emits it for routine DDL.',
-        statement: 'DROP TABLE IF EXISTS sqldiff.gap_probe_missing',
-        repo: repoNotice.results,
-        pglite: { results: oracleNotice.results, notices: oracleNotice.notices.map((notice) => notice.M) },
+        status: JSON.stringify(repoNotices) === JSON.stringify(pgliteNotices) ? 'fixed' : 'open',
+        statement: sql,
+        before: 'NoticeResponse was read off the socket and dropped, so NOTICE and WARNING text never reached the caller.',
+        repo: { notices: repoNotices },
+        pglite: { notices: pgliteNotices, raw: oracleNotice.notices.map((notice) => notice.raw) },
+        reason: '`executeReport` returns every notice in wire order and `takeNotices` drains the same notices after `execute`.',
     });
 }
 
 {
-    const oracleDetail = await call('query', { sql: "SELECT 'oops'::int" });
-    const repoDetail = runRepo("SELECT 'oops'::int");
+    const sql = "SELECT 'oops'::int";
+    const oracleDetail = await call('query', { sql });
+    const report = connection.executeReport(sql);
+    const repoError = { code: report.error.code, message: report.error.message, fields: repoFields(report.error.fields) };
+    const pgliteError = { code: oracleDetail.error.code, message: oracleDetail.error.message, fields: oracleDetail.error.ordered };
     gaps.push({
-        name: 'error-fields-dropped',
+        name: 'error-fields-kept',
         surface: 'ErrorResponse fields',
-        reason: 'ErrorResponse is reduced to C and M. Position P, detail D, hint H and the object name fields never reach the caller, so psql cannot draw an error caret and structured diagnostics are unavailable.',
-        statement: "SELECT 'oops'::int",
-        repo: repoDetail.error,
-        pglite: { error: `${oracleDetail.error.code}: ${oracleDetail.error.message}`, fields: Object.keys(oracleDetail.error.fields).sort() },
+        status: JSON.stringify(repoError) === JSON.stringify(pgliteError) ? 'fixed' : 'open',
+        statement: sql,
+        before: 'ErrorResponse was reduced to C and M, so position P, detail D, hint H and the object name fields never reached the caller.',
+        repo: { error: repoError },
+        pglite: { error: pgliteError, raw: oracleDetail.error.raw },
+        reason: 'Every ErrorResponse field survives decoding in wire order, so structured diagnostics and the psql caret are available.',
     });
 }
 
 {
-    const oraclePartial = await call('query', { sql: 'SELECT 1 AS a; SELECT 1 / 0' });
-    const repoPartial = runRepo('SELECT 1 AS a; SELECT 1 / 0');
+    const sql = 'SELECT 1 AS a; SELECT 1 / 0';
+    const oraclePartial = await call('query', { sql });
+    const report = connection.executeReport(sql);
+    const repoPartial = {
+        results: normalizeRepo(report.results),
+        error: { code: report.error.code, message: report.error.message, fields: repoFields(report.error.fields) },
+    };
+    const pglitePartial = {
+        results: oraclePartial.results,
+        error: { code: oraclePartial.error.code, message: oraclePartial.error.message, fields: oraclePartial.error.ordered },
+    };
     gaps.push({
-        name: 'partial-results-dropped',
+        name: 'partial-results-kept',
         surface: 'multi-statement error',
-        reason: 'execute throws on the first error and discards the StatementResult entries already decoded for earlier statements of the same simple-query batch.',
-        statement: 'SELECT 1 AS a; SELECT 1 / 0',
-        repo: repoPartial.error,
-        pglite: { results: oraclePartial.results, error: `${oraclePartial.error.code}: ${oraclePartial.error.message}` },
+        status: JSON.stringify(repoPartial) === JSON.stringify(pglitePartial) ? 'fixed' : 'open',
+        statement: sql,
+        before: '`execute` threw on the first error and discarded the StatementResult entries decoded for earlier statements of the same batch.',
+        repo: repoPartial,
+        pglite: { ...pglitePartial, tags: oraclePartial.tags, raw: oraclePartial.error.raw },
+        reason: '`executeReport` keeps every completed result before the error, matching the PGlite reply order T, D, C, E, Z.',
     });
 }
 
@@ -853,14 +879,19 @@ const lines = [
         `- smallest repro: \`${diff.repro}\``,
         '',
     ].join('\n')),
-    '## Gaps in the client surface',
+    '## Client-surface gaps',
+    '',
+    'Each row compares the observable reply of this client with the same reply read from',
+    'PGlite through `execProtocolRaw`. A row is `fixed` only when the field order and the',
+    'payload bytes match.',
     '',
     ...gaps.map((gap) => [
-        `### ${gap.name}`,
+        `### ${gap.name} — ${gap.status}`,
         '',
         `- surface: ${gap.surface}`,
         `- statement: \`${gap.statement}\``,
-        `- this repository: \`${JSON.stringify(gap.repo)}\``,
+        `- before the fix: ${gap.before}`,
+        `- this repository now: \`${JSON.stringify(gap.repo)}\``,
         `- PGlite: \`${JSON.stringify(gap.pglite)}\``,
         `- reason: ${gap.reason}`,
         '',
@@ -873,7 +904,7 @@ const lines = [
     '',
     '## Gate',
     '',
-    `- stable differences frozen as assertions in \`cases/sql-diff.json\`: ${gated}`,
+    `- client-surface assertions frozen in \`cases/sql-diff.json\`: ${gated}`,
     '',
 ];
 
@@ -885,6 +916,7 @@ console.log(JSON.stringify({
     executed,
     diffs: diffs.length,
     gaps: gaps.length,
+    fixed: gaps.filter((gap) => gap.status === 'fixed').length,
     boundary: boundary.length,
     gated,
     report: path.relative(repositoryRoot, reportJson),

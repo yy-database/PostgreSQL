@@ -86,6 +86,21 @@ def text(value):
     return value
 
 
+def field_pairs(fields):
+    return [[field.kind, field.value] for field in fields]
+
+
+def field_bytes(fields):
+    """Re-serializes ordered fields into the PGlite payload bytes."""
+    out = bytearray()
+    for field in fields:
+        out.extend(field.kind.encode("utf-8"))
+        out.extend(field.value.encode("utf-8"))
+        out.append(0)
+    out.append(0)
+    return bytes(out)
+
+
 def statement_from(item):
     return StatementResult(
         [ColumnInfo(column["name"]) for column in item["columns"]],
@@ -145,32 +160,57 @@ for item in load_case("sql.json"):
         check(f"{key}/run", lambda error=error: (_ for _ in ()).throw(AssertionError(str(error))))
 
 # -------------------------------------------------------------------------------
-# Known differences from PGlite, frozen as assertions. `cases/sql-diff.json`
-# records the PGlite reply and the reason next to every entry produced by
-# `scripts/sql-diff.mjs`, so these guard the documented gap instead of hiding it.
+# Client-observable surface, frozen against PGlite. `cases/sql-diff.json`
+# carries the raw `execProtocolRaw` payloads, so every ordering claim is checked
+# byte for byte instead of against the protocol chapter.
 # -------------------------------------------------------------------------------
 for item in load_case("sql-diff.json"):
     key = f"sql-diff/{item['name']}"
     try:
         for statement in item.get("setup", []):
             connection.execute(statement)
-        if "expectError" in item:
-            try:
-                connection.execute(item["sql"])
-                actual[key] = {"message": None}
-                expect_equal(f"{key}/error", None, item["expectError"])
-            except PostgresError as error:
-                actual[key] = {"code": str(error)[:5], "message": str(error)}
-                expect_equal(f"{key}/error", str(error), item["expectError"])
-        else:
-            results = normalize(connection.execute(item["sql"]))
-            actual[key] = results
-            expect_equal(f"{key}/result-count", len(results), len(item["expect"]))
-            for index, expected in enumerate(item["expect"]):
-                result = results[index]
-                expect_equal(f"{key}/{index}/columns", result["columns"], expected["columns"])
-                expect_equal(f"{key}/{index}/rows", result["rows"], expected["rows"])
-                expect_equal(f"{key}/{index}/tag", result["tag"], expected["tag"])
+        # `execute` leaves notices buffered across batches; drop earlier ones.
+        connection.take_notices()
+        report = connection.execute_report(item["sql"])
+        results = normalize(report.results)
+        error_info = (
+            {"code": report.error.code, "message": report.error.message, "fields": field_pairs(report.error.fields)}
+            if report.error is not None
+            else None
+        )
+        notices = [field_pairs(notice.fields) for notice in report.notices]
+        actual[key] = {"results": results, "error": error_info, "notices": notices}
+
+        expect_equal(f"{key}/results", results, item["expectResults"])
+        expect_equal(f"{key}/error", error_info, item["expectError"])
+        expect_equal(f"{key}/notices", notices, item["expectNotices"])
+
+        if "rawErrorPayload" in item:
+            expect_equal(f"{key}/error/bytes", field_bytes(report.error.fields).hex(), item["rawErrorPayload"])
+            expect_equal(
+                f"{key}/error/decoded-bytes",
+                field_bytes(native.decode_error_fields(bytes.fromhex(item["rawErrorPayload"]))).hex(),
+                item["rawErrorPayload"],
+            )
+        for index, payload in enumerate(item.get("rawNoticePayloads", [])):
+            expect_equal(f"{key}/notice/{index}/bytes", field_bytes(report.notices[index].fields).hex(), payload)
+            expect_equal(
+                f"{key}/notice/{index}/decoded-bytes",
+                field_bytes(native.decode_notice_fields(bytes.fromhex(payload))).hex(),
+                payload,
+            )
+
+        # `execute` keeps the same notices for callers that do not take a report.
+        try:
+            connection.execute(item["sql"])
+        except PostgresError:
+            pass
+        expect_equal(
+            f"{key}/execute-notices",
+            [field_pairs(notice.fields) for notice in connection.take_notices()],
+            item["expectNotices"],
+        )
+
         for statement in item.get("teardown", []):
             connection.execute(statement)
     except Exception as error:  # noqa: BLE001 - a failing case is a failed assertion

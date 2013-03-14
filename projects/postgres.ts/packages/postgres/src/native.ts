@@ -33,6 +33,35 @@ export interface ServerErrorInfo {
     message: string;
 }
 
+/** One `ErrorResponse` or `NoticeResponse` field, kept in wire order. */
+export interface MessageFieldInfo {
+    /** One-byte selector from the protocol, such as `C` or `P`. */
+    kind: string;
+    value: string;
+}
+
+/** A server error together with every field the server sent, in wire order. */
+export interface ErrorInfo {
+    code: string;
+    message: string;
+    fields: MessageFieldInfo[];
+}
+
+/** One `NoticeResponse` the server emitted while a statement ran. */
+export interface NoticeInfo {
+    fields: MessageFieldInfo[];
+}
+
+/** Outcome of one simple-query batch. */
+export interface ExecutionReport {
+    /** Every statement that finished before the batch stopped. */
+    results: StatementResult[];
+    /** The failure that stopped the batch, or `null` when every statement ran. */
+    error: ErrorInfo | null;
+    /** Every notice in wire order. */
+    notices: NoticeInfo[];
+}
+
 /** One named prepared statement on a live connection. */
 export interface PreparedStatement {
     name(): string;
@@ -48,6 +77,10 @@ export interface PreparedStatement {
 /** One socket in the protocol-v3 simple and extended query modes. */
 export interface Connection {
     execute(sql: string): StatementResult[];
+    /** Runs one batch, keeping the statements that finished before the error. */
+    executeReport(sql: string): ExecutionReport;
+    /** Drains every notice received by `execute` calls so far, in wire order. */
+    takeNotices(): NoticeInfo[];
     executeWithParams(sql: string, params: (string | null)[], types: number[]): StatementResult[];
     prepare(sql: string, types: number[]): PreparedStatement;
     executePrepared(name: string, params: (string | null)[]): StatementResult[];
@@ -93,6 +126,8 @@ export interface PostgresNative {
     encodeStartupPacket(user: string, database: string): Buffer;
     encodeQueryPacket(sql: string): Buffer;
     decodeErrorResponse(payload: Buffer): ServerErrorInfo;
+    decodeErrorFields(payload: Buffer): MessageFieldInfo[];
+    decodeNoticeFields(payload: Buffer): MessageFieldInfo[];
     decodeRowDescription(payload: Buffer): string[];
     decodeDataRow(payload: Buffer, columns: number): (string | null)[];
     decodeCommandTag(payload: Buffer): string;

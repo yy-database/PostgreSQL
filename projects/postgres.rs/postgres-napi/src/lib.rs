@@ -12,7 +12,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use postgres_client::psql::{format_results, parse_arguments, PsqlOptions};
-use postgres_client::{Column, PostgresError, QueryResult};
+use postgres_client::{Column, MessageField, Notice, PostgresError, QueryResult};
 
 /// Where to connect and which identity to present.
 #[napi(object)]
@@ -49,6 +49,39 @@ pub struct StatementResult {
 pub struct ServerErrorInfo {
     pub code: String,
     pub message: String,
+}
+
+/// One `ErrorResponse` or `NoticeResponse` field, kept in wire order.
+#[napi(object)]
+pub struct MessageFieldInfo {
+    /// One-byte selector from the protocol, such as `C` or `P`.
+    pub kind: String,
+    pub value: String,
+}
+
+/// A server error together with every field the server sent, in wire order.
+#[napi(object)]
+pub struct ErrorInfo {
+    pub code: String,
+    pub message: String,
+    pub fields: Vec<MessageFieldInfo>,
+}
+
+/// One `NoticeResponse` the server emitted while a statement ran.
+#[napi(object)]
+pub struct NoticeInfo {
+    pub fields: Vec<MessageFieldInfo>,
+}
+
+/// Outcome of one simple-query batch.
+///
+/// `results` holds every statement that finished, `error` the failure that
+/// stopped the batch, and `notices` every notice in wire order.
+#[napi(object)]
+pub struct ExecutionReport {
+    pub results: Vec<StatementResult>,
+    pub error: Option<ErrorInfo>,
+    pub notices: Vec<NoticeInfo>,
 }
 
 /// One stored row.
@@ -88,6 +121,30 @@ impl Connection {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
         connection.execute(&sql).map(|results| results.into_iter().map(statement).collect()).map_err(native)
+    }
+
+    /// Runs one simple-query batch and keeps the statements that already finished.
+    ///
+    /// Unlike `execute`, a failure in a later statement does not discard earlier
+    /// results: the report carries results, error and notices in server order.
+    #[napi]
+    pub fn execute_report(&self, sql: String) -> Result<ExecutionReport> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        let report = connection.execute_report(&sql).map_err(native)?;
+        Ok(ExecutionReport {
+            results: report.results.into_iter().map(statement).collect(),
+            error: report.error.as_ref().and_then(error_info),
+            notices: report.notices.iter().map(notice_info).collect(),
+        })
+    }
+
+    /// Drains every notice received by `execute` calls so far, in wire order.
+    #[napi]
+    pub fn take_notices(&self) -> Result<Vec<NoticeInfo>> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        Ok(connection.take_notices().iter().map(notice_info).collect())
     }
 
     /// Runs one parameterised statement through an unnamed prepared statement.
@@ -268,9 +325,25 @@ pub fn encode_query_packet(sql: String) -> Result<Buffer> {
 #[napi]
 pub fn decode_error_response(payload: Buffer) -> Result<ServerErrorInfo> {
     match postgres_client::protocol::error_response(payload.as_ref()) {
-        PostgresError::Server { code, message } => Ok(ServerErrorInfo { code, message }),
+        PostgresError::Server { code, message, .. } => Ok(ServerErrorInfo { code, message }),
         other => Err(Error::from_reason(other.to_string())),
     }
+}
+
+/// Decodes every `ErrorResponse` field, in wire order.
+#[napi]
+pub fn decode_error_fields(payload: Buffer) -> Result<Vec<MessageFieldInfo>> {
+    postgres_client::protocol::message_fields(payload.as_ref())
+        .map(|fields| fields.iter().map(message_field_info).collect())
+        .map_err(native)
+}
+
+/// Decodes every `NoticeResponse` field, in wire order.
+#[napi]
+pub fn decode_notice_fields(payload: Buffer) -> Result<Vec<MessageFieldInfo>> {
+    postgres_client::protocol::notice_response(payload.as_ref())
+        .map(|notice| notice.fields.iter().map(message_field_info).collect())
+        .map_err(native)
 }
 
 /// Decodes the column names of a `RowDescription`.
@@ -475,6 +548,25 @@ fn statement(result: QueryResult) -> StatementResult {
         columns: result.columns.into_iter().map(|column| ColumnInfo { name: column.name }).collect(),
         rows: result.rows.into_iter().map(|values| DataRow { values }).collect(),
         tag: result.tag,
+    }
+}
+
+fn message_field_info(field: &MessageField) -> MessageFieldInfo {
+    MessageFieldInfo { kind: String::from_utf8_lossy(&[field.kind]).into_owned(), value: field.value.clone() }
+}
+
+fn notice_info(notice: &Notice) -> NoticeInfo {
+    NoticeInfo { fields: notice.fields.iter().map(message_field_info).collect() }
+}
+
+fn error_info(error: &PostgresError) -> Option<ErrorInfo> {
+    match error {
+        PostgresError::Server { code, message, fields } => Some(ErrorInfo {
+            code: code.clone(),
+            message: message.clone(),
+            fields: fields.iter().map(message_field_info).collect(),
+        }),
+        _ => None,
     }
 }
 

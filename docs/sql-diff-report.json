@@ -60,61 +60,227 @@
     ],
     "gaps": [
         {
-            "name": "notice-discarded",
+            "name": "notice-surfaced",
             "surface": "NoticeResponse",
-            "reason": "Only DataRow, RowDescription, CommandComplete and ErrorResponse reach the caller. NoticeResponse is read off the socket and dropped, so NOTICE and WARNING text can never be shown, although PostgreSQL emits it for routine DDL.",
-            "statement": "DROP TABLE IF EXISTS sqldiff.gap_probe_missing",
-            "repo": [
-                {
-                    "columns": [],
-                    "rows": [],
-                    "tag": "DROP TABLE"
-                }
-            ],
-            "pglite": {
-                "results": [
-                    {
-                        "columns": [],
-                        "rows": [],
-                        "tag": "DROP TABLE"
-                    }
-                ],
-                "notices": [
-                    "table \"gap_probe_missing\" does not exist, skipping"
-                ]
-            }
-        },
-        {
-            "name": "error-fields-dropped",
-            "surface": "ErrorResponse fields",
-            "reason": "ErrorResponse is reduced to C and M. Position P, detail D, hint H and the object name fields never reach the caller, so psql cannot draw an error caret and structured diagnostics are unavailable.",
-            "statement": "SELECT 'oops'::int",
+            "status": "fixed",
+            "statement": "DROP TABLE IF EXISTS gap_probe_missing",
+            "before": "NoticeResponse was read off the socket and dropped, so NOTICE and WARNING text never reached the caller.",
             "repo": {
-                "code": "22P02",
-                "message": "invalid input syntax for type integer: \"oops\""
+                "notices": [
+                    [
+                        [
+                            "S",
+                            "NOTICE"
+                        ],
+                        [
+                            "V",
+                            "NOTICE"
+                        ],
+                        [
+                            "C",
+                            "00000"
+                        ],
+                        [
+                            "M",
+                            "table \"gap_probe_missing\" does not exist, skipping"
+                        ],
+                        [
+                            "F",
+                            "tablecmds.c"
+                        ],
+                        [
+                            "L",
+                            "1506"
+                        ],
+                        [
+                            "R",
+                            "DropErrorMsgNonExistent"
+                        ]
+                    ]
+                ]
             },
             "pglite": {
-                "error": "22P02: invalid input syntax for type integer: \"oops\"",
-                "fields": [
-                    "C",
-                    "F",
-                    "L",
-                    "M",
-                    "P",
-                    "R",
-                    "S",
-                    "V"
+                "notices": [
+                    [
+                        [
+                            "S",
+                            "NOTICE"
+                        ],
+                        [
+                            "V",
+                            "NOTICE"
+                        ],
+                        [
+                            "C",
+                            "00000"
+                        ],
+                        [
+                            "M",
+                            "table \"gap_probe_missing\" does not exist, skipping"
+                        ],
+                        [
+                            "F",
+                            "tablecmds.c"
+                        ],
+                        [
+                            "L",
+                            "1506"
+                        ],
+                        [
+                            "R",
+                            "DropErrorMsgNonExistent"
+                        ]
+                    ]
+                ],
+                "raw": [
+                    "534e4f5449434500564e4f5449434500433030303030004d7461626c6520226761705f70726f62655f6d697373696e672220646f6573206e6f742065786973742c20736b697070696e6700467461626c65636d64732e63004c31353036005244726f704572726f724d73674e6f6e4578697374656e740000"
                 ]
-            }
+            },
+            "reason": "`executeReport` returns every notice in wire order and `takeNotices` drains the same notices after `execute`."
         },
         {
-            "name": "partial-results-dropped",
-            "surface": "multi-statement error",
-            "reason": "execute throws on the first error and discards the StatementResult entries already decoded for earlier statements of the same simple-query batch.",
-            "statement": "SELECT 1 AS a; SELECT 1 / 0",
+            "name": "error-fields-kept",
+            "surface": "ErrorResponse fields",
+            "status": "fixed",
+            "statement": "SELECT 'oops'::int",
+            "before": "ErrorResponse was reduced to C and M, so position P, detail D, hint H and the object name fields never reached the caller.",
             "repo": {
-                "code": "22012",
-                "message": "division by zero"
+                "error": {
+                    "code": "22P02",
+                    "message": "invalid input syntax for type integer: \"oops\"",
+                    "fields": [
+                        [
+                            "S",
+                            "ERROR"
+                        ],
+                        [
+                            "V",
+                            "ERROR"
+                        ],
+                        [
+                            "C",
+                            "22P02"
+                        ],
+                        [
+                            "M",
+                            "invalid input syntax for type integer: \"oops\""
+                        ],
+                        [
+                            "P",
+                            "8"
+                        ],
+                        [
+                            "F",
+                            "numutils.c"
+                        ],
+                        [
+                            "L",
+                            "618"
+                        ],
+                        [
+                            "R",
+                            "pg_strtoint32_safe"
+                        ]
+                    ]
+                }
+            },
+            "pglite": {
+                "error": {
+                    "code": "22P02",
+                    "message": "invalid input syntax for type integer: \"oops\"",
+                    "fields": [
+                        [
+                            "S",
+                            "ERROR"
+                        ],
+                        [
+                            "V",
+                            "ERROR"
+                        ],
+                        [
+                            "C",
+                            "22P02"
+                        ],
+                        [
+                            "M",
+                            "invalid input syntax for type integer: \"oops\""
+                        ],
+                        [
+                            "P",
+                            "8"
+                        ],
+                        [
+                            "F",
+                            "numutils.c"
+                        ],
+                        [
+                            "L",
+                            "618"
+                        ],
+                        [
+                            "R",
+                            "pg_strtoint32_safe"
+                        ]
+                    ]
+                },
+                "raw": "534552524f5200564552524f5200433232503032004d696e76616c696420696e7075742073796e74617820666f72207479706520696e74656765723a20226f6f70732200503800466e756d7574696c732e63004c363138005270675f737472746f696e7433325f736166650000"
+            },
+            "reason": "Every ErrorResponse field survives decoding in wire order, so structured diagnostics and the psql caret are available."
+        },
+        {
+            "name": "partial-results-kept",
+            "surface": "multi-statement error",
+            "status": "fixed",
+            "statement": "SELECT 1 AS a; SELECT 1 / 0",
+            "before": "`execute` threw on the first error and discarded the StatementResult entries decoded for earlier statements of the same batch.",
+            "repo": {
+                "results": [
+                    {
+                        "columns": [
+                            "a"
+                        ],
+                        "rows": [
+                            [
+                                "1"
+                            ]
+                        ],
+                        "tag": "SELECT 1"
+                    }
+                ],
+                "error": {
+                    "code": "22012",
+                    "message": "division by zero",
+                    "fields": [
+                        [
+                            "S",
+                            "ERROR"
+                        ],
+                        [
+                            "V",
+                            "ERROR"
+                        ],
+                        [
+                            "C",
+                            "22012"
+                        ],
+                        [
+                            "M",
+                            "division by zero"
+                        ],
+                        [
+                            "F",
+                            "int.c"
+                        ],
+                        [
+                            "L",
+                            "872"
+                        ],
+                        [
+                            "R",
+                            "int4div"
+                        ]
+                    ]
+                }
             },
             "pglite": {
                 "results": [
@@ -130,8 +296,50 @@
                         "tag": "SELECT 1"
                     }
                 ],
-                "error": "22012: division by zero"
-            }
+                "error": {
+                    "code": "22012",
+                    "message": "division by zero",
+                    "fields": [
+                        [
+                            "S",
+                            "ERROR"
+                        ],
+                        [
+                            "V",
+                            "ERROR"
+                        ],
+                        [
+                            "C",
+                            "22012"
+                        ],
+                        [
+                            "M",
+                            "division by zero"
+                        ],
+                        [
+                            "F",
+                            "int.c"
+                        ],
+                        [
+                            "L",
+                            "872"
+                        ],
+                        [
+                            "R",
+                            "int4div"
+                        ]
+                    ]
+                },
+                "tags": [
+                    "T",
+                    "D",
+                    "C",
+                    "E",
+                    "Z"
+                ],
+                "raw": "534552524f5200564552524f5200433232303132004d6469766973696f6e206279207a65726f0046696e742e63004c3837320052696e74346469760000"
+            },
+            "reason": "`executeReport` keeps every completed result before the error, matching the PGlite reply order T, D, C, E, Z."
         }
     ],
     "notices": [],

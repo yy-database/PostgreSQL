@@ -71,6 +71,16 @@ PGlite 0.5.15 through `execProtocolRaw` and an independent protocol decoder, so
 this repository is never its own reference. The same seed rewrites
 byte-identical report files; `--only <case>` reruns one statement.
 
+The client-surface gaps found by that run are fixed: `Connection::execute_report`
+returns `{ results, error, notices }`, so `NoticeResponse` reaches the caller,
+`ErrorResponse` keeps every ordered field (`S`, `V`, `C`, `M`, `D`, `H`, `P`,
+`F`, `L`, `R` and the object-name fields), and a failing later statement no
+longer discards results already completed in the same batch. `execute` keeps its
+throw-on-error signature and leaves notices buffered for `take_notices`. The
+three fixed rows carry the PGlite `execProtocolRaw` payload bytes in
+`cases/sql-diff.json`, and both acceptance suites re-serialize the decoded
+fields back to those bytes.
+
 ## Testing
 
 ```shell
@@ -79,8 +89,8 @@ pnpm test
 
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
-one shared corpus on both language surfaces. Floors: node 1054, python 1054,
-rust 32; TS and Python results must match case by case; `skipped` must stay 0.
+one shared corpus on both language surfaces. Floors: node 1066, python 1066,
+rust 35; TS and Python results must match case by case; `skipped` must stay 0.
 
 ## Wiring SQL onto this repository's storage (not started)
 
