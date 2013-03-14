@@ -69,7 +69,23 @@ node projects/postgres.ts/packages/postgres-harness/scripts/sql-diff.mjs --seed 
 `sqldiff` staging schema, never on `public`. Every expected value comes from
 PGlite 0.5.15 through `execProtocolRaw` and an independent protocol decoder, so
 this repository is never its own reference. The same seed rewrites
-byte-identical report files; `--only <case>` reruns one statement.
+byte-identical report files; `--only <case>` reruns one statement and does not
+rewrite the checked-in report.
+
+The `differential corpus` CI job gates the same run:
+
+```shell
+pnpm corpus -- --seed 20261106 --count 118 --check
+```
+
+`corpus/sql-differential-baseline.json` pins the seed, the count, the corpus
+digest and the only allowed differences, each classified as a structured
+rejection, a not-implemented feature, an out-of-scope wire feature or an oracle
+disagreement. The gate verifies the identity before any engine starts, rejects
+an unlisted difference with the statement, this repository's output and the raw
+PGlite reply, rejects a changed signal, and rejects a baseline entry that no
+longer differs. `pnpm corpus -- --seed 20261106 --count 118 --update-baseline`
+regenerates the baseline and drops fixed entries.
 
 The client-surface gaps found by that run are fixed: `Connection::execute_report`
 returns `{ results, error, notices }`, so `NoticeResponse` reaches the caller,

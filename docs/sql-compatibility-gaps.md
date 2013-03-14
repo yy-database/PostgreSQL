@@ -10,6 +10,7 @@ so this repository is never its own reference.
 - 118 statements: ddl 20, dml 22, expr 34, agg 22, cast 20
 - corpus digest `6825c48b20c7e36d8d74c1d6652cf7ae85969bc6d6cd25ba91538408ab165e03`
 - every statement runs serially on the staging schema `sqldiff`, never on `public`
+- public schema objects after the run: oracle 0, repository 0
 
 ## Differences found
 
@@ -61,5 +62,9 @@ These wire features are rejected on purpose and are not counted as defects.
 
 ## Gate
 
+- fixed seed `20261106` and count `118`, corpus digest `6825c48b20c7e36d8d74c1d6652cf7ae85969bc6d6cd25ba91538408ab165e03`
+- known-difference baseline: 6 entries (structured-rejection 1, not-implemented 2, out-of-scope 3, oracle-disagreement 0)
 - client-surface assertions frozen in `cases/sql-diff.json`: 3
+- run `pnpm corpus -- --seed 20261106 --count 118 --check` in CI
+- regenerate with `pnpm corpus -- --seed 20261106 --count 118 --update-baseline`
 

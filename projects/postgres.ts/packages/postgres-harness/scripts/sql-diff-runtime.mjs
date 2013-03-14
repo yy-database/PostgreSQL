@@ -175,7 +175,9 @@ function decodeReply(bytes) {
                 break;
         }
     }
-    return { results, error, notices, tags };
+    // The whole reply is kept as bytes so a gate failure can print exactly what
+    // PGlite sent, not a re-serialized copy of the decoded fields.
+    return { results, error, notices, tags, raw: Buffer.from(bytes).toString('hex') };
 }
 
 async function freePort() {
@@ -215,7 +217,7 @@ async function run(sql) {
     try {
         return decodeReply(await oracle.execProtocolRaw(queryBytes(sql)));
     } catch (error) {
-        return { results: [], error: { code: 'client', message: `${error.message}`, fields: {} }, notices: [], tags: [] };
+        return { results: [], error: { code: 'client', message: `${error.message}`, fields: {} }, notices: [], tags: [], raw: null };
     }
 }
 

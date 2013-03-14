@@ -12,6 +12,7 @@
         "fmt": "cargo fmt --manifest-path projects/postgres.rs/Cargo.toml --all",
         "fmt:check": "cargo fmt --manifest-path projects/postgres.rs/Cargo.toml --all --check",
         "test": "node projects/postgres.ts/packages/postgres-harness/cli.mjs test",
+        "corpus": "node projects/postgres.ts/packages/postgres-harness/scripts/sql-diff.mjs",
         "test:rust": "cargo test --manifest-path projects/postgres.rs/Cargo.toml --workspace",
         "typecheck": "tsc --noEmit",
         "examples:ts": "node projects/postgres.ts/examples/roundtrip.ts",

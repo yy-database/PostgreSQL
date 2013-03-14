@@ -13,8 +13,18 @@
  * over the real socket server, exactly like the acceptance harness does.
  *
  * Every statement runs on the staging schema `sqldiff`, never on `public`, so
- * no frozen acceptance table is touched. The only command-line switches are
- * `--seed` and `--only` (repeat one case for a minimal repro).
+ * no frozen acceptance table is touched. The run is a pure function of
+ * `--seed` and `--count`: no wall clock, no locale and no unseeded randomness
+ * takes part. Every process forks its own pair of in-memory PGlite instances,
+ * so parallel runs share no state and produce the same report.
+ *
+ * `--check` is the regression gate used in CI. It verifies the fixed seed,
+ * count and corpus digest in `corpus/sql-differential-baseline.json` before any
+ * engine starts, then requires every observed difference to match one baseline
+ * entry exactly. An unlisted difference, a changed signal or a stale entry all
+ * fail the gate. `--update-baseline` rewrites the baseline from the current run
+ * and drops entries that no longer differ. `--only <case>` is a repro switch and
+ * cannot be combined with either gate mode.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -31,6 +41,24 @@ const reportMarkdown = path.join(repositoryRoot, 'docs', 'sql-compatibility-gaps
 const knownCases = path.join(harnessDir, 'cases', 'sql-diff.json');
 
 const DEFAULT_SEED = 20261106;
+const DEFAULT_COUNT = 118;
+const PGLITE_VERSION = '0.5.15';
+
+const BASELINE_VERSION = 1;
+const baselineFile = path.join(harnessDir, 'corpus', 'sql-differential-baseline.json');
+
+const BASELINE_REASONS = ['structured-rejection', 'not-implemented', 'out-of-scope', 'oracle-disagreement'];
+
+// The probes never reach PGlite, so the reason records why this repository
+// refuses the frame instead of why a decoded value differs.
+const BOUNDARY_REASONS = {
+    'binary-result-format': 'not-implemented',
+    'portal-row-limit': 'not-implemented',
+    'oversized-query': 'structured-rejection',
+    'copy-out': 'out-of-scope',
+    'copy-in': 'out-of-scope',
+    'listen-notify': 'out-of-scope',
+};
 
 // -------------------------------------------------------------------------------
 // Deterministic generator.
@@ -508,21 +536,114 @@ function generateCorpus(seed) {
 // Command line.
 // -------------------------------------------------------------------------------
 function argumentsFrom(argv) {
-    const options = { seed: DEFAULT_SEED, only: null };
+    const options = {
+        seed: DEFAULT_SEED,
+        count: DEFAULT_COUNT,
+        only: null,
+        check: false,
+        updateBaseline: false,
+        help: false,
+    };
+    const values = new Set(['--seed', '--count', '--only']);
+    const flags = new Set(['--check', '--update-baseline', '--help', '-h']);
     for (let index = 0; index < argv.length; index += 1) {
         const flag = argv[index];
-        if (flag === '--seed') options.seed = Number(argv[index + 1]);
-        else if (flag === '--only') options.only = argv[index + 1];
-        else if (flag === '--help' || flag === '-h') options.help = true;
+        if (values.has(flag)) {
+            const value = argv[index + 1];
+            if (value === undefined) throw new Error(`${flag} needs a value`);
+            if (flag === '--seed') options.seed = Number(value);
+            else if (flag === '--count') options.count = Number(value);
+            else options.only = value;
+            index += 1;
+            continue;
+        }
+        if (!flags.has(flag)) throw new Error(`unknown option: ${flag}`);
+        if (flag === '--check') options.check = true;
+        else if (flag === '--update-baseline') options.updateBaseline = true;
+        else options.help = true;
     }
     if (!Number.isInteger(options.seed) || options.seed < 0) throw new Error(`invalid --seed value`);
+    if (!Number.isInteger(options.count) || options.count <= 0) throw new Error(`invalid --count value`);
+    if (options.check && options.updateBaseline) throw new Error('--check and --update-baseline cannot be combined');
+    if (options.only && (options.check || options.updateBaseline)) {
+        throw new Error('--only cannot be combined with --check or --update-baseline');
+    }
     return options;
 }
 
 const options = argumentsFrom(process.argv.slice(2));
 if (options.help) {
-    console.log('usage: node sql-diff.mjs [--seed <uint32>] [--only <case-name>]');
+    console.log('usage: node sql-diff.mjs [--seed <uint32>] [--count <n>] [--only <case-name>] [--check | --update-baseline]');
     process.exit(0);
+}
+
+// -------------------------------------------------------------------------------
+// Corpus identity. The seed and the statement generator fully determine the
+// corpus, so the digest is computed before any process starts.
+// -------------------------------------------------------------------------------
+const corpus = generateCorpus(options.seed);
+const digest = crypto.createHash('sha256').update(JSON.stringify(corpus)).digest('hex');
+const selected = options.only ? corpus.filter((item) => item.name === options.only) : corpus;
+if (options.only && selected.length === 0) throw new Error(`no case named '${options.only}'`);
+
+if (corpus.length !== options.count) {
+    process.stderr.write(
+        [
+            `corpus gate failed: the generator produced ${corpus.length} cases but --count declared ${options.count}`,
+            `  seed ${options.seed}`,
+            `  digest ${digest}`,
+            '',
+            'The corpus is generated from the seed, so --count must equal the generated length.',
+            '',
+        ].join('\n'),
+    );
+    process.exit(1);
+}
+
+// -------------------------------------------------------------------------------
+// Known differences. The baseline is the only allowed set of differences. Each
+// entry names one case, why it is expected to differ and the exact signal seen
+// when the baseline was generated. `--check` runs this before any engine starts.
+// -------------------------------------------------------------------------------
+function loadBaseline() {
+    let parsed;
+    try {
+        parsed = JSON.parse(fs.readFileSync(baselineFile, 'utf8'));
+    } catch (error) {
+        throw new Error(`cannot read the differential baseline at ${baselineFile}: ${error.message}`);
+    }
+    if (parsed.version !== BASELINE_VERSION) {
+        throw new Error(`baseline version ${parsed.version} is not supported, expected ${BASELINE_VERSION}`);
+    }
+    return parsed;
+}
+
+function identityProblems(baseline, expected) {
+    const problems = [];
+    if (baseline.seed !== expected.seed) problems.push(`seed: baseline ${baseline.seed}, current ${expected.seed}`);
+    if (baseline.count !== expected.count) problems.push(`count: baseline ${baseline.count}, current ${expected.count}`);
+    if (baseline.digest !== expected.digest) {
+        problems.push(`corpus digest: baseline ${baseline.digest}, current ${expected.digest}`);
+    }
+    return problems;
+}
+
+const baseline = options.check ? loadBaseline() : null;
+if (baseline) {
+    const problems = identityProblems(baseline, { seed: options.seed, count: options.count, digest });
+    if (problems.length > 0) {
+        process.stderr.write(
+            [
+                'corpus gate failed: the generated corpus no longer matches the baseline',
+                ...problems.map((problem) => `  ${problem}`),
+                '',
+                'The corpus changed without regenerating the baseline. Review the change and run:',
+                `  pnpm corpus -- --seed ${options.seed} --count ${options.count} --update-baseline`,
+                '',
+            ].join('\n'),
+        );
+        process.exit(1);
+    }
 }
 
 // -------------------------------------------------------------------------------
@@ -644,7 +765,7 @@ function statementDiff(item, oracle, repo) {
             reason: oracle.error ? 'error-shape' : 'error-missing',
             statement,
             repo: repo.error ? { error: right } : { results: repo.results },
-            pglite: { error: left, results: oracle.results },
+            pglite: { error: left, results: oracle.results, raw: oracle.raw ?? null },
         };
     }
     const matched = JSON.stringify(repo.results) === JSON.stringify(oracle.results);
@@ -654,18 +775,15 @@ function statementDiff(item, oracle, repo) {
         reason: 'result-shape',
         statement,
         repo: { results: repo.results },
-        pglite: { results: oracle.results },
+        pglite: { results: oracle.results, raw: oracle.raw ?? null },
     };
 }
 
 // -------------------------------------------------------------------------------
 // Run.
 // -------------------------------------------------------------------------------
-const corpus = generateCorpus(options.seed);
-const digest = crypto.createHash('sha256').update(JSON.stringify(corpus)).digest('hex');
-const selected = options.only ? corpus.filter((item) => item.name === options.only) : corpus;
-if (options.only && selected.length === 0) throw new Error(`no case named '${options.only}'`);
-
+// The staging schema is dropped and recreated so a rerun starts from the same
+// state. Every statement is schema-qualified, so `public` stays untouched.
 for (const sql of ['DROP SCHEMA IF EXISTS sqldiff CASCADE', 'CREATE SCHEMA sqldiff', ...STAGE_SETUP]) {
     await both(sql);
 }
@@ -684,6 +802,7 @@ for (const item of selected) {
     }
     if (!outcome.matched) {
         diffs.push({
+            id: item.index,
             cluster: item.cluster,
             name: item.name,
             statement: item.sql,
@@ -695,6 +814,12 @@ for (const item of selected) {
     }
     for (const sql of item.teardown) await both(sql);
 }
+
+// Isolation assertion: the corpus is only allowed to touch `sqldiff`. Both
+// engines read the same catalog count, so a statement that slipped into
+// `public` fails the gate instead of silently changing a frozen table.
+const PUBLIC_OBJECTS = "SELECT count(*) AS c FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')";
+const isolation = await both(PUBLIC_OBJECTS);
 
 // -------------------------------------------------------------------------------
 // Client-observable gaps. Each probe reads the same reply twice: from PGlite
@@ -785,7 +910,7 @@ for (const [name, feature, work] of [
     } catch (raised) {
         error = `${raised.message}`;
     }
-    boundary.push({ name, feature, statement: null, repoError: error, repoResults: null });
+    boundary.push({ id: `boundary/${name}`, name, feature, statement: null, repoError: error, repoResults: null });
 }
 
 function withFreshConnection(name, feature, statement, run) {
@@ -804,7 +929,7 @@ function withFreshConnection(name, feature, statement, run) {
             // the session is already gone after an intentional protocol abort
         }
     }
-    boundary.push({ name, feature, statement, repoError, repoResults });
+    boundary.push({ id: `boundary/${name}`, name, feature, statement, repoError, repoResults });
 }
 
 withFreshConnection('copy-out', 'COPY TO STDOUT', 'COPY (SELECT 1) TO STDOUT', (probe) => probe.execute('COPY (SELECT 1) TO STDOUT'));
@@ -827,15 +952,234 @@ try {
 runtime.kill();
 
 // -------------------------------------------------------------------------------
+// Gate.
+// -------------------------------------------------------------------------------
+function sha256(value) {
+    return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function repoText(side) {
+    return side.error ? `error ${side.error.error}` : `results ${JSON.stringify(side.results)}`;
+}
+
+function pgliteText(side) {
+    return side.error ? `error ${side.error.error}` : `results ${JSON.stringify(side.results)}`;
+}
+
+function corpusEntry(diff) {
+    const raw = diff.pglite.raw;
+    const signal = [`repo ${repoText(diff.repo)}`, `pglite ${pgliteText(diff.pglite)}`, raw == null ? 'raw none' : `raw sha256:${sha256(raw)}`];
+    let reason;
+    let detail;
+    if (raw == null) {
+        reason = 'oracle-disagreement';
+        detail = 'the PGlite reply could not be decoded, so the oracle itself is the difference';
+    } else if (diff.repo.error) {
+        reason = diff.repo.error.error.includes('unsupported:') ? 'not-implemented' : 'structured-rejection';
+        detail = `this repository rejects the statement: ${diff.repo.error.error}`;
+    } else if (diff.pglite.error) {
+        reason = 'oracle-disagreement';
+        detail = `PGlite rejects the statement while this repository accepts it: ${diff.pglite.error.error}`;
+    } else {
+        reason = 'oracle-disagreement';
+        detail = 'both sides answer the statement but decode different values';
+    }
+    return {
+        id: diff.id,
+        cluster: diff.cluster,
+        name: diff.name,
+        statement: diff.statement,
+        kind: 'difference',
+        reason,
+        detail,
+        signal,
+    };
+}
+
+function boundaryEntry(item) {
+    return {
+        id: item.id,
+        cluster: 'boundary',
+        name: item.name,
+        statement: item.statement,
+        kind: 'boundary',
+        reason: BOUNDARY_REASONS[item.name] ?? 'out-of-scope',
+        detail: `outside the declared surface: ${item.feature}`,
+        signal: [item.repoError ? `repo error ${item.repoError}` : `repo results ${JSON.stringify(item.repoResults)}`],
+    };
+}
+
+function observedDifferences() {
+    const observed = diffs.map((diff) => ({ entry: corpusEntry(diff), diff }));
+    for (const item of boundary) {
+        if (item.repoError) observed.push({ entry: boundaryEntry(item), boundary: item });
+    }
+    return observed;
+}
+
+function entryKey(entry) {
+    return `${entry.kind}|${entry.id}|${entry.statement ?? entry.name}`;
+}
+
+function observedOutput(observed) {
+    const lines = [`#${observed.entry.id} [${observed.entry.cluster}] ${observed.entry.name}`];
+    if (observed.boundary) {
+        lines.push(`  statement: ${observed.boundary.statement ?? '(frame encoding probe, no SQL reaches PGlite)'}`);
+        lines.push(`  this repository: ${observed.entry.signal[0].replace(/^repo /, '')}`);
+        lines.push('  PGlite: not reached, the client refuses to encode the frame');
+        lines.push('  PGlite raw reply: none');
+    } else {
+        const diff = observed.diff;
+        lines.push(`  statement: ${diff.statement}`);
+        lines.push(`  this repository: ${repoText(diff.repo)}`);
+        lines.push(`  PGlite: ${pgliteText(diff.pglite)}`);
+        lines.push(`  PGlite raw reply: ${diff.pglite.raw ?? 'none'}`);
+        lines.push(`  smallest repro: ${diff.repro}`);
+    }
+    return lines;
+}
+
+function describeUnexpected(observed) {
+    return [
+        'unexpected difference that the known-difference baseline does not explain',
+        ...observedOutput(observed),
+        `  classification: ${observed.entry.reason} (${observed.entry.detail})`,
+    ].join('\n');
+}
+
+function describeChanged(expected, observed) {
+    return [
+        `known difference changed shape: #${observed.entry.id} [${observed.entry.cluster}] ${observed.entry.name}`,
+        ...observedOutput(observed).slice(1),
+        `  baseline signal: ${expected.signal.join(' | ')}`,
+        `  current signal:  ${observed.entry.signal.join(' | ')}`,
+    ].join('\n');
+}
+
+function describeStale(entry) {
+    return [
+        `baseline entry no longer differs: #${entry.id} [${entry.cluster}] ${entry.name}`,
+        `  statement: ${entry.statement ?? '(frame encoding probe, no SQL reaches PGlite)'}`,
+        `  the case now matches PGlite, drop it with: pnpm corpus -- --seed ${options.seed} --count ${options.count} --update-baseline`,
+    ].join('\n');
+}
+
+function checkBaseline(entries, observed) {
+    const listed = new Map(entries.map((entry) => [entryKey(entry), entry]));
+    const seen = new Set();
+    const problems = [];
+    let matched = 0;
+    for (const item of observed) {
+        const key = entryKey(item.entry);
+        seen.add(key);
+        const expected = listed.get(key);
+        if (!expected) {
+            problems.push(describeUnexpected(item));
+        } else if (JSON.stringify(expected.signal) !== JSON.stringify(item.entry.signal)) {
+            problems.push(describeChanged(expected, item));
+        } else {
+            matched += 1;
+        }
+    }
+    for (const entry of entries) {
+        if (!seen.has(entryKey(entry))) problems.push(describeStale(entry));
+    }
+    return { problems, matched };
+}
+
+function isolationProblems() {
+    const countOf = (side) => {
+        const value = side?.results?.[0]?.rows?.[0]?.[0];
+        return value === undefined || value === null ? null : Number(value);
+    };
+    const oracle = countOf(isolation.oracle);
+    const repo = countOf(isolation.repo);
+    if (oracle === null || repo === null || Number.isNaN(oracle) || Number.isNaN(repo)) {
+        return { oracle, repo, problems: [`could not measure the public schema object count (oracle ${oracle}, repository ${repo})`] };
+    }
+    if (oracle > 0 || repo > 0) {
+        return { oracle, repo, problems: [`the corpus wrote ${oracle} oracle and ${repo} repository object(s) into the public schema`] };
+    }
+    return { oracle, repo, problems: [] };
+}
+
+function reasonCounts(entries) {
+    const counts = {};
+    for (const reason of BASELINE_REASONS) counts[reason] = 0;
+    for (const entry of entries) counts[entry.reason] = (counts[entry.reason] ?? 0) + 1;
+    return counts;
+}
+
+const observed = observedDifferences();
+const isolationState = isolationProblems();
+
+if (options.updateBaseline) {
+    if (isolationState.problems.length > 0) {
+        process.stderr.write(`baseline not written: ${isolationState.problems.join('\n')}\n`);
+        process.exit(1);
+    }
+    const entries = observed
+        .map((item) => item.entry)
+        .sort((left, right) => left.kind.localeCompare(right.kind) || String(left.id).localeCompare(String(right.id)));
+    const file = {
+        version: BASELINE_VERSION,
+        seed: options.seed,
+        count: options.count,
+        digest,
+        engines: { pglite: PGLITE_VERSION },
+        entries,
+    };
+    fs.mkdirSync(path.dirname(baselineFile), { recursive: true });
+    fs.writeFileSync(baselineFile, `${JSON.stringify(file, null, 2)}\n`);
+    const counts = reasonCounts(entries);
+    console.log(
+        [
+            `baseline written: ${path.relative(repositoryRoot, baselineFile)}`,
+            `seed=${options.seed} count=${options.count} digest=${digest}`,
+            `entries: ${entries.length} (${Object.entries(counts).map(([reason, value]) => `${reason} ${value}`).join(', ')})`,
+            `executed ${executed}, differences ${diffs.length}, boundary rejections ${observed.length - diffs.length}, public objects ${isolationState.oracle}/${isolationState.repo}`,
+        ].join('\n'),
+    );
+    process.exit(0);
+}
+
+if (options.check) {
+    const result = checkBaseline(baseline.entries, observed);
+    const problems = [...isolationState.problems, ...result.problems];
+    const ok = problems.length === 0;
+    const summary = ok
+        ? [
+              `corpus gate ok: seed ${options.seed} count ${options.count} digest ${digest}`,
+              `${corpus.length} cases: ${executed} executed / ${diffs.length} differences / ${boundary.length} boundary probes`,
+              `known differences: ${result.matched} matched the baseline`,
+              `public schema objects after the run: oracle ${isolationState.oracle}, repository ${isolationState.repo}`,
+          ]
+        : [
+              `corpus gate failed: ${problems.length} problem(s), ${result.matched} known differences matched`,
+              `seed ${options.seed} count ${options.count} digest ${digest}`,
+              '',
+              problems.join('\n\n'),
+          ];
+    const rendered = summary.join('\n');
+    if (!ok) {
+        process.stderr.write(`${rendered}\n`);
+        process.exit(1);
+    }
+    console.log(rendered);
+    process.exit(0);
+}
+
+// -------------------------------------------------------------------------------
 // Report.
 // -------------------------------------------------------------------------------
 const clusters = {};
 for (const item of corpus) clusters[item.cluster] = (clusters[item.cluster] ?? 0) + 1;
 const gated = fs.existsSync(knownCases) ? (JSON.parse(fs.readFileSync(knownCases, 'utf8')).length ?? 0) : 0;
+const baselineEntries = fs.existsSync(baselineFile) ? loadBaseline().entries : [];
 
 const report = {
     seed: options.seed,
-    engine: 'PGlite 0.5.15 through execProtocolRaw and an independent protocol decoder',
+    engine: `PGlite ${PGLITE_VERSION} through execProtocolRaw and an independent protocol decoder`,
     corpus: { total: corpus.length, clusters, digest },
     executed,
     diffs,
@@ -843,10 +1187,20 @@ const report = {
     gaps,
     notices,
     gated,
+    isolation: { publicObjects: { oracle: isolationState.oracle, repo: isolationState.repo } },
+    baseline: {
+        path: path.relative(repositoryRoot, baselineFile),
+        entries: baselineEntries.length,
+        reasons: reasonCounts(baselineEntries),
+    },
 };
 
-fs.mkdirSync(path.dirname(reportJson), { recursive: true });
-fs.writeFileSync(reportJson, `${JSON.stringify(report, null, 4)}\n`);
+// `--only` is a repro switch: it must not overwrite the checked-in report with
+// a single-case run.
+if (!options.only) {
+    fs.mkdirSync(path.dirname(reportJson), { recursive: true });
+    fs.writeFileSync(reportJson, `${JSON.stringify(report, null, 4)}\n`);
+}
 
 function renderResults(results) {
     if (!results || results.length === 0) return '[]';
@@ -866,6 +1220,7 @@ const lines = [
     `- ${corpus.length} statements: ${Object.entries(clusters).map(([name, count]) => `${name} ${count}`).join(', ')}`,
     `- corpus digest \`${digest}\``,
     '- every statement runs serially on the staging schema `sqldiff`, never on `public`',
+    `- public schema objects after the run: oracle ${isolationState.oracle}, repository ${isolationState.repo}`,
     '',
     '## Differences found',
     '',
@@ -904,11 +1259,15 @@ const lines = [
     '',
     '## Gate',
     '',
+    `- fixed seed \`${report.seed}\` and count \`${corpus.length}\`, corpus digest \`${digest}\``,
+    `- known-difference baseline: ${baselineEntries.length} entries (${Object.entries(reasonCounts(baselineEntries)).map(([reason, count]) => `${reason} ${count}`).join(', ')})`,
     `- client-surface assertions frozen in \`cases/sql-diff.json\`: ${gated}`,
+    '- run `pnpm corpus -- --seed 20261106 --count 118 --check` in CI',
+    '- regenerate with `pnpm corpus -- --seed 20261106 --count 118 --update-baseline`',
     '',
 ];
 
-fs.writeFileSync(reportMarkdown, `${lines.join('\n')}\n`);
+if (!options.only) fs.writeFileSync(reportMarkdown, `${lines.join('\n')}\n`);
 
 console.log(JSON.stringify({
     seed: report.seed,
@@ -919,6 +1278,8 @@ console.log(JSON.stringify({
     fixed: gaps.filter((gap) => gap.status === 'fixed').length,
     boundary: boundary.length,
     gated,
+    isolation: report.isolation,
+    baseline: report.baseline,
     report: path.relative(repositoryRoot, reportJson),
 }, null, 4));
 

@@ -16,6 +16,7 @@
     "diffs": [],
     "boundary": [
         {
+            "id": "boundary/binary-result-format",
             "name": "binary-result-format",
             "feature": "binary result format",
             "statement": null,
@@ -23,6 +24,7 @@
             "repoResults": null
         },
         {
+            "id": "boundary/portal-row-limit",
             "name": "portal-row-limit",
             "feature": "portal row limit",
             "statement": null,
@@ -30,6 +32,7 @@
             "repoResults": null
         },
         {
+            "id": "boundary/oversized-query",
             "name": "oversized-query",
             "feature": "query larger than 16MiB",
             "statement": null,
@@ -37,6 +40,7 @@
             "repoResults": null
         },
         {
+            "id": "boundary/copy-out",
             "name": "copy-out",
             "feature": "COPY TO STDOUT",
             "statement": "COPY (SELECT 1) TO STDOUT",
@@ -44,6 +48,7 @@
             "repoResults": null
         },
         {
+            "id": "boundary/listen-notify",
             "name": "listen-notify",
             "feature": "NotificationResponse",
             "statement": "SELECT 1 AS n; NOTIFY sqldiff_chan",
@@ -51,6 +56,7 @@
             "repoResults": null
         },
         {
+            "id": "boundary/copy-in",
             "name": "copy-in",
             "feature": "COPY FROM STDIN",
             "statement": "COPY sqldiff.stage FROM STDIN",
@@ -343,5 +349,21 @@
         }
     ],
     "notices": [],
-    "gated": 3
+    "gated": 3,
+    "isolation": {
+        "publicObjects": {
+            "oracle": 0,
+            "repo": 0
+        }
+    },
+    "baseline": {
+        "path": "projects\\postgres.ts\\packages\\postgres-harness\\corpus\\sql-differential-baseline.json",
+        "entries": 6,
+        "reasons": {
+            "structured-rejection": 1,
+            "not-implemented": 2,
+            "out-of-scope": 3,
+            "oracle-disagreement": 0
+        }
+    }
 }

@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "seed": 20261106,
+  "count": 118,
+  "digest": "6825c48b20c7e36d8d74c1d6652cf7ae85969bc6d6cd25ba91538408ab165e03",
+  "engines": {
+    "pglite": "0.5.15"
+  },
+  "entries": [
+    {
+      "id": "boundary/binary-result-format",
+      "cluster": "boundary",
+      "name": "binary-result-format",
+      "statement": null,
+      "kind": "boundary",
+      "reason": "not-implemented",
+      "detail": "outside the declared surface: binary result format",
+      "signal": [
+        "repo error unsupported: binary-result-format"
+      ]
+    },
+    {
+      "id": "boundary/copy-in",
+      "cluster": "boundary",
+      "name": "copy-in",
+      "statement": "COPY sqldiff.stage FROM STDIN",
+      "kind": "boundary",
+      "reason": "out-of-scope",
+      "detail": "outside the declared surface: COPY FROM STDIN",
+      "signal": [
+        "repo error unsupported PostgreSQL response tag 71"
+      ]
+    },
+    {
+      "id": "boundary/copy-out",
+      "cluster": "boundary",
+      "name": "copy-out",
+      "statement": "COPY (SELECT 1) TO STDOUT",
+      "kind": "boundary",
+      "reason": "out-of-scope",
+      "detail": "outside the declared surface: COPY TO STDOUT",
+      "signal": [
+        "repo error unsupported PostgreSQL response tag 72"
+      ]
+    },
+    {
+      "id": "boundary/listen-notify",
+      "cluster": "boundary",
+      "name": "listen-notify",
+      "statement": "SELECT 1 AS n; NOTIFY sqldiff_chan",
+      "kind": "boundary",
+      "reason": "out-of-scope",
+      "detail": "outside the declared surface: NotificationResponse",
+      "signal": [
+        "repo error unsupported PostgreSQL response tag 65"
+      ]
+    },
+    {
+      "id": "boundary/oversized-query",
+      "cluster": "boundary",
+      "name": "oversized-query",
+      "statement": null,
+      "kind": "boundary",
+      "reason": "structured-rejection",
+      "detail": "outside the declared surface: query larger than 16MiB",
+      "signal": [
+        "repo error query exceeds the byte limit"
+      ]
+    },
+    {
+      "id": "boundary/portal-row-limit",
+      "cluster": "boundary",
+      "name": "portal-row-limit",
+      "statement": null,
+      "kind": "boundary",
+      "reason": "not-implemented",
+      "detail": "outside the declared surface: portal row limit",
+      "signal": [
+        "repo error unsupported: execute-row-limit"
+      ]
+    }
+  ]
+}
