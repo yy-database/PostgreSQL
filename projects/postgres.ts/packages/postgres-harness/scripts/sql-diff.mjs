@@ -41,13 +41,15 @@ const reportMarkdown = path.join(repositoryRoot, 'docs', 'sql-compatibility-gaps
 const knownCases = path.join(harnessDir, 'cases', 'sql-diff.json');
 
 const DEFAULT_SEED = 20261106;
-const DEFAULT_COUNT = 212;
+const DEFAULT_COUNT = 295;
 const PGLITE_VERSION = '0.5.15';
 
 const BASELINE_VERSION = 1;
 const baselineFile = path.join(harnessDir, 'corpus', 'sql-differential-baseline.json');
 
-const BASELINE_REASONS = ['structured-rejection', 'not-implemented', 'out-of-scope', 'oracle-disagreement'];
+// `oracle-limitation` marks a case the oracle client cannot express, so the
+// difference says nothing about the real engine contract.
+const BASELINE_REASONS = ['structured-rejection', 'not-implemented', 'out-of-scope', 'oracle-disagreement', 'oracle-limitation'];
 
 // The probes never reach PGlite, so the reason records why this repository
 // refuses the frame instead of why a decoded value differs.
@@ -1027,6 +1029,14 @@ function extendedCluster(gen) {
         params: [],
         setup: [],
         teardown: [],
+        // `pg` routes an empty `values` array to a simple query
+        // (`requiresPreparation()` returns `values.length > 0`), so PGlite never
+        // receives a `Bind` here and reports the simple-query `42P02`. Real
+        // PostgreSQL rejects `Bind` with fewer parameters than the statement
+        // requires under `08P01`, which is what this repository reports. The
+        // difference is an oracle limitation, not an engine disagreement.
+        oracleLimitation:
+            '`pg` sends an empty `values` array as a simple query, so the oracle never reaches `Bind` for this case. PostgreSQL rejects a `Bind` that supplies fewer parameters than the prepared statement requires with `08P01` (`ERRCODE_PROTOCOL_VIOLATION`), which is the reply this repository returns.',
     });
     {
         const rows = seededRows(gen, 3);
@@ -1105,6 +1115,154 @@ function extendedCluster(gen) {
     return cases.map((item) => ({ cluster: 'extended', setup: [], teardown: [], ...item }));
 }
 
+function joinCluster(gen) {
+    const cases = [];
+    const left = 'sqldiff.join_left';
+    const right = 'sqldiff.join_right';
+    const leftRows = seededRows(gen, 4);
+    const rightRows = seededRows(gen, 4, 2);
+    const setup = [
+        `CREATE TABLE ${left} (id int PRIMARY KEY, label text, grp int)`,
+        `CREATE TABLE ${right} (rid int PRIMARY KEY, rlabel text, grp int)`,
+        `INSERT INTO ${left} VALUES ${leftRows.map((row, index) => `(${row.id}, '${row.label}', ${index % 2})`).join(', ')}`,
+        `INSERT INTO ${right} VALUES ${rightRows.map((row, index) => `(${row.id}, '${row.label}', ${index % 2})`).join(', ')}`,
+    ];
+    const teardown = [`DROP TABLE IF EXISTS ${right} CASCADE`, `DROP TABLE IF EXISTS ${left} CASCADE`];
+    const push = (name, sql) => cases.push({ name, setup, sql, teardown });
+
+    push('inner-join-on', `SELECT l.id, r.rid FROM ${left} l JOIN ${right} r ON l.grp = r.grp ORDER BY l.id, r.rid`);
+    push('inner-join-using', `SELECT l.id, r.rid FROM ${left} l JOIN ${right} r USING (grp) ORDER BY l.id, r.rid`);
+    push('left-join', `SELECT l.id, r.rid FROM ${left} l LEFT JOIN ${right} r ON l.grp = r.grp ORDER BY l.id, r.rid`);
+    push('right-join', `SELECT l.id, r.rid FROM ${left} l RIGHT JOIN ${right} r ON l.grp = r.grp ORDER BY r.rid, l.id`);
+    push('full-join', `SELECT l.id, r.rid FROM ${left} l FULL JOIN ${right} r ON l.grp = r.grp ORDER BY l.id NULLS LAST, r.rid`);
+    push('cross-join', `SELECT l.id, r.rid FROM ${left} l CROSS JOIN ${right} r ORDER BY l.id, r.rid`);
+    push('natural-join', `SELECT l.id, r.rid FROM ${left} l NATURAL JOIN ${right} r ORDER BY l.id, r.rid`);
+    push('natural-left-join', `SELECT l.id, r.rid FROM ${left} l NATURAL LEFT JOIN ${right} r ORDER BY l.id, r.rid`);
+    push('natural-right-join', `SELECT l.id, r.rid FROM ${left} l NATURAL RIGHT JOIN ${right} r ORDER BY r.rid, l.id`);
+    push('right-join-using', `SELECT l.id, r.rid FROM ${left} l RIGHT JOIN ${right} r USING (grp) ORDER BY r.rid, l.id`);
+    push('full-join-filtered', `SELECT l.id, r.rid FROM ${left} l FULL JOIN ${right} r ON l.grp = r.grp WHERE l.id IS NOT NULL AND r.rid IS NOT NULL ORDER BY l.id, r.rid`);
+    push('join-expression', `SELECT l.id, r.rid FROM ${left} l JOIN ${right} r ON l.id + r.rid = 7 ORDER BY l.id, r.rid`);
+    push('join-with-where', `SELECT l.id, r.rid FROM ${left} l JOIN ${right} r ON l.grp = r.grp WHERE l.grp = 1 ORDER BY l.id, r.rid`);
+    push('join-order-desc', `SELECT l.id, r.rid FROM ${left} l JOIN ${right} r ON l.grp = r.grp ORDER BY l.id DESC, r.rid DESC`);
+    push('join-aggregate', `SELECT l.grp, count(*) AS n FROM ${left} l JOIN ${right} r ON l.grp = r.grp GROUP BY l.grp ORDER BY l.grp`);
+    push('left-join-null-count', `SELECT count(*) AS missing FROM ${left} l LEFT JOIN ${right} r ON l.grp = r.grp WHERE r.rid IS NULL`);
+    push('join-three-tables', `SELECT l.id, r.rid, l2.id FROM ${left} l JOIN ${right} r ON l.grp = r.grp JOIN ${left} l2 ON l2.id = r.rid - 2 ORDER BY l.id, r.rid, l2.id`);
+    push('self-join', `SELECT a.id, b.id FROM ${left} a JOIN ${left} b ON a.grp = b.grp AND a.id < b.id ORDER BY a.id, b.id`);
+    push('self-join-count', `SELECT count(*) AS n FROM ${left} a JOIN ${left} b ON a.grp = b.grp`);
+    push('join-using-group-count', `SELECT count(*) AS n FROM ${left} l JOIN ${right} r USING (grp) WHERE l.grp = 0`);
+    return cases.map((item) => ({ cluster: 'join', setup: [], teardown: [], ...item }));
+}
+
+function windowCluster(gen) {
+    const cases = [];
+    const table = 'sqldiff.window_rows';
+    const amounts = ['10.00', '20.00', '20.00', '30.00', '40.00', '40.00'];
+    const rows = amounts.map((amount, index) => `(${index + 1}, '${gen.pick(WORDS)}', ${index % 2}, ${amount})`);
+    const setup = [
+        `CREATE TABLE ${table} (id int PRIMARY KEY, label text, grp int, amount numeric(10,2))`,
+        `INSERT INTO ${table} VALUES ${rows.join(', ')}`,
+    ];
+    const teardown = [`DROP TABLE IF EXISTS ${table} CASCADE`];
+    const push = (name, sql) => cases.push({ name, setup, sql, teardown });
+
+    push('row-number-order', `SELECT id, row_number() OVER (ORDER BY amount) AS rn FROM ${table} ORDER BY id`);
+    push('rank-order', `SELECT id, rank() OVER (ORDER BY amount) AS r FROM ${table} ORDER BY id`);
+    push('dense-rank-order', `SELECT id, dense_rank() OVER (ORDER BY amount) AS r FROM ${table} ORDER BY id`);
+    push('percent-rank', `SELECT id, percent_rank() OVER (ORDER BY amount) AS p FROM ${table} ORDER BY id`);
+    push('cume-dist', `SELECT id, cume_dist() OVER (ORDER BY amount) AS c FROM ${table} ORDER BY id`);
+    push('ntile-two', `SELECT id, ntile(2) OVER (ORDER BY id) AS bucket FROM ${table} ORDER BY id`);
+    push('ntile-four', `SELECT id, ntile(4) OVER (ORDER BY amount) AS bucket FROM ${table} ORDER BY id`);
+    push('lag-one', `SELECT id, lag(amount) OVER (ORDER BY id) AS prev FROM ${table} ORDER BY id`);
+    push('lag-default', `SELECT id, lag(amount, 1, 0) OVER (ORDER BY id) AS prev FROM ${table} ORDER BY id`);
+    push('lead-one', `SELECT id, lead(amount) OVER (ORDER BY id) AS next FROM ${table} ORDER BY id`);
+    push('lead-offset-two', `SELECT id, lead(amount, 2) OVER (ORDER BY id) AS next FROM ${table} ORDER BY id`);
+    push('first-value', `SELECT id, first_value(amount) OVER (ORDER BY id) AS first FROM ${table} ORDER BY id`);
+    push('last-value-default-frame', `SELECT id, last_value(amount) OVER (ORDER BY id) AS last FROM ${table} ORDER BY id`);
+    push('last-value-unbounded', `SELECT id, last_value(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last FROM ${table} ORDER BY id`);
+    push('running-sum', `SELECT id, sum(amount) OVER (ORDER BY id) AS running FROM ${table} ORDER BY id`);
+    push('running-sum-rows-frame', `SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM ${table} ORDER BY id`);
+    push('moving-average', `SELECT id, avg(amount) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS avg FROM ${table} ORDER BY id`);
+    push('frame-following', `SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS s FROM ${table} ORDER BY id`);
+    push('partition-row-number', `SELECT id, grp, row_number() OVER (PARTITION BY grp ORDER BY id) AS rn FROM ${table} ORDER BY id`);
+    push('partition-sum', `SELECT id, grp, sum(amount) OVER (PARTITION BY grp) AS s FROM ${table} ORDER BY id`);
+    push('partition-rank', `SELECT id, grp, rank() OVER (PARTITION BY grp ORDER BY amount) AS r FROM ${table} ORDER BY id`);
+    push('count-over-partition', `SELECT id, count(*) OVER (PARTITION BY grp) AS n FROM ${table} ORDER BY id`);
+    push('multiple-windows', `SELECT id, row_number() OVER (ORDER BY id) AS rn, rank() OVER (ORDER BY amount) AS r FROM ${table} ORDER BY id`);
+    push('window-in-subquery', `SELECT id, r FROM (SELECT id, rank() OVER (ORDER BY amount) AS r FROM ${table}) s WHERE r <= 3 ORDER BY id`);
+    return cases.map((item) => ({ cluster: 'window', setup: [], teardown: [], ...item }));
+}
+
+function aggBoundaryCluster(gen) {
+    const cases = [];
+    const table = 'sqldiff.agg_rows';
+    const empty = 'sqldiff.agg_empty';
+    const rows = seededRows(gen, 6);
+    const setup = [
+        `CREATE TABLE ${table} (id int PRIMARY KEY, grp int, note text, amount numeric(10,2))`,
+        `INSERT INTO ${table} VALUES ${rows.map((row, index) => `(${row.id}, ${index % 2}, '${row.label}', ${row.amount})`).join(', ')}`,
+        `CREATE TABLE ${empty} (id int PRIMARY KEY, grp int, note text, amount numeric(10,2))`,
+    ];
+    const teardown = [`DROP TABLE IF EXISTS ${empty} CASCADE`, `DROP TABLE IF EXISTS ${table} CASCADE`];
+    const push = (name, sql) => cases.push({ name, setup, sql, teardown });
+
+    push('group-by-having', `SELECT grp, count(*) AS n FROM ${table} GROUP BY grp HAVING count(*) > 1 ORDER BY grp`);
+    push('having-no-rows', `SELECT grp, count(*) AS n FROM ${table} GROUP BY grp HAVING count(*) > 100 ORDER BY grp`);
+    push('group-by-empty-table', `SELECT grp, count(*) AS n FROM ${empty} GROUP BY grp ORDER BY grp`);
+    push('empty-plain-aggregate', `SELECT count(*) AS n, sum(amount) AS s, max(amount) AS m FROM ${empty}`);
+    push('grouping-sets-two', `SELECT grp, count(*) AS n FROM ${table} GROUP BY GROUPING SETS ((grp), ()) ORDER BY grp NULLS LAST`);
+    push('grouping-sets-mixed', `SELECT grp, note, count(*) AS n FROM ${table} GROUP BY GROUPING SETS ((grp, note), (grp), ()) ORDER BY grp NULLS LAST, note NULLS LAST`);
+    push('rollup', `SELECT grp, count(*) AS n FROM ${table} GROUP BY ROLLUP (grp) ORDER BY grp NULLS LAST`);
+    push('cube', `SELECT grp, note, count(*) AS n FROM ${table} GROUP BY CUBE (grp, note) ORDER BY grp NULLS LAST, note NULLS LAST`);
+    push('grouping-function', `SELECT grp, grouping(grp) AS g, count(*) AS n FROM ${table} GROUP BY ROLLUP (grp) ORDER BY grp NULLS LAST`);
+    push('filter-count', `SELECT count(*) FILTER (WHERE grp = 1) AS n FROM ${table}`);
+    push('filter-sum', `SELECT sum(amount) FILTER (WHERE grp = 0) AS s FROM ${table}`);
+    push('filter-with-group-by', `SELECT grp, count(*) FILTER (WHERE amount > 20) AS n FROM ${table} GROUP BY grp ORDER BY grp`);
+    push('filter-having', `SELECT grp, sum(amount) FILTER (WHERE note <> '') AS s FROM ${table} GROUP BY grp HAVING count(*) > 0 ORDER BY grp`);
+    push('count-distinct', `SELECT count(DISTINCT grp) AS n FROM ${table}`);
+    push('sum-distinct', `SELECT sum(DISTINCT amount) AS s FROM ${table}`);
+    push('group-by-two-columns', `SELECT grp, note, count(*) AS n FROM ${table} GROUP BY grp, note ORDER BY grp, note`);
+    push('aggregate-over-null', `SELECT count(amount) AS n, sum(amount) AS s FROM ${table} WHERE amount IS NULL`);
+    return cases.map((item) => ({ cluster: 'agg-boundary', setup: [], teardown: [], ...item }));
+}
+
+function jsonCluster(gen) {
+    const cases = [];
+    const table = 'sqldiff.json_rows';
+    const first = gen.int(10, 19);
+    const setup = [
+        `CREATE TABLE ${table} (id int PRIMARY KEY, doc jsonb, tags text[], nums int[])`,
+        `INSERT INTO ${table} VALUES (1, '{"a": ${first}, "b": "x", "list": [10, 20, 30]}', '{alpha,bravo,charlie}', '{1,2,3}')`,
+        `INSERT INTO ${table} VALUES (2, '{"a": {"b": ${first + 1}}, "b": null, "list": [40]}', '{delta}', '{4,5}')`,
+        `INSERT INTO ${table} VALUES (3, '{"a": ${first + 2}, "nested": {"k": "v"}}', '{}', '{}')`,
+    ];
+    const teardown = [`DROP TABLE IF EXISTS ${table} CASCADE`];
+    const push = (name, sql) => cases.push({ name, setup, sql, teardown });
+
+    push('arrow-text', `SELECT doc -> 'a' AS v FROM ${table} WHERE id = 1`);
+    push('arrow-array-index', `SELECT doc -> 'list' -> 0 AS v FROM ${table} WHERE id = 1`);
+    push('arrow-chain', `SELECT doc -> 'list' -> 2 AS v FROM ${table} WHERE id = 1`);
+    push('arrow2-text', `SELECT doc ->> 'b' AS v FROM ${table} WHERE id = 1`);
+    push('arrow2-nested', `SELECT doc -> 'a' ->> 'b' AS v FROM ${table} WHERE id = 2`);
+    push('hash-arrow', `SELECT doc #> '{a}' AS v FROM ${table} WHERE id = 2`);
+    push('hash-arrow-text', `SELECT doc #>> '{a,b}' AS v FROM ${table} WHERE id = 2`);
+    push('hash-arrow-array', `SELECT doc #> '{list,1}' AS v FROM ${table} WHERE id = 1`);
+    push('path-query', `SELECT jsonb_path_query(doc, '$.a') AS v FROM ${table} WHERE id = 1`);
+    push('path-query-array', `SELECT jsonb_path_query(doc, '$.list[*]') AS v FROM ${table} WHERE id = 1`);
+    push('path-query-filter', `SELECT jsonb_path_query(doc, '$.list[*] ? (@ > 15)') AS v FROM ${table} WHERE id = 1`);
+    push('path-exists-true', `SELECT jsonb_path_exists(doc, '$.a') AS v FROM ${table} WHERE id = 3`);
+    push('path-exists-false', `SELECT jsonb_path_exists(doc, '$.missing') AS v FROM ${table} WHERE id = 3`);
+    push('array-length', `SELECT jsonb_array_length(doc -> 'list') AS n FROM ${table} WHERE id = 1`);
+    push('type-of', `SELECT jsonb_typeof(doc -> 'a') AS t FROM ${table} WHERE id = 1`);
+    push('contains', `SELECT doc @> '{"a": ${first}}' AS v FROM ${table} WHERE id = 1`);
+    push('object-keys', `SELECT k FROM (SELECT jsonb_object_keys(doc) AS k FROM ${table} WHERE id = 1) s ORDER BY k`);
+    push('array-subscript', `SELECT tags[2] AS v FROM ${table} WHERE id = 1`);
+    push('array-slice', `SELECT tags[1:2] AS v FROM ${table} WHERE id = 1`);
+    push('array-slice-open-end', `SELECT nums[2:] AS v FROM ${table} WHERE id = 1`);
+    push('array-slice-empty', `SELECT nums[3:2] AS v FROM ${table} WHERE id = 2`);
+    push('array-subscript-out-of-range', `SELECT tags[9] AS v FROM ${table} WHERE id = 3`);
+    return cases.map((item) => ({ cluster: 'json', setup: [], teardown: [], ...item }));
+}
+
 function generateCorpus(seed) {
     const gen = factory(seed);
     const cases = [
@@ -1117,6 +1275,10 @@ function generateCorpus(seed) {
         ...cursorCluster(gen),
         ...castMatrixCluster(gen),
         ...constraintCluster(gen),
+        ...joinCluster(gen),
+        ...windowCluster(gen),
+        ...aggBoundaryCluster(gen),
+        ...jsonCluster(gen),
         ...extendedCluster(gen),
     ];
     return cases.map((item, index) => ({ index, setup: [], teardown: [], ...item }));
@@ -1501,6 +1663,7 @@ for (const item of selected) {
             name: item.name,
             statement: outcome.statement,
             ...(outcome.params ? { params: outcome.params } : {}),
+            ...(item.oracleLimitation ? { oracleLimitation: item.oracleLimitation } : {}),
             reason: outcome.reason,
             repo: outcome.repo,
             pglite: outcome.pglite,
@@ -1665,7 +1828,10 @@ function corpusEntry(diff) {
     const signal = [`repo ${repoText(diff.repo)}`, `pglite ${pgliteText(diff.pglite)}`, raw == null ? 'raw none' : `raw sha256:${sha256(raw)}`];
     let reason;
     let detail;
-    if (diff.repo.error && diff.pglite.error) {
+    if (diff.oracleLimitation) {
+        reason = 'oracle-limitation';
+        detail = diff.oracleLimitation;
+    } else if (diff.repo.error && diff.pglite.error) {
         reason = diff.repo.error.includes('unsupported:') ? 'not-implemented' : 'oracle-disagreement';
         detail = `both engines reject the statement with different replies: this repository ${diff.repo.error}, PGlite ${diff.pglite.error}`;
     } else if (diff.repo.error) {
@@ -1903,6 +2069,10 @@ function renderResults(results) {
     return results.map((result) => `[${result.tag}] ${JSON.stringify(result.rows)}`).join('; ');
 }
 
+const differenceEntries = new Map(
+    observed.filter((item) => !item.boundary).map((item) => [item.entry.id, item.entry]),
+);
+
 const lines = [
     '# SQL compatibility gaps against PGlite',
     '',
@@ -1923,15 +2093,19 @@ const lines = [
     '## Differences found',
     '',
     ...(diffs.length === 0 ? ['No statement in the declared surface differs from PGlite.', ''] : []),
-    ...diffs.map((diff) => [
-        `### ${diff.cluster}/${diff.name}`,
-        '',
-        `- statement: \`${diff.statement}\``,
-        `- this repository: \`${JSON.stringify(diff.repo)}\``,
-        `- PGlite: \`${JSON.stringify(diff.pglite)}\``,
-        `- smallest repro: \`${diff.repro}\``,
-        '',
-    ].join('\n')),
+    ...diffs.map((diff) => {
+        const entry = differenceEntries.get(diff.id);
+        return [
+            `### ${diff.cluster}/${diff.name}`,
+            '',
+            `- statement: \`${diff.statement}\``,
+            `- this repository: \`${JSON.stringify(diff.repo)}\``,
+            `- PGlite: \`${JSON.stringify(diff.pglite)}\``,
+            ...(entry ? [`- classification: \`${entry.reason}\` — ${entry.detail}`] : []),
+            `- smallest repro: \`${diff.repro}\``,
+            '',
+        ].join('\n');
+    }),
     '## Client-surface gaps',
     '',
     'Each row compares the observable reply of this client with the same reply read from',

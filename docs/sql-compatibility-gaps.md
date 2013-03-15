@@ -9,8 +9,8 @@ own reference.
 
 ## Corpus
 
-- 212 statements: ddl 20, dml 22, expr 34, agg 22, cast 20, transaction 20, cursor 14, cast-matrix 24, constraint 20, extended 16
-- corpus digest `1403963a5f5083ea4f6f40234f7c393c32de43ae680e7fcac218036be7a9711a`
+- 295 statements: ddl 20, dml 22, expr 34, agg 22, cast 20, transaction 20, cursor 14, cast-matrix 24, constraint 20, join 20, window 24, agg-boundary 17, json 22, extended 16
+- corpus digest `425917a64504d0650f710bcb69fcfd40c2a9aa30fbc4b3e84799f7dc3a5d31f3`
 - every statement runs serially on the staging schema `sqldiff`, never on `public`
 - public schema objects after the run: oracle 0, repository 0
 
@@ -21,6 +21,7 @@ own reference.
 - statement: `SELECT $1::int AS n`
 - this repository: `{"error":"08P01: bind message supplies 0 parameters, but prepared statement \"\" requires 1"}`
 - PGlite: `{"error":"42P02: there is no parameter $1","results":[],"raw":null}`
+- classification: `oracle-limitation` — `pg` sends an empty `values` array as a simple query, so the oracle never reaches `Bind` for this case. PostgreSQL rejects a `Bind` that supplies fewer parameters than the prepared statement requires with `08P01` (`ERRCODE_PROTOCOL_VIOLATION`), which is the reply this repository returns.
 - smallest repro: `node projects/postgres.ts/packages/postgres-harness/scripts/sql-diff.mjs --seed 20261106 --only params-missing`
 
 ## Client-surface gaps
@@ -69,9 +70,9 @@ These wire features are rejected on purpose and are not counted as defects.
 
 ## Gate
 
-- fixed seed `20261106` and count `212`, corpus digest `1403963a5f5083ea4f6f40234f7c393c32de43ae680e7fcac218036be7a9711a`
-- known-difference baseline: 7 entries (structured-rejection 1, not-implemented 2, out-of-scope 3, oracle-disagreement 1)
+- fixed seed `20261106` and count `295`, corpus digest `425917a64504d0650f710bcb69fcfd40c2a9aa30fbc4b3e84799f7dc3a5d31f3`
+- known-difference baseline: 7 entries (structured-rejection 1, not-implemented 2, out-of-scope 3, oracle-disagreement 0, oracle-limitation 1)
 - client-surface assertions frozen in `cases/sql-diff.json`: 3
-- run `pnpm corpus -- --seed 20261106 --count 212 --check` in CI
-- regenerate with `pnpm corpus -- --seed 20261106 --count 212 --update-baseline`
+- run `pnpm corpus -- --seed 20261106 --count 295 --check` in CI
+- regenerate with `pnpm corpus -- --seed 20261106 --count 295 --update-baseline`
 

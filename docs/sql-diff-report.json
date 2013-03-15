@@ -2,7 +2,7 @@
     "seed": 20261106,
     "engine": "PGlite 0.5.15 through execProtocolRaw and an independent protocol decoder",
     "corpus": {
-        "total": 212,
+        "total": 295,
         "clusters": {
             "ddl": 20,
             "dml": 22,
@@ -13,20 +13,25 @@
             "cursor": 14,
             "cast-matrix": 24,
             "constraint": 20,
+            "join": 20,
+            "window": 24,
+            "agg-boundary": 17,
+            "json": 22,
             "extended": 16
         },
-        "digest": "1403963a5f5083ea4f6f40234f7c393c32de43ae680e7fcac218036be7a9711a"
+        "digest": "425917a64504d0650f710bcb69fcfd40c2a9aa30fbc4b3e84799f7dc3a5d31f3"
     },
-    "executed": 212,
+    "executed": 295,
     "diffs": [
         {
-            "id": 204,
+            "id": 287,
             "cluster": "extended",
             "name": "params-missing",
             "statement": "SELECT $1::int AS n",
             "params": [
                 []
             ],
+            "oracleLimitation": "`pg` sends an empty `values` array as a simple query, so the oracle never reaches `Bind` for this case. PostgreSQL rejects a `Bind` that supplies fewer parameters than the prepared statement requires with `08P01` (`ERRCODE_PROTOCOL_VIOLATION`), which is the reply this repository returns.",
             "reason": "error-shape",
             "repo": {
                 "error": "08P01: bind message supplies 0 parameters, but prepared statement \"\" requires 1"
@@ -404,7 +409,8 @@
             "structured-rejection": 1,
             "not-implemented": 2,
             "out-of-scope": 3,
-            "oracle-disagreement": 1
+            "oracle-disagreement": 0,
+            "oracle-limitation": 1
         }
     }
 }
