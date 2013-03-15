@@ -262,6 +262,27 @@ impl Connection {
         Ok(connection.take_notices().iter().map(notice_info).collect())
     }
 
+    /// The `BackendKeyData` from startup as `(process_id, secret_key)`.
+    fn backend_key_data(&self) -> PyResult<Option<(i32, i32)>> {
+        let guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_ref() else {
+            return Err(closed_error());
+        };
+        Ok(connection.backend_key_data().map(|key| (key.process_id, key.secret_key)))
+    }
+
+    /// Sends a `CancelRequest` on a fresh socket and closes it.
+    ///
+    /// PostgreSQL answers nothing there, so success only means the packet left
+    /// this process. The main socket is untouched.
+    fn cancel(&self) -> PyResult<()> {
+        let guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_ref() else {
+            return Err(closed_error());
+        };
+        connection.cancel().map_err(native)
+    }
+
     /// Runs one parameterised statement through an unnamed prepared statement.
     /// `types` lists parameter OIDs; pass an empty list to let the server infer.
     fn execute_with_params(
@@ -435,6 +456,12 @@ fn encode_startup_packet(user: &str, database: &str) -> Vec<u8> {
 #[pyfunction]
 fn encode_query_packet(sql: &str) -> PyResult<Vec<u8>> {
     postgres_client::protocol::query_packet(sql).map_err(native)
+}
+
+/// Builds the 16-byte `CancelRequest` sent on its own connection.
+#[pyfunction]
+fn encode_cancel_request(process_id: i32, secret_key: i32) -> Vec<u8> {
+    postgres_client::protocol::cancel_request_packet(process_id, secret_key)
 }
 
 /// Decodes an `ErrorResponse` payload into `(code, message)`.
@@ -706,6 +733,7 @@ fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(max_message_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(encode_startup_packet, module)?)?;
     module.add_function(wrap_pyfunction!(encode_query_packet, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_cancel_request, module)?)?;
     module.add_function(wrap_pyfunction!(decode_error_response, module)?)?;
     module.add_function(wrap_pyfunction!(decode_error_fields, module)?)?;
     module.add_function(wrap_pyfunction!(decode_notice_fields, module)?)?;

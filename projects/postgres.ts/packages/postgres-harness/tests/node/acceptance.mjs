@@ -594,6 +594,71 @@ for (const item of protocol.encodeQuery) {
     }
 }
 
+for (const item of protocol.encodeCancel) {
+    const key = `protocol/cancel/${item.name}`;
+    const packet = native.encodeCancelRequest(item.processId, item.secretKey);
+    actual[key] = packet.toString('hex');
+    expectEqual(`${key}/bytes`, packet.toString('hex'), item.expectHex);
+    expectEqual(`${key}/length`, packet.length, 16);
+    expectEqual(`${key}/code`, packet.readUInt32BE(4), 80877102);
+    expectEqual(`${key}/pid`, packet.readInt32BE(8), item.processId);
+    expectEqual(`${key}/secret`, packet.readInt32BE(12), item.secretKey);
+}
+
+// A live `CancelRequest`, then an idle gap longer than the socket read timeout.
+{
+    const key = 'protocol/cancel/session';
+    const session = native.connect(config);
+    const keyData = session.backendKeyData();
+    actual[key] = { keyData: keyData === null ? null : { processId: keyData.processId, secretKey: keyData.secretKey } };
+    check(`${key}/backend-key`, () => {
+        if (!keyData || !Number.isInteger(keyData.processId) || !Number.isInteger(keyData.secretKey)) {
+            throw new Error(`expected BackendKeyData with two integers got ${JSON.stringify(keyData)}`);
+        }
+    });
+    session.cancel();
+    const results = session.execute('SELECT 1 AS n');
+    actual[key].afterCancel = results[0].rows[0].values;
+    expectEqual(`${key}/after-cancel`, results[0].rows[0].values, ['1']);
+
+    const started = Date.now();
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6000);
+    const idleResults = session.execute('SELECT 2 AS n');
+    actual[key].idleMs = Date.now() - started >= 5000;
+    actual[key].idle = idleResults[0].rows[0].values;
+    expectEqual(`${key}/idle`, idleResults[0].rows[0].values, ['2']);
+    session.close();
+}
+
+// A statement slower than the client read timeout must poison the socket, so
+// the abandoned reply cannot be read as the next statement's answer.
+{
+    const key = 'protocol/timeout';
+    const slow = native.connect(config);
+    let slowFailed = false;
+    try {
+        slow.execute('SELECT pg_sleep(5.5)');
+    } catch {
+        slowFailed = true;
+    }
+    let poisoned = false;
+    try {
+        slow.execute('SELECT 1 AS n');
+    } catch (error) {
+        poisoned = /^connection is unusable after/.test(error.message);
+    }
+    actual[key] = { slowFailed, poisoned };
+    check(`${key}/slow`, () => {
+        if (!slowFailed) throw new Error('expected the read timeout to fail the statement');
+    });
+    check(`${key}/poisoned`, () => {
+        if (!poisoned) throw new Error('expected the next call to be refused as poisoned');
+    });
+    try {
+        slow.close();
+    } catch {}
+}
+
 for (const item of protocol.decodeError) {
     const key = `protocol/error/${item.name}`;
     if (item.expectError) {

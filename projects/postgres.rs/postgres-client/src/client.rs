@@ -1,7 +1,7 @@
 //! One socket, one connection, no global state.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::error::{Notice, PostgresError};
@@ -76,12 +76,27 @@ pub struct Prepared {
     pub columns: Vec<Column>,
 }
 
+/// The `pid` and `secret key` the server sent in `BackendKeyData`.
+///
+/// Both values appear verbatim in a `CancelRequest`, so they are kept for the
+/// lifetime of the session instead of being discarded during startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendKeyData {
+    pub process_id: i32,
+    pub secret_key: i32,
+}
+
 /// A live protocol-v3 connection in the simple-query mode.
 pub struct Connection {
     stream: TcpStream,
+    config: ClientConfig,
+    backend_key: Option<BackendKeyData>,
     session_tag: u32,
     statements: u64,
     notices: Vec<Notice>,
+    /// Set once the stream is desynchronised, so later calls cannot read the
+    /// reply of an abandoned round trip as if it belonged to a new statement.
+    failure: Option<String>,
 }
 
 /// One simple-query round trip that keeps the statements that already finished.
@@ -111,11 +126,7 @@ struct SimpleOutcome {
 impl Connection {
     /// Opens the socket and completes the startup handshake.
     pub fn open(config: &ClientConfig) -> Result<Self, PostgresError> {
-        let address = (config.host.as_str(), config.port)
-            .to_socket_addrs()
-            .map_err(|error| PostgresError::Io(format!("{}:{} cannot be resolved: {error}", config.host, config.port)))?
-            .next()
-            .ok_or_else(|| PostgresError::Io(format!("{}:{} resolved to no address", config.host, config.port)))?;
+        let address = resolve_address(config)?;
         let stream = TcpStream::connect_timeout(&address, TIMEOUT)
             .map_err(|error| PostgresError::Io(format!("{}:{} cannot be reached: {error}", config.host, config.port)))?;
         stream.set_read_timeout(Some(TIMEOUT)).map_err(io_error)?;
@@ -125,9 +136,64 @@ impl Connection {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.subsec_nanos())
             .unwrap_or(0);
-        let mut connection = Self { stream, session_tag, statements: 0, notices: Vec::new() };
+        let mut connection = Self {
+            stream,
+            config: config.clone(),
+            backend_key: None,
+            session_tag,
+            statements: 0,
+            notices: Vec::new(),
+            failure: None,
+        };
         connection.startup(config)?;
         Ok(connection)
+    }
+
+    /// The `BackendKeyData` sent during startup, or `None` when the server
+    /// skipped it.
+    pub fn backend_key_data(&self) -> Option<BackendKeyData> {
+        self.backend_key
+    }
+
+    /// Sends one `CancelRequest` on a fresh socket, then closes it.
+    ///
+    /// PostgreSQL answers nothing on this connection, so `Ok` means the packet
+    /// left this process. The main socket is untouched and stays usable.
+    pub fn cancel(&self) -> Result<(), PostgresError> {
+        let Some(key) = self.backend_key else {
+            return Err(PostgresError::Protocol("server sent no BackendKeyData to cancel".into()));
+        };
+        let address = resolve_address(&self.config)?;
+        let mut stream = TcpStream::connect_timeout(&address, TIMEOUT).map_err(|error| {
+            PostgresError::Io(format!(
+                "cancel connection to {}:{} failed: {error}",
+                self.config.host, self.config.port
+            ))
+        })?;
+        stream.set_write_timeout(Some(TIMEOUT)).map_err(io_error)?;
+        stream.write_all(&protocol::cancel_request_packet(key.process_id, key.secret_key)).map_err(io_error)?;
+        stream.shutdown(std::net::Shutdown::Both).map_err(io_error)?;
+        Ok(())
+    }
+
+    fn ensure_usable(&self) -> Result<(), PostgresError> {
+        match &self.failure {
+            Some(reason) => Err(PostgresError::Io(format!("connection is unusable after {reason}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the stream as unusable after a transport or protocol failure.
+    ///
+    /// A server error is not a desync: the server answered and the next
+    /// `ReadyForQuery` already drained the stream, so the session stays usable.
+    fn poison(&mut self, error: &PostgresError) {
+        if !matches!(error, PostgresError::Io(_) | PostgresError::Protocol(_)) {
+            return;
+        }
+        if self.failure.is_none() {
+            self.failure = Some(error.to_string());
+        }
     }
 
     fn startup(&mut self, config: &ClientConfig) -> Result<(), PostgresError> {
@@ -154,7 +220,15 @@ impl Connection {
                     }
                     return Ok(());
                 }
-                b'S' | b'K' => {}
+                b'K' => {
+                    if payload.len() == 8 {
+                        self.backend_key = Some(BackendKeyData {
+                            process_id: i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
+                            secret_key: i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+                        });
+                    }
+                }
+                b'S' => {}
                 b'N' => self.record_notice(&payload)?,
                 other => return Err(PostgresError::Protocol(format!("unsupported PostgreSQL startup response tag {other}"))),
             }
@@ -163,7 +237,14 @@ impl Connection {
 
     /// Runs one simple-query statement and returns every result it produced.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>, PostgresError> {
-        let outcome = self.run_simple(sql)?;
+        self.ensure_usable()?;
+        let outcome = match self.run_simple(sql) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
         match outcome.error {
             Some(error) => Err(error),
             None => Ok(outcome.results),
@@ -176,8 +257,15 @@ impl Connection {
     /// the error, then every notice the server emitted for this batch. Notices
     /// of earlier batches stay buffered for `take_notices`.
     pub fn execute_report(&mut self, sql: &str) -> Result<Report, PostgresError> {
+        self.ensure_usable()?;
         let start = self.notices.len();
-        let outcome = self.run_simple(sql)?;
+        let outcome = match self.run_simple(sql) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
         let notices = self.notices.split_off(start);
         Ok(Report { results: outcome.results, error: outcome.error, notices })
     }
@@ -264,40 +352,68 @@ impl Connection {
         params: &[Option<&str>],
         param_types: &[u32],
     ) -> Result<Vec<QueryResult>, PostgresError> {
+        self.ensure_usable()?;
         let mut packet = protocol::parse_packet("", sql, param_types)?;
         packet.extend_from_slice(&protocol::bind_packet("", "", params, 0)?);
         packet.extend_from_slice(&protocol::describe_packet(b'P', "")?);
         packet.extend_from_slice(&protocol::execute_packet("", 0)?);
         packet.extend_from_slice(&protocol::sync_packet());
-        Ok(self.read_extended(&packet)?.results)
+        match self.read_extended(&packet) {
+            Ok(outcome) => Ok(outcome.results),
+            Err(error) => {
+                self.poison(&error);
+                Err(error)
+            }
+        }
     }
 
     /// Prepares a named statement and describes it in the same round trip.
     pub fn prepare(&mut self, sql: &str, param_types: &[u32]) -> Result<Prepared, PostgresError> {
+        self.ensure_usable()?;
         self.statements += 1;
         let name = format!("pg_rs_{:08x}_{}", self.session_tag, self.statements);
         let mut packet = protocol::parse_packet(&name, sql, param_types)?;
         packet.extend_from_slice(&protocol::describe_packet(b'S', &name)?);
         packet.extend_from_slice(&protocol::sync_packet());
-        let outcome = self.read_extended(&packet)?;
+        let outcome = match self.read_extended(&packet) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
         Ok(Prepared { name, parameters: outcome.parameters, columns: outcome.described })
     }
 
     /// Binds parameters to an existing prepared statement and executes it.
     pub fn execute_prepared(&mut self, name: &str, params: &[Option<&str>]) -> Result<Vec<QueryResult>, PostgresError> {
+        self.ensure_usable()?;
         let mut packet = protocol::bind_packet("", name, params, 0)?;
         packet.extend_from_slice(&protocol::describe_packet(b'P', "")?);
         packet.extend_from_slice(&protocol::execute_packet("", 0)?);
         packet.extend_from_slice(&protocol::sync_packet());
-        Ok(self.read_extended(&packet)?.results)
+        match self.read_extended(&packet) {
+            Ok(outcome) => Ok(outcome.results),
+            Err(error) => {
+                self.poison(&error);
+                Err(error)
+            }
+        }
     }
 
     /// Closes a prepared statement on the server. Closing an unknown name is a
     /// no-op: the server answers CloseComplete either way.
     pub fn close_prepared(&mut self, name: &str) -> Result<(), PostgresError> {
+        self.ensure_usable()?;
         let mut packet = protocol::close_packet(b'S', name)?;
         packet.extend_from_slice(&protocol::sync_packet());
-        let outcome = self.read_extended(&packet)?;
+        let outcome = match self.read_extended(&packet) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
         if !outcome.results.is_empty() {
             return Err(PostgresError::Protocol("Close returned a result set".into()));
         }
@@ -411,6 +527,14 @@ impl Connection {
         self.stream.read_exact(&mut payload).map_err(io_error)?;
         Ok((header[0], payload))
     }
+}
+
+fn resolve_address(config: &ClientConfig) -> Result<SocketAddr, PostgresError> {
+    (config.host.as_str(), config.port)
+        .to_socket_addrs()
+        .map_err(|error| PostgresError::Io(format!("{}:{} cannot be resolved: {error}", config.host, config.port)))?
+        .next()
+        .ok_or_else(|| PostgresError::Io(format!("{}:{} resolved to no address", config.host, config.port)))
 }
 
 fn io_error(error: std::io::Error) -> PostgresError {

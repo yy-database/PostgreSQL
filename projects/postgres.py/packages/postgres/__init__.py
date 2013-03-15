@@ -27,6 +27,7 @@ from postgres_pyo3 import (  # noqa: F401
     decode_row_description,
     encode_bind_message,
     encode_bytea,
+    encode_cancel_request,
     encode_close_message,
     encode_describe_message,
     encode_execute_message,

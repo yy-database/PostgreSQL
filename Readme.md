@@ -109,6 +109,46 @@ three fixed rows carry the PGlite `execProtocolRaw` payload bytes in
 `cases/sql-diff.json`, and both acceptance suites re-serialize the decoded
 fields back to those bytes.
 
+## Connection and protocol robustness
+
+The wire layer is measured on its own axis, separate from SQL semantics.
+`Connection` now keeps the `BackendKeyData` (`K`) the server sends during
+startup instead of discarding it.
+
+**CancelRequest.** `Connection::cancel()` opens a second socket, writes the
+exact 16-byte startup-position packet (length `16`, code `80877102`, the `pid`
+and `secret key` verbatim), shuts it down and returns. The main socket is not
+touched and stays usable. `protocol::cancel_request_packet` is checked byte
+for byte (`0000001004d2162e...`) in `cargo test` and in both acceptance suites
+through `encodeCancelRequest`, including a zero and a negative key pair.
+
+PGlite is not an oracle for cancellation: its socket server consumes the
+packet and closes silently because there is no backend process to signal.
+`statement_timeout` is accepted and reported by `SHOW`, but not enforced: a
+query that ran 5.6 s with `statement_timeout = '100ms'` still completed.
+Therefore `57014 query canceled` cannot be produced by the only engine
+available here; termination semantics are recorded as an **oracle limitation**
+and are not asserted. What is asserted is what the client owns: the packet
+bytes, and that a cancel followed by a normal statement on the same session
+still returns `SELECT 1`.
+
+**Connection interruption.** A read that ends after a partial result, a frame
+that declares more bytes than arrive, and a peer that closes before
+`ReadyForQuery` all raise a `PostgresError::Io`. After any transport or
+decoding failure the connection is marked unusable, so a later call returns
+`connection is unusable after ...` instead of reading the abandoned reply as
+if it belonged to the next statement. A server error (`08P01` for a bad `Bind`)
+is *not* a desync: the stream is drained to `ReadyForQuery` and the session
+stays usable. `postgres-client/tests/robustness.rs` drives every path above
+with fixed byte scripts against a loopback listener.
+
+**Timeout and idle.** The socket timeout is a per-read limit, not a session
+deadline: a six-second idle gap leaves the session usable and the next
+statement returns normally. A statement slower than that limit fails the call
+and, through the poison rule above, cannot leave half a result behind. This
+repository has no `statement_timeout` GUC of its own; the boundary it owns is
+the 5 s socket read limit.
+
 ## Testing
 
 ```shell
@@ -117,8 +157,8 @@ pnpm test
 
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
-one shared corpus on both language surfaces. Floors: node 1066, python 1066,
-rust 35; TS and Python results must match case by case; `skipped` must stay 0.
+one shared corpus on both language surfaces. Floors: node 1086, python 1086,
+rust 41; TS and Python results must match case by case; `skipped` must stay 0.
 
 ## Wiring SQL onto this repository's storage (not started)
 

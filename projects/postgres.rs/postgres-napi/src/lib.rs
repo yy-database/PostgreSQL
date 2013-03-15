@@ -23,6 +23,13 @@ pub struct ClientOptions {
     pub database: String,
 }
 
+/// The `pid` and `secret key` from `BackendKeyData`, needed for `CancelRequest`.
+#[napi(object)]
+pub struct BackendKeyDataInfo {
+    pub process_id: i32,
+    pub secret_key: i32,
+}
+
 /// One column of a result set.
 #[napi(object)]
 #[derive(Clone)]
@@ -145,6 +152,28 @@ impl Connection {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
         Ok(connection.take_notices().iter().map(notice_info).collect())
+    }
+
+    /// The `BackendKeyData` from startup, or `null` when the server skipped it.
+    #[napi]
+    pub fn backend_key_data(&self) -> Result<Option<BackendKeyDataInfo>> {
+        let guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_ref().ok_or_else(closed_error)?;
+        Ok(connection.backend_key_data().map(|key| BackendKeyDataInfo {
+            process_id: key.process_id,
+            secret_key: key.secret_key,
+        }))
+    }
+
+    /// Sends a `CancelRequest` on a fresh socket and closes it.
+    ///
+    /// PostgreSQL answers nothing there, so success only means the packet left
+    /// this process. The main socket is untouched.
+    #[napi]
+    pub fn cancel(&self) -> Result<()> {
+        let guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_ref().ok_or_else(closed_error)?;
+        connection.cancel().map_err(native)
     }
 
     /// Runs one parameterised statement through an unnamed prepared statement.
@@ -319,6 +348,12 @@ pub fn encode_query_packet(sql: String) -> Result<Buffer> {
     postgres_client::protocol::query_packet(&sql)
         .map(Buffer::from)
         .map_err(native)
+}
+
+/// Builds the 16-byte `CancelRequest` sent on its own connection.
+#[napi]
+pub fn encode_cancel_request(process_id: i32, secret_key: i32) -> Buffer {
+    Buffer::from(postgres_client::protocol::cancel_request_packet(process_id, secret_key))
 }
 
 /// Decodes an `ErrorResponse` payload.

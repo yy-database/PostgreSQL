@@ -10,6 +10,12 @@ export interface ClientOptions {
     database: string;
 }
 
+/** The `pid` and `secret key` from `BackendKeyData`, needed for `CancelRequest`. */
+export interface BackendKeyDataInfo {
+    processId: number;
+    secretKey: number;
+}
+
 /** One column of a result set. */
 export interface ColumnInfo {
     name: string;
@@ -81,6 +87,10 @@ export interface Connection {
     executeReport(sql: string): ExecutionReport;
     /** Drains every notice received by `execute` calls so far, in wire order. */
     takeNotices(): NoticeInfo[];
+    /** `BackendKeyData` from startup, or `null` when the server skipped it. */
+    backendKeyData(): BackendKeyDataInfo | null;
+    /** Sends a `CancelRequest` on a fresh socket; the main socket stays usable. */
+    cancel(): void;
     executeWithParams(sql: string, params: (string | null)[], types: number[]): StatementResult[];
     prepare(sql: string, types: number[]): PreparedStatement;
     executePrepared(name: string, params: (string | null)[]): StatementResult[];
@@ -125,6 +135,8 @@ export interface PostgresNative {
     maxMessageBytes(): number;
     encodeStartupPacket(user: string, database: string): Buffer;
     encodeQueryPacket(sql: string): Buffer;
+    /** The 16-byte `CancelRequest` sent on its own connection. */
+    encodeCancelRequest(processId: number, secretKey: number): Buffer;
     decodeErrorResponse(payload: Buffer): ServerErrorInfo;
     decodeErrorFields(payload: Buffer): MessageFieldInfo[];
     decodeNoticeFields(payload: Buffer): MessageFieldInfo[];

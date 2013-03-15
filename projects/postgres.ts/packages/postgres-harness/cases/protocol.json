@@ -37,6 +37,26 @@
             "structural": true
         }
     ],
+    "encodeCancel": [
+        {
+            "name": "cancel-pid-and-secret",
+            "processId": 1234,
+            "secretKey": 5678,
+            "expectHex": "0000001004d2162e000004d20000162e"
+        },
+        {
+            "name": "cancel-zero",
+            "processId": 0,
+            "secretKey": 0,
+            "expectHex": "0000001004d2162e0000000000000000"
+        },
+        {
+            "name": "cancel-negative-pid",
+            "processId": -1,
+            "secretKey": -1,
+            "expectHex": "0000001004d2162effffffffffffffff"
+        }
+    ],
     "decodeError": [
         {
             "name": "error-code-and-message",

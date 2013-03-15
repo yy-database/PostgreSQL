@@ -583,6 +583,74 @@ for item in protocol["encodeQuery"]:
         expect_equal(f"{key}/length", len(packet), len(item["expectHex"]) // 2)
         expect_equal(f"{key}/tag", packet[0], 0x51)
 
+for item in protocol["encodeCancel"]:
+    key = f"protocol/cancel/{item['name']}"
+    packet = to_bytes(native.encode_cancel_request(item["processId"], item["secretKey"]))
+    actual[key] = packet.hex()
+    expect_equal(f"{key}/bytes", packet.hex(), item["expectHex"])
+    expect_equal(f"{key}/length", len(packet), 16)
+    expect_equal(f"{key}/code", int.from_bytes(packet[4:8], "big"), 80877102)
+    expect_equal(f"{key}/pid", int.from_bytes(packet[8:12], "big", signed=True), item["processId"])
+    expect_equal(f"{key}/secret", int.from_bytes(packet[12:16], "big", signed=True), item["secretKey"])
+
+key = "protocol/cancel/session"
+session = native.connect(CONFIG["host"], CONFIG["port"], CONFIG["user"], CONFIG["database"])
+key_data = session.backend_key_data()
+shape = None if key_data is None else {"processId": key_data[0], "secretKey": key_data[1]}
+actual[key] = {"keyData": shape}
+
+
+def backend_key_present():
+    if not key_data or not isinstance(key_data[0], int) or not isinstance(key_data[1], int):
+        raise AssertionError(f"expected BackendKeyData with two integers got {key_data!r}")
+
+
+check(f"{key}/backend-key", backend_key_present)
+session.cancel()
+results = session.execute("SELECT 1 AS n")
+actual[key]["afterCancel"] = results[0].rows[0]
+expect_equal(f"{key}/after-cancel", results[0].rows[0], ["1"])
+
+started = time.monotonic()
+time.sleep(6)
+idle_results = session.execute("SELECT 2 AS n")
+actual[key]["idleMs"] = time.monotonic() - started >= 5
+actual[key]["idle"] = idle_results[0].rows[0]
+expect_equal(f"{key}/idle", idle_results[0].rows[0], ["2"])
+session.close()
+
+key = "protocol/timeout"
+slow = native.connect(CONFIG["host"], CONFIG["port"], CONFIG["user"], CONFIG["database"])
+slow_failed = False
+try:
+    slow.execute("SELECT pg_sleep(5.5)")
+except PostgresError:
+    slow_failed = True
+poisoned = False
+try:
+    slow.execute("SELECT 1 AS n")
+except PostgresError as error:
+    poisoned = str(error).startswith("connection is unusable after")
+actual[key] = {"slowFailed": slow_failed, "poisoned": poisoned}
+
+
+def slow_timed_out():
+    if not slow_failed:
+        raise AssertionError("expected the read timeout to fail the statement")
+
+
+def refused_after_failure():
+    if not poisoned:
+        raise AssertionError("expected the next call to be refused as poisoned")
+
+
+check(f"{key}/slow", slow_timed_out)
+check(f"{key}/poisoned", refused_after_failure)
+try:
+    slow.close()
+except PostgresError:
+    pass
+
 for item in protocol["decodeError"]:
     key = f"protocol/error/{item['name']}"
     payload = bytes.fromhex(item["payloadHex"])

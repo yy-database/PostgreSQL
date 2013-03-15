@@ -317,6 +317,28 @@ pub fn sync_packet() -> Vec<u8> {
     packet
 }
 
+// -------------------------------------------------------------------------------
+// `CancelRequest`: a startup-position packet sent on its own connection.
+// ---------------------------------------------------------------------------
+
+/// Code carried where the startup packet carries the protocol version.
+pub const CANCEL_REQUEST_CODE: u32 = 808_771_02;
+/// Every `CancelRequest` packet is exactly this long.
+pub const CANCEL_REQUEST_BYTES: usize = 16;
+
+/// One `CancelRequest`, carrying the `pid` and `secret key` from `BackendKeyData`.
+///
+/// The packet has the startup layout instead of a tagged message, so the caller
+/// writes it on a fresh socket and closes it: the server answers nothing.
+pub fn cancel_request_packet(process_id: i32, secret_key: i32) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(CANCEL_REQUEST_BYTES);
+    packet.extend_from_slice(&(CANCEL_REQUEST_BYTES as u32).to_be_bytes());
+    packet.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
+    packet.extend_from_slice(&process_id.to_be_bytes());
+    packet.extend_from_slice(&secret_key.to_be_bytes());
+    packet
+}
+
 /// Parameter OIDs carried by a `ParameterDescription`, in declaration order.
 /// The server sends OID `0` for parameters whose type it could not infer.
 pub fn parameter_description(payload: &[u8]) -> Result<Vec<u32>, PostgresError> {
@@ -488,6 +510,17 @@ mod tests {
         assert_eq!(parameter_type_oid("int4"), Some(23));
         assert_eq!(parameter_type_oid("timestamptz"), Some(1184));
         assert_eq!(parameter_type_oid("nope"), None);
+    }
+
+    #[test]
+    fn cancel_request_carries_pid_and_secret_in_sixteen_bytes() {
+        let packet = cancel_request_packet(1234, 5678);
+        assert_eq!(packet, b"\0\0\0\x10\x04\xd2\x16\x2e\0\0\x04\xd2\0\0\x16\x2e".to_vec());
+        assert_eq!(packet.len(), CANCEL_REQUEST_BYTES);
+        assert_eq!(u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]), CANCEL_REQUEST_CODE);
+        assert_eq!(i32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]), 1234);
+        assert_eq!(i32::from_be_bytes([packet[12], packet[13], packet[14], packet[15]]), 5678);
+        assert_ne!(cancel_request_packet(0, 0), packet);
     }
 
     #[test]
