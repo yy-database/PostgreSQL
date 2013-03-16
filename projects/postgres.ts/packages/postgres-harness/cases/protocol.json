@@ -131,6 +131,44 @@
             "expectError": "invalid PostgreSQL copy column format 2"
         }
     ],
+    "encodeBindWithFormats": [
+        {
+            "name": "bind-empty",
+            "portal": "",
+            "statement": "",
+            "params": [],
+            "paramFormats": [],
+            "resultFormats": [],
+            "expectHex": "420000000c0000000000000000"
+        },
+        {
+            "name": "bind-text-and-null",
+            "portal": "p",
+            "statement": "s",
+            "params": [{ "format": 0, "value": "42" }, { "format": 0, "value": null }],
+            "paramFormats": [],
+            "resultFormats": [],
+            "expectHex": "42000000187000730000000002000000023432ffffffff0000"
+        },
+        {
+            "name": "bind-binary-int4",
+            "portal": "",
+            "statement": "",
+            "params": [{ "format": 1, "valueHex": "0000002a" }],
+            "paramFormats": [1],
+            "resultFormats": [1],
+            "expectHex": "42000000180000000100010001000000040000002a00010001"
+        },
+        {
+            "name": "bind-mixed-formats",
+            "portal": "",
+            "statement": "",
+            "params": [{ "format": 0, "value": "7" }, { "format": 1, "valueHex": "0000002a" }],
+            "paramFormats": [0, 1],
+            "resultFormats": [0, 1],
+            "expectHex": "4200000021000000020000000100020000000137000000040000002a000200000001"
+        }
+    ],
     "decodeError": [
         {
             "name": "error-code-and-message",

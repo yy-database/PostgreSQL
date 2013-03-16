@@ -13,7 +13,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 
 use postgres_client::psql::{format_results, parse_arguments, PsqlOptions as CoreOptions};
-use postgres_client::{Column, MessageField, Notice, PostgresError as CoreError, QueryResult};
+use postgres_client::{Column, MessageField, Notice, Param as CoreParam, PostgresError as CoreError, QueryResult};
 
 create_exception!(postgres_pyo3, PostgresError, PyException);
 
@@ -192,6 +192,46 @@ impl CopyResponseInfo {
     #[new]
     fn new(format: u32, columns: u32, column_formats: Vec<u32>) -> Self {
         Self { format, columns, column_formats }
+    }
+}
+
+/// One named portal bound to a prepared statement.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct PortalInfo {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    parameters: Vec<u32>,
+    #[pyo3(get)]
+    columns: Vec<ColumnInfo>,
+}
+
+#[pymethods]
+impl PortalInfo {
+    #[new]
+    fn new(name: String, parameters: Vec<u32>, columns: Vec<ColumnInfo>) -> Self {
+        Self { name, parameters, columns }
+    }
+}
+
+/// One `Execute` round trip on a portal.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct PortalExecReport {
+    /// Rows produced by this batch.
+    #[pyo3(get)]
+    results: Vec<StatementResult>,
+    /// `True` when the server stopped at the row limit with rows still waiting.
+    #[pyo3(get)]
+    suspended: bool,
+}
+
+#[pymethods]
+impl PortalExecReport {
+    #[new]
+    fn new(results: Vec<StatementResult>, suspended: bool) -> Self {
+        Self { results, suspended }
     }
 }
 
@@ -405,6 +445,109 @@ impl Connection {
         connection.close_prepared(name).map_err(native)
     }
 
+    /// Runs one parameterised statement with explicit text or binary parameters
+    /// and result formats.
+    ///
+    /// `params` holds `(format, value)` pairs where `format` is `0` for text and
+    /// `1` for binary. `result_formats` is empty for text, one code for every
+    /// column, or one code per column.
+    #[pyo3(signature = (sql, params, types, result_formats))]
+    fn execute_with_param_formats(
+        &self,
+        sql: &str,
+        params: Vec<(u32, Option<Vec<u8>>)>,
+        types: Vec<u32>,
+        result_formats: Vec<u32>,
+    ) -> PyResult<Vec<StatementResult>> {
+        let owned = param_buffers(&params)?;
+        let values: Vec<CoreParam<'_>> = owned
+            .iter()
+            .map(|(format, value)| CoreParam { format: *format, value: value.as_deref() })
+            .collect();
+        let formats = result_formats_u16(&result_formats)?;
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        connection
+            .execute_with_param_formats(sql, &values, &types, &formats)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Executes a prepared statement with explicit text or binary parameters.
+    #[pyo3(signature = (name, params, result_formats))]
+    fn execute_prepared_formats(
+        &self,
+        name: &str,
+        params: Vec<(u32, Option<Vec<u8>>)>,
+        result_formats: Vec<u32>,
+    ) -> PyResult<Vec<StatementResult>> {
+        let owned = param_buffers(&params)?;
+        let values: Vec<CoreParam<'_>> = owned
+            .iter()
+            .map(|(format, value)| CoreParam { format: *format, value: value.as_deref() })
+            .collect();
+        let formats = result_formats_u16(&result_formats)?;
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        connection
+            .execute_prepared_formats(name, &values, &formats)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Binds a named portal so it can be executed more than once.
+    #[pyo3(signature = (statement, portal, params, result_formats))]
+    fn bind_portal(
+        &self,
+        statement: &str,
+        portal: &str,
+        params: Vec<(u32, Option<Vec<u8>>)>,
+        result_formats: Vec<u32>,
+    ) -> PyResult<PortalInfo> {
+        let owned = param_buffers(&params)?;
+        let values: Vec<CoreParam<'_>> = owned
+            .iter()
+            .map(|(format, value)| CoreParam { format: *format, value: value.as_deref() })
+            .collect();
+        let formats = result_formats_u16(&result_formats)?;
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        let portal = connection.bind_portal(statement, portal, &values, &formats).map_err(native)?;
+        Ok(PortalInfo {
+            name: portal.name,
+            parameters: portal.parameters,
+            columns: portal.columns.into_iter().map(|column| ColumnInfo { name: column.name }).collect(),
+        })
+    }
+
+    /// Executes an open portal. `max_rows` of `0` runs it to completion.
+    fn execute_portal(&self, portal: &str, max_rows: i32) -> PyResult<PortalExecReport> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        let report = connection.execute_portal(portal, max_rows).map_err(native)?;
+        Ok(PortalExecReport {
+            results: report.results.into_iter().map(statement).collect(),
+            suspended: report.suspended,
+        })
+    }
+
+    /// Closes a portal by server-side name.
+    fn close_portal(&self, name: &str) -> PyResult<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        connection.close_portal(name).map_err(native)
+    }
+
     /// Streams `chunks` as `COPY ... FROM STDIN` data for one statement.
     ///
     /// Data is only written after the server answered `CopyInResponse`. A
@@ -615,7 +758,8 @@ fn encode_parse_message(name: &str, sql: &str, param_types: Vec<u32>) -> PyResul
 }
 
 /// Builds one extended-protocol `Bind` message. Parameters are text values and
-/// `None` is SQL `NULL`. `result_format` must be `0`; binary results are refused.
+/// `None` is SQL `NULL`. `result_format` is `0` for text columns and `1` for
+/// binary ones.
 #[pyfunction]
 fn encode_bind_message(
     portal: &str,
@@ -627,6 +771,24 @@ fn encode_bind_message(
     postgres_client::protocol::bind_packet(portal, statement, &values, result_format).map_err(native)
 }
 
+/// Builds one extended-protocol `Bind` message with explicit parameter and
+/// result format codes.
+#[pyfunction]
+fn encode_bind_message_with_formats(
+    portal: &str,
+    statement: &str,
+    params: Vec<(u32, Option<Vec<u8>>)>,
+    param_formats: Vec<u32>,
+    result_formats: Vec<u32>,
+) -> PyResult<Vec<u8>> {
+    let owned = param_buffers(&params)?;
+    let values: Vec<Option<&[u8]>> = owned.iter().map(|(_, value)| value.as_deref()).collect();
+    let param_codes = result_formats_u16(&param_formats)?;
+    let result_codes = result_formats_u16(&result_formats)?;
+    postgres_client::protocol::bind_packet_with_formats(portal, statement, &values, &param_codes, &result_codes)
+        .map_err(native)
+}
+
 /// Builds one extended-protocol `Describe` message for a statement or portal.
 #[pyfunction]
 fn encode_describe_message(target: &str, name: &str) -> PyResult<Vec<u8>> {
@@ -634,8 +796,8 @@ fn encode_describe_message(target: &str, name: &str) -> PyResult<Vec<u8>> {
     postgres_client::protocol::describe_packet(kind, name).map_err(native)
 }
 
-/// Builds one extended-protocol `Execute` message. `max_rows` must be `0`;
-/// partial execution is refused.
+/// Builds one extended-protocol `Execute` message. `max_rows` of `0` runs the
+/// portal to completion and a positive limit suspends it after that many rows.
 #[pyfunction]
 fn encode_execute_message(portal: &str, max_rows: i32) -> PyResult<Vec<u8>> {
     postgres_client::protocol::execute_packet(portal, max_rows).map_err(native)
@@ -830,6 +992,33 @@ fn describe_target(target: &str) -> PyResult<u8> {
     }
 }
 
+/// Copies every parameter into owned bytes so the borrows outlive the lock.
+fn param_buffers(params: &[(u32, Option<Vec<u8>>)]) -> PyResult<Vec<(u16, Option<Vec<u8>>)>> {
+    let mut owned = Vec::with_capacity(params.len());
+    for (format, value) in params {
+        let format = u16::try_from(*format)
+            .map_err(|_| PostgresError::new_err("parameter format does not fit 16 bits"))?;
+        if format > 1 {
+            return Err(PostgresError::new_err("parameter format is 0 for text and 1 for binary"));
+        }
+        owned.push((format, value.clone()));
+    }
+    Ok(owned)
+}
+
+fn result_formats_u16(formats: &[u32]) -> PyResult<Vec<u16>> {
+    let mut codes = Vec::with_capacity(formats.len());
+    for format in formats {
+        let code = u16::try_from(*format)
+            .map_err(|_| PostgresError::new_err("result format does not fit 16 bits"))?;
+        if code > 1 {
+            return Err(PostgresError::new_err("result format is 0 for text and 1 for binary"));
+        }
+        codes.push(code);
+    }
+    Ok(codes)
+}
+
 fn lock_error() -> PyErr {
     PostgresError::new_err("connection lock is poisoned")
 }
@@ -855,6 +1044,8 @@ fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<CopyInReport>()?;
     module.add_class::<CopyOutReport>()?;
     module.add_class::<CopyResponseInfo>()?;
+    module.add_class::<PortalInfo>()?;
+    module.add_class::<PortalExecReport>()?;
     module.add_class::<PsqlOptions>()?;
     module.add_class::<Store>()?;
     module.add_class::<StoreRow>()?;
@@ -874,6 +1065,7 @@ fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(decode_command_tag, module)?)?;
     module.add_function(wrap_pyfunction!(encode_parse_message, module)?)?;
     module.add_function(wrap_pyfunction!(encode_bind_message, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_bind_message_with_formats, module)?)?;
     module.add_function(wrap_pyfunction!(encode_describe_message, module)?)?;
     module.add_function(wrap_pyfunction!(encode_execute_message, module)?)?;
     module.add_function(wrap_pyfunction!(encode_sync_message, module)?)?;

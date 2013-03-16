@@ -95,6 +95,13 @@
                 "expectHex": "45000000090000000000"
             },
             {
+                "name": "execute-row-limit",
+                "kind": "execute",
+                "portal": "",
+                "maxRows": 5,
+                "expectHex": "45000000090000000005"
+            },
+            {
                 "name": "sync",
                 "kind": "sync",
                 "expectHex": "5300000004"
@@ -139,15 +146,8 @@
                 "portal": "",
                 "statement": "",
                 "params": [],
-                "resultFormat": 1,
-                "expectError": "unsupported: binary-result-format"
-            },
-            {
-                "name": "row-limit",
-                "kind": "execute",
-                "portal": "",
-                "maxRows": 5,
-                "expectError": "unsupported: execute-row-limit"
+                "resultFormat": 2,
+                "expectError": "invalid result format code 2"
             },
             {
                 "name": "too-many-types",

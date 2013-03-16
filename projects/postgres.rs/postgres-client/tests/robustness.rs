@@ -456,3 +456,196 @@ fn copy_out_error_keeps_the_prefix_and_the_connection_usable() {
     handle.join().expect("server thread");
     let _ = connection.close();
 }
+
+fn typed_row_description(column: &str, oid: u32, format: u16) -> Vec<u8> {
+    let mut payload = vec![0, 1];
+    payload.extend_from_slice(column.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&[0, 0, 0, 0]); // table oid
+    payload.extend_from_slice(&[0, 0]); // column attribute
+    payload.extend_from_slice(&oid.to_be_bytes());
+    payload.extend_from_slice(&4_i16.to_be_bytes());
+    payload.extend_from_slice(&(-1_i32).to_be_bytes());
+    payload.extend_from_slice(&format.to_be_bytes());
+    payload
+}
+
+fn binary_row(bytes: &[u8]) -> Vec<u8> {
+    let mut payload = vec![0, 1];
+    payload.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+#[test]
+fn binary_result_rows_are_decoded_from_the_wire() {
+    let (port, handle) = spawn_server(|listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((27, 28)));
+
+        let (_tag, _payload) = read_tagged(&mut server);
+        let _bind = read_tagged(&mut server);
+        let _describe = read_tagged(&mut server);
+        let _execute = read_tagged(&mut server);
+        let _sync = read_tagged(&mut server);
+        server.write_all(&frame(b'1', b"")).expect("ParseComplete");
+        server.write_all(&frame(b'2', b"")).expect("BindComplete");
+        server.write_all(&frame(b'T', &typed_row_description("n", 23, 1))).expect("RowDescription");
+        server.write_all(&frame(b'D', &binary_row(&[0, 0, 0, 42]))).expect("DataRow");
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let results = connection.execute_with_param_formats("SELECT 42", &[], &[], &[1]).expect("binary result");
+    assert_eq!(results[0].rows, vec![vec![Some("42".to_owned())]]);
+    assert_eq!(results[0].tag, "SELECT 1");
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}
+
+#[test]
+fn binary_decode_errors_drain_to_ready_for_query() {
+    let (port, handle) = spawn_server(|listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((29, 30)));
+
+        for _ in 0..5 {
+            let _ = read_tagged(&mut server);
+        }
+        server.write_all(&frame(b'1', b"")).expect("ParseComplete");
+        server.write_all(&frame(b'2', b"")).expect("BindComplete");
+        server.write_all(&frame(b'T', &typed_row_description("f", 701, 1))).expect("RowDescription");
+        server.write_all(&frame(b'D', &binary_row(&[0, 0, 0, 0, 0, 0, 0, 0]))).expect("DataRow");
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        let (tag, payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'Q');
+        assert!(payload.starts_with(b"SELECT 1"));
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let error = connection
+        .execute_with_param_formats("SELECT 1::float8", &[], &[], &[1])
+        .expect_err("float8 binary is unsupported");
+    assert_eq!(error.feature(), Some("binary-result-type-701"));
+    connection.execute("SELECT 1").expect("the session survives a decode error");
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}
+
+#[test]
+fn portal_suspension_keeps_rows_and_the_session_open() {
+    let (port, handle) = spawn_server(|listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((31, 32)));
+
+        // Prepare: Parse, Describe(S), Sync.
+        for _ in 0..3 {
+            let _ = read_tagged(&mut server);
+        }
+        server.write_all(&frame(b'1', b"")).expect("ParseComplete");
+        server.write_all(&frame(b't', &[0, 1, 0, 0, 0, 23])).expect("ParameterDescription");
+        server.write_all(&frame(b'T', &row_description("n"))).expect("RowDescription");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        // Bind: Bind, Describe(P), Sync.
+        for _ in 0..3 {
+            let _ = read_tagged(&mut server);
+        }
+        server.write_all(&frame(b'2', b"")).expect("BindComplete");
+        server.write_all(&frame(b'T', &row_description("n"))).expect("RowDescription");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        // First execute: Describe(P), Execute, Sync. Suspends after one row.
+        for _ in 0..3 {
+            let _ = read_tagged(&mut server);
+        }
+        server.write_all(&frame(b'T', &row_description("n"))).expect("RowDescription");
+        server.write_all(&frame(b'D', &data_row("1"))).expect("DataRow");
+        server.write_all(&frame(b's', b"")).expect("PortalSuspended");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        // Second execute: Describe(P), Execute, Sync. Finishes the portal.
+        for _ in 0..3 {
+            let _ = read_tagged(&mut server);
+        }
+        server.write_all(&frame(b'T', &row_description("n"))).expect("RowDescription");
+        server.write_all(&frame(b'D', &data_row("2"))).expect("DataRow");
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        // Close: Close, Sync.
+        for _ in 0..2 {
+            let _ = read_tagged(&mut server);
+        }
+        server.write_all(&frame(b'3', b"")).expect("CloseComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let prepared = connection.prepare("SELECT n", &[]).expect("prepare");
+    let portal = connection.bind_portal(&prepared.name, "p1", &[], &[]).expect("bind portal");
+    assert_eq!(portal.name, "p1");
+    let first = connection.execute_portal("p1", 1).expect("first batch");
+    assert!(first.suspended, "the portal must suspend at the row limit");
+    assert_eq!(first.results[0].rows, vec![vec![Some("1".to_owned())]]);
+    assert_eq!(first.results[0].tag, "", "PortalSuspended carries no command tag");
+    let second = connection.execute_portal("p1", 1).expect("second batch");
+    assert!(!second.suspended, "the second execute finishes the portal");
+    assert_eq!(second.results[0].rows, vec![vec![Some("2".to_owned())]]);
+    assert_eq!(second.results[0].tag, "SELECT 1");
+    connection.close_portal("p1").expect("close portal");
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}
+
+#[test]
+fn binary_parameters_are_bound_as_bytes() {
+    let (port, handle) = spawn_server(|listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((33, 34)));
+
+        let (tag, _payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'P');
+        let (tag, payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'B');
+        let mut cursor = 0;
+        for _ in 0..2 {
+            while payload[cursor] != 0 {
+                cursor += 1;
+            }
+            cursor += 1;
+        }
+        let formats = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]) as usize;
+        cursor += 2 + formats * 2;
+        let count = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]) as usize;
+        cursor += 2;
+        assert_eq!(count, 1);
+        assert_eq!(&payload[cursor..cursor + 8], &[0, 0, 0, 4, 0, 0, 0, 42]);
+
+        let _describe = read_tagged(&mut server);
+        let _execute = read_tagged(&mut server);
+        let _sync = read_tagged(&mut server);
+        server.write_all(&frame(b'1', b"")).expect("ParseComplete");
+        server.write_all(&frame(b'2', b"")).expect("BindComplete");
+        server.write_all(&frame(b'T', &row_description("n"))).expect("RowDescription");
+        server.write_all(&frame(b'D', &data_row("42"))).expect("DataRow");
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let param = postgres_client::Param::binary(&[0, 0, 0, 42]);
+    let results = connection.execute_with_param_formats("SELECT $1::int4", &[param], &[23], &[]).expect("binary parameter");
+    assert_eq!(results[0].rows, vec![vec![Some("42".to_owned())]]);
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}

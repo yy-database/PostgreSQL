@@ -175,6 +175,39 @@ itself is verified against fixed byte scripts in
 before `CopyInResponse` that must not stream any data, 500 chunks, and a peer
 that closes mid-stream.
 
+**Extended query boundary.** `bind_packet_with_formats` carries text and binary
+parameters plus per-column result formats. It refuses a parameter-format count
+that is not `0`, `1` or the parameter count, and any format code other than
+`0`/`1`; more than 65535 parameters are refused with `at most 65535 parameters
+can be bound`. `execute_packet` accepts a row limit, so a portal drains in
+batches: `PortalSuspended` (`s`) is reported as `suspended` with an empty
+command tag, and the next `Execute` on the same portal continues instead of
+restarting. Four fixed Bind vectors (empty, text with a NULL, binary `int4`,
+mixed formats) are asserted byte for byte in both bindings.
+
+Binary result values are decoded per OID for `int2`, `int4`, `int8`, `bool`,
+`text`, `bytea`, `numeric`, `date`, `time`, `timestamp`, `uuid`, `json`,
+`jsonb`, `varchar` and `bpchar`, and the suites require every one of the 15
+types to decode to exactly the same text PGlite produces for the text format.
+`float4`, `float8` and `timestamptz` stay `unsupported:
+binary-result-type-<oid>` because PostgreSQL float output and timestamptz
+rendering depend on the session, not on the wire bytes. A decode failure is
+drained through `ReadyForQuery`, so the statement fails while the session
+survives. An unknown parameter type OID surfaces as `XX000 cache lookup failed
+for type 999999`.
+
+Named portals live only inside the transaction that bound them: binding a
+portal and letting `Sync` end the implicit transaction destroys it, so a later
+execute reports `34000 portal "..." does not exist`. That loss is asserted
+rather than hidden. Inside `BEGIN`, a ten-row portal drained with row limits
+`4/4/4` returns `4`, `4` and `2` rows with the tags `""`, `""` and `SELECT 2`, and
+`close_portal` removes it for good (`34000` afterwards). Prepared statements
+are independent of portals: the same statement executes repeatedly with
+different parameters and a NULL, two names can hold the same SQL text, closing
+one leaves the other usable, `DEALLOCATE <name>` removes the server-side
+statement (`26000` on reuse), and a failed bind (`22P02`) leaves both the
+statement and the connection usable.
+
 ## Testing
 
 ```shell
@@ -183,8 +216,8 @@ pnpm test
 
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
-one shared corpus on both language surfaces. Floors: node 1145, python 1145,
-rust 48, consistency 367; TS and Python results must match case by case;
+one shared corpus on both language surfaces. Floors: node 1203, python 1203,
+rust 58, consistency 396; TS and Python results must match case by case;
 `skipped` must stay 0.
 
 ## Wiring SQL onto this repository's storage (not started)

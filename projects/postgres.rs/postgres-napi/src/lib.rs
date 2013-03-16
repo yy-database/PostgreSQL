@@ -12,7 +12,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use postgres_client::psql::{format_results, parse_arguments, PsqlOptions};
-use postgres_client::{Column, MessageField, Notice, PostgresError, QueryResult};
+use postgres_client::{Column, MessageField, Notice, Param as PostgresParam, PostgresError, QueryResult};
 
 /// Where to connect and which identity to present.
 #[napi(object)]
@@ -116,6 +116,33 @@ pub struct CopyResponseInfo {
     pub format: u32,
     pub columns: u32,
     pub column_formats: Vec<u32>,
+}
+
+/// One bound parameter: a format code plus an optional payload.
+///
+/// `format` is `0` for text and `1` for binary. `null` is SQL `NULL`.
+#[napi(object)]
+pub struct ParamInfo {
+    pub format: u32,
+    pub value: Option<Buffer>,
+}
+
+/// One named portal bound to a prepared statement.
+#[napi(object)]
+pub struct PortalInfo {
+    pub name: String,
+    pub parameters: Vec<u32>,
+    pub columns: Vec<ColumnInfo>,
+}
+
+/// One `Execute` round trip on a portal.
+///
+/// `results` holds this batch, and `suspended` is `true` when the server stopped
+/// at the row limit with rows still waiting.
+#[napi(object)]
+pub struct PortalExecReport {
+    pub results: Vec<StatementResult>,
+    pub suspended: bool,
 }
 
 /// One stored row.
@@ -255,6 +282,98 @@ impl Connection {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
         connection.close_prepared(&name).map_err(native)
+    }
+
+    /// Runs one parameterised statement with explicit text or binary parameters
+    /// and result formats. `resultFormats` is empty for text, one code for every
+    /// column, or one code per column.
+    #[napi]
+    pub fn execute_with_param_formats(
+        &self,
+        sql: String,
+        params: Vec<ParamInfo>,
+        types: Vec<u32>,
+        result_formats: Vec<u32>,
+    ) -> Result<Vec<StatementResult>> {
+        let owned = param_buffers(&params)?;
+        let values: Vec<PostgresParam<'_>> = owned
+            .iter()
+            .map(|(format, value)| PostgresParam { format: *format, value: value.as_deref() })
+            .collect();
+        let formats = result_formats_u16(result_formats)?;
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection
+            .execute_with_param_formats(&sql, &values, &types, &formats)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Executes a prepared statement with explicit text or binary parameters.
+    #[napi]
+    pub fn execute_prepared_formats(
+        &self,
+        name: String,
+        params: Vec<ParamInfo>,
+        result_formats: Vec<u32>,
+    ) -> Result<Vec<StatementResult>> {
+        let owned = param_buffers(&params)?;
+        let values: Vec<PostgresParam<'_>> = owned
+            .iter()
+            .map(|(format, value)| PostgresParam { format: *format, value: value.as_deref() })
+            .collect();
+        let formats = result_formats_u16(result_formats)?;
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection
+            .execute_prepared_formats(&name, &values, &formats)
+            .map(|results| results.into_iter().map(statement).collect())
+            .map_err(native)
+    }
+
+    /// Binds a named portal so it can be executed more than once.
+    #[napi]
+    pub fn bind_portal(
+        &self,
+        statement: String,
+        portal: String,
+        params: Vec<ParamInfo>,
+        result_formats: Vec<u32>,
+    ) -> Result<PortalInfo> {
+        let owned = param_buffers(&params)?;
+        let values: Vec<PostgresParam<'_>> = owned
+            .iter()
+            .map(|(format, value)| PostgresParam { format: *format, value: value.as_deref() })
+            .collect();
+        let formats = result_formats_u16(result_formats)?;
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        let portal = connection.bind_portal(&statement, &portal, &values, &formats).map_err(native)?;
+        Ok(PortalInfo {
+            name: portal.name,
+            parameters: portal.parameters,
+            columns: portal.columns.into_iter().map(|column| ColumnInfo { name: column.name }).collect(),
+        })
+    }
+
+    /// Executes an open portal. `maxRows` of `0` runs it to completion.
+    #[napi]
+    pub fn execute_portal(&self, portal: String, max_rows: i32) -> Result<PortalExecReport> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        let report = connection.execute_portal(&portal, max_rows).map_err(native)?;
+        Ok(PortalExecReport {
+            results: report.results.into_iter().map(statement).collect(),
+            suspended: report.suspended,
+        })
+    }
+
+    /// Closes a portal by server-side name.
+    #[napi]
+    pub fn close_portal(&self, name: String) -> Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection.close_portal(&name).map_err(native)
     }
 
     /// Streams `chunks` as `COPY ... FROM STDIN` data for one statement.
@@ -470,7 +589,8 @@ pub fn encode_parse_message(name: String, sql: String, param_types: Vec<u32>) ->
 }
 
 /// Builds one extended-protocol `Bind` message. Parameters are text values and
-/// `null` is SQL `NULL`. `resultFormat` must be `0`; binary results are refused.
+/// `null` is SQL `NULL`. `resultFormat` is `0` for text columns and `1` for
+/// binary ones.
 #[napi]
 pub fn encode_bind_message(
     portal: String,
@@ -486,6 +606,25 @@ pub fn encode_bind_message(
         .map_err(native)
 }
 
+/// Builds one extended-protocol `Bind` message with explicit parameter and
+/// result format codes. An empty format list means text for every value.
+#[napi]
+pub fn encode_bind_message_with_formats(
+    portal: String,
+    statement: String,
+    params: Vec<ParamInfo>,
+    param_formats: Vec<u32>,
+    result_formats: Vec<u32>,
+) -> Result<Buffer> {
+    let owned = param_buffers(&params)?;
+    let values: Vec<Option<&[u8]>> = owned.iter().map(|(_, value)| value.as_deref()).collect();
+    let param_codes = result_formats_u16(param_formats)?;
+    let result_codes = result_formats_u16(result_formats)?;
+    postgres_client::protocol::bind_packet_with_formats(&portal, &statement, &values, &param_codes, &result_codes)
+        .map(Buffer::from)
+        .map_err(native)
+}
+
 /// Builds one extended-protocol `Describe` message for a statement or portal.
 #[napi]
 pub fn encode_describe_message(target: String, name: String) -> Result<Buffer> {
@@ -495,8 +634,8 @@ pub fn encode_describe_message(target: String, name: String) -> Result<Buffer> {
         .map_err(native)
 }
 
-/// Builds one extended-protocol `Execute` message. `maxRows` must be `0`;
-/// partial execution is refused.
+/// Builds one extended-protocol `Execute` message. `maxRows` of `0` runs the
+/// portal to completion and a positive limit suspends it after that many rows.
 #[napi]
 pub fn encode_execute_message(portal: String, max_rows: i32) -> Result<Buffer> {
     postgres_client::protocol::execute_packet(&portal, max_rows)
@@ -743,6 +882,33 @@ fn describe_target(target: &str) -> Result<u8> {
         "portal" => Ok(b'P'),
         _ => Err(Error::from_reason("describe target must be S or P")),
     }
+}
+
+/// Copies every parameter into owned bytes so the borrows outlive the lock.
+fn param_buffers(params: &[ParamInfo]) -> Result<Vec<(u16, Option<Vec<u8>>)>> {
+    let mut owned = Vec::with_capacity(params.len());
+    for param in params {
+        let format = u16::try_from(param.format)
+            .map_err(|_| Error::from_reason("parameter format does not fit 16 bits"))?;
+        if format > 1 {
+            return Err(Error::from_reason("parameter format is 0 for text and 1 for binary"));
+        }
+        owned.push((format, param.value.as_ref().map(|buffer| buffer.to_vec())));
+    }
+    Ok(owned)
+}
+
+fn result_formats_u16(formats: Vec<u32>) -> Result<Vec<u16>> {
+    let mut codes = Vec::with_capacity(formats.len());
+    for format in formats {
+        let code = u16::try_from(format)
+            .map_err(|_| Error::from_reason("result format does not fit 16 bits"))?;
+        if code > 1 {
+            return Err(Error::from_reason("result format is 0 for text and 1 for binary"));
+        }
+        codes.push(code);
+    }
+    Ok(codes)
 }
 
 fn lock_error() -> Error {

@@ -840,6 +840,250 @@ for (const item of protocol.decodeCopyResponse) {
     expectEqual(`${key}/fatal-routine`, evidence.fatal?.routine, 'PostgresMainLongJmp');
 }
 
+// -------------------------------------------------------------------------------
+// Extended-query boundaries. Binary payloads were captured from PGlite, so the
+// decoded values must equal the text-format answers for the same query.
+// -------------------------------------------------------------------------------
+function bindParam(param) {
+    if (param.valueHex !== undefined) return { format: param.format, value: Buffer.from(param.valueHex, 'hex') };
+    if (param.value === null || param.value === undefined) return { format: param.format };
+    return { format: param.format, value: Buffer.from(param.value, 'utf8') };
+}
+
+for (const item of protocol.encodeBindWithFormats) {
+    const key = `protocol/bind/${item.name}`;
+    const packet = native.encodeBindMessageWithFormats(
+        item.portal,
+        item.statement,
+        item.params.map(bindParam),
+        item.paramFormats,
+        item.resultFormats,
+    );
+    actual[key] = packet.toString('hex');
+    expectEqual(`${key}/bytes`, packet.toString('hex'), item.expectHex);
+    expectEqual(`${key}/length`, packet.length, item.expectHex.length / 2);
+    expectEqual(`${key}/length-field`, packet.readUInt32BE(1), packet.length - 1);
+    expectEqual(`${key}/tag`, packet[0], 0x42);
+}
+
+function rowsOf(results) {
+    return results.map((result) => ({
+        columns: result.columns.map((column) => column.name),
+        rows: result.rows.map((row) => row.values.map(text)),
+        tag: result.tag,
+    }));
+}
+
+function expectRecovery(key, connection) {
+    check(`${key}/recovery`, () => {
+        const rows = rowsOf(connection.execute('SELECT 1 AS n'))[0].rows;
+        if (!same(rows, [['1']])) throw new Error(`recovery returned ${JSON.stringify(rows)}`);
+    });
+}
+
+{
+    const extended = native.connect(config);
+    const types = `SELECT 42::int2 AS a, 42::int4 AS b, 9223372036854775807::int8 AS c, true AS d,
+ 'héllo'::text AS e, '\\x0041ff'::bytea AS f, 1.234567890123456789::numeric AS g,
+ DATE '2024-02-29' AS h, TIME '12:34:56.789' AS i, TIMESTAMP '2024-02-29 12:34:56.789' AS j,
+ '0f8fad5b-d9cb-469f-a165-70867728950e'::uuid AS k, '{"a":1}'::json AS l,
+ '{"a": 1}'::jsonb AS m, 'abc'::varchar AS n, 'pad'::bpchar AS o`;
+
+    const textKey = 'extended/binary/text-format';
+    const binaryKey = 'extended/binary/binary-format';
+    const textRows = rowsOf(extended.executeWithParamFormats(types, [], [], []));
+    const binaryRows = rowsOf(extended.executeWithParamFormats(types, [], [], [1]));
+    actual[textKey] = textRows[0].rows;
+    actual[binaryKey] = binaryRows[0].rows;
+    expectEqual(`${textKey}/columns`, textRows[0].columns, binaryRows[0].columns);
+    check(`${binaryKey}/equals-text`, () => {
+        if (!same(binaryRows[0].rows, textRows[0].rows)) {
+            throw new Error(`binary ${JSON.stringify(binaryRows[0].rows)} differs from text ${JSON.stringify(textRows[0].rows)}`);
+        }
+    });
+
+    const mixed = extended.executeWithParamFormats("SELECT 42::int4 AS a, 'abc'::text AS b", [], [], [1, 0]);
+    actual['extended/binary/mixed-formats'] = rowsOf(mixed)[0].rows;
+    expectEqual('extended/binary/mixed-formats/rows', rowsOf(mixed)[0].rows, [['42', 'abc']]);
+
+    const binaryParam = extended.executeWithParamFormats(
+        'SELECT $1::int4 + 1 AS r',
+        [{ format: 1, value: Buffer.from([0, 0, 0, 42]) }],
+        [23],
+        [],
+    );
+    actual['extended/param/binary-int4'] = rowsOf(binaryParam)[0].rows;
+    expectEqual('extended/param/binary-int4/rows', rowsOf(binaryParam)[0].rows, [['43']]);
+
+    const nulls = extended.executeWithParamFormats(
+        'SELECT $1::int4 IS NULL AS a, $2::text IS NULL AS b',
+        [{ format: 1 }, { format: 0 }],
+        [23, 25],
+        [],
+    );
+    actual['extended/param/null'] = rowsOf(nulls)[0].rows;
+    expectEqual('extended/param/null/rows', rowsOf(nulls)[0].rows, [['t', 't']]);
+
+    const unknownKey = 'extended/param/unknown-oid';
+    let unknownError = null;
+    try {
+        extended.executeWithParamFormats('SELECT $1', [{ format: 0, value: Buffer.from('1') }], [999999], []);
+    } catch (error) {
+        unknownError = error;
+    }
+    actual[unknownKey] = { code: unknownError === null ? null : splitError(unknownError.message), message: unknownError?.message };
+    expectEqual(`${unknownKey}/code`, unknownError === null ? null : splitError(unknownError.message), 'XX000');
+    check(`${unknownKey}/message`, () => {
+        if (!unknownError?.message.includes('cache lookup failed for type 999999')) {
+            throw new Error(`expected the cache lookup message, got '${unknownError?.message}'`);
+        }
+    });
+    expectRecovery(unknownKey, extended);
+
+    const unsupportedKey = 'extended/binary/unsupported-type';
+    let unsupportedError = null;
+    try {
+        extended.executeWithParamFormats('SELECT 1::float8 AS f', [], [], [1]);
+    } catch (error) {
+        unsupportedError = error.message;
+    }
+    actual[unsupportedKey] = { error: unsupportedError };
+    expectEqual(`${unsupportedKey}/error`, unsupportedError, 'unsupported: binary-result-type-701');
+    expectRecovery(unsupportedKey, extended);
+
+    const limitKey = 'extended/param/limit';
+    let limitError = null;
+    try {
+        extended.executeWithParamFormats('SELECT 1', new Array(65536).fill({ format: 0 }), [], []);
+    } catch (error) {
+        limitError = error.message;
+    }
+    actual[limitKey] = { error: limitError };
+    expectEqual(`${limitKey}/error`, limitError, 'at most 65535 parameters can be bound');
+    expectRecovery(limitKey, extended);
+
+    extended.execute('DROP TABLE IF EXISTS extended_portal_probe');
+    extended.execute('CREATE TEMP TABLE extended_portal_probe (n int)');
+    extended.execute('INSERT INTO extended_portal_probe VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)');
+    const statement = extended.prepare('SELECT n FROM extended_portal_probe ORDER BY n', []);
+
+    // A named portal cannot outlive the implicit transaction that `Sync` ends.
+    const lostKey = 'extended/portal/lost-at-sync';
+    let lostError = null;
+    try {
+        extended.bindPortal(statement.name(), 'lost_portal', [], []);
+        extended.executePortal('lost_portal', 4);
+    } catch (error) {
+        lostError = error.message;
+    }
+    actual[lostKey] = { error: lostError };
+    expectEqual(`${lostKey}/error`, lostError, '34000: portal "lost_portal" does not exist');
+    expectRecovery(lostKey, extended);
+
+    // Inside an explicit transaction the portal survives `Sync` and suspends.
+    extended.execute('BEGIN');
+    const portal = extended.bindPortal(statement.name(), 'p1', [], []);
+    actual['extended/portal/bind'] = { name: portal.name, parameters: portal.parameters, columns: portal.columns.length };
+    expectEqual('extended/portal/bind/name', portal.name, 'p1');
+    expectEqual('extended/portal/bind/columns', portal.columns.length, 1);
+    const batches = [4, 4, 4];
+    const expected = [
+        { suspended: true, rows: [['1'], ['2'], ['3'], ['4']], tag: '' },
+        { suspended: true, rows: [['5'], ['6'], ['7'], ['8']], tag: '' },
+        { suspended: false, rows: [['9'], ['10']], tag: 'SELECT 2' },
+    ];
+    batches.forEach((limit, index) => {
+        const key = `extended/portal/batch-${index}`;
+        const report = extended.executePortal('p1', limit);
+        const first = rowsOf(report.results)[0];
+        actual[key] = { suspended: report.suspended, rows: first?.rows, tag: first?.tag };
+        expectEqual(`${key}/suspended`, report.suspended, expected[index].suspended);
+        expectEqual(`${key}/rows`, first?.rows, expected[index].rows);
+        expectEqual(`${key}/tag`, first?.tag, expected[index].tag);
+    });
+    extended.closePortal('p1');
+    actual['extended/portal/close'] = { closed: true };
+    const closedKey = 'extended/portal/closed';
+    let closedError = null;
+    try {
+        extended.executePortal('p1', 4);
+    } catch (error) {
+        closedError = error.message;
+    }
+    actual[closedKey] = { error: closedError };
+    expectEqual(`${closedKey}/error`, closedError, '34000: portal "p1" does not exist');
+    extended.execute('COMMIT');
+    expectRecovery(closedKey, extended);
+
+    const repeated = extended.prepare('SELECT $1::int4 * 2 AS v', [23]);
+    const repeatedKey = 'extended/prepared/repeat';
+    for (const value of ['1', '2', '3', null]) {
+        const results = rowsOf(extended.executePrepared(repeated.name(), [value]));
+        actual[`${repeatedKey}/${value === null ? 'null' : value}`] = results[0].rows;
+        expectEqual(
+            `${repeatedKey}/${value === null ? 'null' : value}`,
+            results[0].rows,
+            [[value === null ? null : String(Number(value) * 2)]],
+        );
+    }
+
+    const first = extended.prepare('SELECT $1::int4 AS a', [23]);
+    const second = extended.prepare('SELECT $1::int4 AS a', [23]);
+    const uniqueKey = 'extended/prepared/unique-names';
+    actual[uniqueKey] = { distinct: first.name() !== second.name(), prefixed: first.name().startsWith('pg_rs_') };
+    check(`${uniqueKey}/distinct`, () => {
+        if (first.name() === second.name()) throw new Error('expected two distinct statement names');
+    });
+    first.close();
+    const afterCloseKey = 'extended/prepared/after-close';
+    let afterCloseError = null;
+    try {
+        extended.executePrepared(first.name(), ['1']);
+    } catch (error) {
+        afterCloseError = splitError(error.message);
+    }
+    actual[afterCloseKey] = { code: afterCloseError };
+    expectEqual(`${afterCloseKey}/code`, afterCloseError, '26000');
+    const survivor = rowsOf(extended.executePrepared(second.name(), ['1']));
+    actual[`${afterCloseKey}/survivor`] = survivor[0].rows;
+    expectEqual(`${afterCloseKey}/survivor`, survivor[0].rows, [['1']]);
+    second.close();
+    expectRecovery(afterCloseKey, extended);
+
+    // The SQL `DEALLOCATE` removes the same server-side statement.
+    const deallocated = extended.prepare('SELECT 7 AS n', []);
+    extended.execute(`DEALLOCATE ${deallocated.name()}`);
+    const deallocateKey = 'extended/prepared/deallocate';
+    let deallocateError = null;
+    try {
+        extended.executePrepared(deallocated.name(), []);
+    } catch (error) {
+        deallocateError = splitError(error.message);
+    }
+    actual[deallocateKey] = { code: deallocateError };
+    expectEqual(`${deallocateKey}/code`, deallocateError, '26000');
+    expectRecovery(deallocateKey, extended);
+
+    // A bind failure must not desynchronise the session.
+    const bindFailureKey = 'extended/prepared/bind-failure';
+    const doomed = extended.prepare('SELECT $1::int4 AS v', [23]);
+    let bindError = null;
+    try {
+        extended.executePrepared(doomed.name(), ['abc']);
+    } catch (error) {
+        bindError = splitError(error.message);
+    }
+    actual[bindFailureKey] = { code: bindError };
+    expectEqual(`${bindFailureKey}/code`, bindError, '22P02');
+    const afterBind = rowsOf(extended.executePrepared(doomed.name(), ['7']));
+    actual[`${bindFailureKey}/after`] = afterBind[0].rows;
+    expectEqual(`${bindFailureKey}/after`, afterBind[0].rows, [['7']]);
+    doomed.close();
+    expectRecovery(bindFailureKey, extended);
+    statement.close();
+    extended.close();
+}
+
 const protocolExecuted = counters.executed;
 
 // -------------------------------------------------------------------------------

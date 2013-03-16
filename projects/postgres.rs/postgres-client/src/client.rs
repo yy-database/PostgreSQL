@@ -76,6 +76,52 @@ pub struct Prepared {
     pub columns: Vec<Column>,
 }
 
+/// One bound parameter, either text or binary, and `None` for SQL `NULL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Param<'a> {
+    /// `0` for text and `1` for binary.
+    pub format: u16,
+    pub value: Option<&'a [u8]>,
+}
+
+impl<'a> Param<'a> {
+    /// A text-format parameter. `None` binds SQL `NULL`.
+    pub fn text(value: Option<&'a str>) -> Self {
+        Self { format: 0, value: value.map(str::as_bytes) }
+    }
+
+    /// A binary-format parameter carrying already encoded bytes.
+    pub fn binary(value: &'a [u8]) -> Self {
+        Self { format: 1, value: Some(value) }
+    }
+
+    /// SQL `NULL` with the default text format.
+    pub fn null() -> Self {
+        Self { format: 0, value: None }
+    }
+}
+
+/// A named portal bound to a prepared statement and reusable across executes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Portal {
+    pub name: String,
+    /// Parameter OIDs the statement resolved.
+    pub parameters: Vec<u32>,
+    /// Columns the portal returns.
+    pub columns: Vec<Column>,
+}
+
+/// One `Execute` round trip on a portal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortalReport {
+    /// Rows produced by this execute. A suspended portal reports the partial
+    /// batch with an empty command tag.
+    pub results: Vec<QueryResult>,
+    /// `true` when the server stopped at the row limit and the portal is still
+    /// open for the next execute.
+    pub suspended: bool,
+}
+
 /// The `pid` and `secret key` the server sent in `BackendKeyData`.
 ///
 /// Both values appear verbatim in a `CancelRequest`, so they are kept for the
@@ -143,6 +189,7 @@ struct ExtendedOutcome {
     results: Vec<QueryResult>,
     parameters: Vec<u32>,
     described: Vec<Column>,
+    suspended: bool,
 }
 
 /// One simple-query reply once `ReadyForQuery` arrived.
@@ -380,9 +427,27 @@ impl Connection {
         params: &[Option<&str>],
         param_types: &[u32],
     ) -> Result<Vec<QueryResult>, PostgresError> {
+        let params: Vec<Param<'_>> = params.iter().map(|value| Param::text(*value)).collect();
+        self.execute_with_param_formats(sql, &params, param_types, &[])
+    }
+
+    /// Runs one parameterised statement with explicit text or binary parameters
+    /// and result formats.
+    ///
+    /// `result_formats` follows the wire shape: empty for text columns, one
+    /// code for every column, or one code per column.
+    pub fn execute_with_param_formats(
+        &mut self,
+        sql: &str,
+        params: &[Param<'_>],
+        param_types: &[u32],
+        result_formats: &[u16],
+    ) -> Result<Vec<QueryResult>, PostgresError> {
         self.ensure_usable()?;
+        let param_formats = param_format_codes(params);
+        let values: Vec<Option<&[u8]>> = params.iter().map(|param| param.value).collect();
         let mut packet = protocol::parse_packet("", sql, param_types)?;
-        packet.extend_from_slice(&protocol::bind_packet("", "", params, 0)?);
+        packet.extend_from_slice(&protocol::bind_packet_with_formats("", "", &values, &param_formats, result_formats)?);
         packet.extend_from_slice(&protocol::describe_packet(b'P', "")?);
         packet.extend_from_slice(&protocol::execute_packet("", 0)?);
         packet.extend_from_slice(&protocol::sync_packet());
@@ -415,8 +480,22 @@ impl Connection {
 
     /// Binds parameters to an existing prepared statement and executes it.
     pub fn execute_prepared(&mut self, name: &str, params: &[Option<&str>]) -> Result<Vec<QueryResult>, PostgresError> {
+        let params: Vec<Param<'_>> = params.iter().map(|value| Param::text(*value)).collect();
+        self.execute_prepared_formats(name, &params, &[])
+    }
+
+    /// Executes an existing prepared statement with explicit parameter and
+    /// result formats. The statement stays on the server for the next call.
+    pub fn execute_prepared_formats(
+        &mut self,
+        name: &str,
+        params: &[Param<'_>],
+        result_formats: &[u16],
+    ) -> Result<Vec<QueryResult>, PostgresError> {
         self.ensure_usable()?;
-        let mut packet = protocol::bind_packet("", name, params, 0)?;
+        let param_formats = param_format_codes(params);
+        let values: Vec<Option<&[u8]>> = params.iter().map(|param| param.value).collect();
+        let mut packet = protocol::bind_packet_with_formats("", name, &values, &param_formats, result_formats)?;
         packet.extend_from_slice(&protocol::describe_packet(b'P', "")?);
         packet.extend_from_slice(&protocol::execute_packet("", 0)?);
         packet.extend_from_slice(&protocol::sync_packet());
@@ -429,11 +508,72 @@ impl Connection {
         }
     }
 
+    /// Binds a named portal to a prepared statement so it can be executed more
+    /// than once through [`Connection::execute_portal`].
+    ///
+    /// The name is required because an unnamed portal is dropped by `Sync`.
+    pub fn bind_portal(
+        &mut self,
+        statement: &str,
+        portal: &str,
+        params: &[Param<'_>],
+        result_formats: &[u16],
+    ) -> Result<Portal, PostgresError> {
+        self.ensure_usable()?;
+        if portal.is_empty() {
+            return Err(PostgresError::Protocol("a reusable portal needs a name".into()));
+        }
+        let param_formats = param_format_codes(params);
+        let values: Vec<Option<&[u8]>> = params.iter().map(|param| param.value).collect();
+        let mut packet = protocol::bind_packet_with_formats(portal, statement, &values, &param_formats, result_formats)?;
+        packet.extend_from_slice(&protocol::describe_packet(b'P', portal)?);
+        packet.extend_from_slice(&protocol::sync_packet());
+        let outcome = match self.read_extended(&packet) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
+        Ok(Portal { name: portal.to_owned(), parameters: outcome.parameters, columns: outcome.described })
+    }
+
+    /// Executes an open portal. `max_rows` of `0` runs it to completion, and a
+    /// positive limit stops early with `suspended` set.
+    ///
+    /// Every execute after the first reuses the portal bound by
+    /// [`Connection::bind_portal`], so the rows continue where the previous
+    /// batch stopped.
+    pub fn execute_portal(&mut self, portal: &str, max_rows: i32) -> Result<PortalReport, PostgresError> {
+        self.ensure_usable()?;
+        let mut packet = protocol::describe_packet(b'P', portal)?;
+        packet.extend_from_slice(&protocol::execute_packet(portal, max_rows)?);
+        packet.extend_from_slice(&protocol::sync_packet());
+        let outcome = match self.read_extended(&packet) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
+        Ok(PortalReport { results: outcome.results, suspended: outcome.suspended })
+    }
+
+    /// Closes a portal on the server. Closing an unknown name still answers
+    /// `CloseComplete`.
+    pub fn close_portal(&mut self, name: &str) -> Result<(), PostgresError> {
+        self.close_named(b'P', name)
+    }
+
     /// Closes a prepared statement on the server. Closing an unknown name is a
     /// no-op: the server answers CloseComplete either way.
     pub fn close_prepared(&mut self, name: &str) -> Result<(), PostgresError> {
+        self.close_named(b'S', name)
+    }
+
+    fn close_named(&mut self, target: u8, name: &str) -> Result<(), PostgresError> {
         self.ensure_usable()?;
-        let mut packet = protocol::close_packet(b'S', name)?;
+        let mut packet = protocol::close_packet(target, name)?;
         packet.extend_from_slice(&protocol::sync_packet());
         let outcome = match self.read_extended(&packet) {
             Ok(outcome) => outcome,
@@ -575,16 +715,21 @@ impl Connection {
         self.stream.write_all(packet).map_err(io_error)?;
         let mut results = Vec::new();
         let mut parameters = Vec::new();
-        let mut described = Vec::new();
-        let mut current: Option<(Vec<Column>, Vec<Vec<Option<String>>>)> = None;
+        let mut details: Vec<protocol::ColumnDescription> = Vec::new();
+        let mut described: Vec<Column> = Vec::new();
+        // Every round trip that expects rows carries a Describe, so the decoder
+        // always receives a fresh RowDescription before the first DataRow.
+        let mut current: Option<(Vec<protocol::ColumnDescription>, Vec<Vec<Option<String>>>)> = None;
+        let mut suspended = false;
         let mut failure: Option<PostgresError> = None;
+        // A decode error must still drain to ReadyForQuery so the session stays
+        // usable, but the error is returned instead of the partial rows.
+        let mut deferred: Option<PostgresError> = None;
         loop {
             let (tag, payload) = self.read_message()?;
-            if failure.is_some() {
-                // After an error the server skips the rest of the batch and only
-                // sends ReadyForQuery, so drain it to keep the socket usable.
+            if failure.is_some() || deferred.is_some() {
                 if tag == b'Z' {
-                    return Err(failure.expect("checked above"));
+                    return Err(failure.or(deferred).expect("failure or deferred is set"));
                 }
                 continue;
             }
@@ -596,17 +741,21 @@ impl Connection {
                 }
                 b't' => parameters = protocol::parameter_description(&payload)?,
                 b'T' => {
-                    if current.is_some() {
-                        return Err(PostgresError::Protocol("unexpected PostgreSQL RowDescription".into()));
+                    let columns = protocol::row_description(&payload)?;
+                    if let Some((_, rows)) = current.as_ref() {
+                        if !rows.is_empty() {
+                            return Err(PostgresError::Protocol("unexpected PostgreSQL RowDescription".into()));
+                        }
                     }
-                    let columns: Vec<Column> =
-                        protocol::column_names(&payload)?.into_iter().map(|name| Column { name }).collect();
-                    described = columns.clone();
+                    described = columns.iter().map(|column| Column { name: column.name.clone() }).collect();
+                    details = columns.clone();
                     current = Some((columns, Vec::new()));
                 }
                 b'n' => {
-                    if current.is_some() {
-                        return Err(PostgresError::Protocol("unexpected PostgreSQL NoData".into()));
+                    if let Some((_, rows)) = current.as_ref() {
+                        if !rows.is_empty() {
+                            return Err(PostgresError::Protocol("unexpected PostgreSQL NoData".into()));
+                        }
                     }
                     current = Some((Vec::new(), Vec::new()));
                 }
@@ -614,11 +763,15 @@ impl Connection {
                     let Some((columns, rows)) = current.as_mut() else {
                         return Err(PostgresError::Protocol("DataRow without RowDescription".into()));
                     };
-                    rows.push(protocol::data_row(&payload, columns.len())?);
+                    match protocol::data_row_with_formats(&payload, columns) {
+                        Ok(values) => rows.push(values),
+                        Err(error) => deferred = Some(error),
+                    }
                 }
                 b'C' => {
                     let command = protocol::command_tag(&payload)?;
-                    let (columns, rows) = current.take().unwrap_or_else(|| (described.clone(), Vec::new()));
+                    let (columns, rows) = current.take().unwrap_or_else(|| (details.clone(), Vec::new()));
+                    let columns: Vec<Column> = columns.iter().map(|column| Column { name: column.name.clone() }).collect();
                     results.push(QueryResult { columns, rows, tag: command });
                 }
                 b'I' => {
@@ -634,7 +787,12 @@ impl Connection {
                         }
                     }
                 }
-                b's' => return Err(PostgresError::Unsupported("execute-row-limit".into())),
+                b's' => {
+                    let (columns, rows) = current.take().unwrap_or_else(|| (details.clone(), Vec::new()));
+                    let columns: Vec<Column> = columns.iter().map(|column| Column { name: column.name.clone() }).collect();
+                    results.push(QueryResult { columns, rows, tag: String::new() });
+                    suspended = true;
+                }
                 b'E' => failure = Some(protocol::error_response(&payload)),
                 b'Z' => {
                     if payload.len() != 1 {
@@ -647,7 +805,7 @@ impl Connection {
                             return Err(PostgresError::Protocol("PostgreSQL result ended before CommandComplete".into()));
                         }
                     }
-                    return Ok(ExtendedOutcome { results, parameters, described });
+                    return Ok(ExtendedOutcome { results, parameters, described, suspended });
                 }
                 b'S' | b'K' => {}
                 b'N' => self.record_notice(&payload)?,
@@ -678,6 +836,21 @@ impl Connection {
         self.stream.read_exact(&mut payload).map_err(io_error)?;
         Ok((header[0], payload))
     }
+}
+
+/// Wire format codes for a parameter list: empty when every parameter is text,
+/// one shared code when they agree, and one code per parameter otherwise.
+fn param_format_codes(params: &[Param<'_>]) -> Vec<u16> {
+    let Some(first) = params.first() else {
+        return Vec::new();
+    };
+    if params.iter().all(|param| param.format == 0) {
+        return Vec::new();
+    }
+    if params.iter().all(|param| param.format == first.format) {
+        return vec![first.format];
+    }
+    params.iter().map(|param| param.format).collect()
 }
 
 fn resolve_address(config: &ClientConfig) -> Result<SocketAddr, PostgresError> {

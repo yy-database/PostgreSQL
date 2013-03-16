@@ -95,6 +95,30 @@ export interface CopyResponseInfo {
     columnFormats: number[];
 }
 
+/** One bound parameter: a format code plus an optional payload. */
+export interface ParamInfo {
+    /** `0` for text and `1` for binary. */
+    format: number;
+    /** Omitted or `undefined` binds SQL `NULL`. */
+    value?: Buffer;
+}
+
+/** One named portal bound to a prepared statement. */
+export interface PortalInfo {
+    name: string;
+    /** Parameter OIDs the statement resolved. */
+    parameters: number[];
+    columns: ColumnInfo[];
+}
+
+/** One `Execute` round trip on a portal. */
+export interface PortalExecReport {
+    /** Rows produced by this batch. */
+    results: StatementResult[];
+    /** `true` when the server stopped at the row limit with rows still waiting. */
+    suspended: boolean;
+}
+
 /** One named prepared statement on a live connection. */
 export interface PreparedStatement {
     name(): string;
@@ -119,9 +143,23 @@ export interface Connection {
     /** Sends a `CancelRequest` on a fresh socket; the main socket stays usable. */
     cancel(): void;
     executeWithParams(sql: string, params: (string | null)[], types: number[]): StatementResult[];
+    /** Runs one statement with explicit text or binary parameters and result formats. */
+    executeWithParamFormats(
+        sql: string,
+        params: ParamInfo[],
+        types: number[],
+        resultFormats: number[],
+    ): StatementResult[];
     prepare(sql: string, types: number[]): PreparedStatement;
     executePrepared(name: string, params: (string | null)[]): StatementResult[];
+    /** Executes a prepared statement with explicit parameter and result formats. */
+    executePreparedFormats(name: string, params: ParamInfo[], resultFormats: number[]): StatementResult[];
     closePrepared(name: string): void;
+    /** Binds a named portal so it can be executed more than once. */
+    bindPortal(statement: string, portal: string, params: ParamInfo[], resultFormats: number[]): PortalInfo;
+    /** Executes an open portal; `maxRows` of `0` runs it to completion. */
+    executePortal(portal: string, maxRows: number): PortalExecReport;
+    closePortal(name: string): void;
     /** Streams `chunks` as `COPY ... FROM STDIN` data for one statement. */
     copyIn(sql: string, chunks: Buffer[]): CopyInReport;
     /** Collects every `CopyData` payload of one `COPY ... TO STDOUT` statement. */
@@ -182,6 +220,14 @@ export interface PostgresNative {
         resultFormat: number,
     ): Buffer;
     encodeDescribeMessage(target: 'statement' | 'portal', name: string): Buffer;
+    /** Builds one `Bind` message with explicit parameter and result format codes. */
+    encodeBindMessageWithFormats(
+        portal: string,
+        statement: string,
+        params: ParamInfo[],
+        paramFormats: number[],
+        resultFormats: number[],
+    ): Buffer;
     encodeExecuteMessage(portal: string, maxRows: number): Buffer;
     encodeSyncMessage(): Buffer;
     encodeCloseMessage(target: 'statement' | 'portal', name: string): Buffer;

@@ -817,6 +817,241 @@ expect_equal(
 expect_equal(f"{in_key}/fatal-file", evidence["fatal"]["file"], "postgres.c")
 expect_equal(f"{in_key}/fatal-routine", evidence["fatal"]["routine"], "PostgresMainLongJmp")
 
+# -------------------------------------------------------------------------------
+# Extended-query boundaries. Binary payloads were captured from PGlite, so the
+# decoded values must equal the text-format answers for the same query.
+# -------------------------------------------------------------------------------
+def bind_param(item):
+    if "valueHex" in item:
+        return (item["format"], bytes.fromhex(item["valueHex"]))
+    if item.get("value") is None:
+        return (item["format"], None)
+    return (item["format"], item["value"].encode("utf-8"))
+
+
+for item in protocol["encodeBindWithFormats"]:
+    key = f"protocol/bind/{item['name']}"
+    packet = to_bytes(
+        native.encode_bind_message_with_formats(
+            item["portal"],
+            item["statement"],
+            [bind_param(param) for param in item["params"]],
+            item["paramFormats"],
+            item["resultFormats"],
+        )
+    )
+    actual[key] = packet.hex()
+    expect_equal(f"{key}/bytes", packet.hex(), item["expectHex"])
+    expect_equal(f"{key}/length", len(packet), len(item["expectHex"]) // 2)
+    expect_equal(f"{key}/length-field", int.from_bytes(packet[1:5], "big"), len(packet) - 1)
+    expect_equal(f"{key}/tag", packet[0], 0x42)
+
+
+def rows_of(results):
+    return normalize(results)
+
+
+def expect_recovery(key, connection):
+    def assertion():
+        rows = connection.execute("SELECT 1 AS n")[0].rows[0]
+        if rows != ["1"]:
+            raise AssertionError(f"recovery returned {rows}")
+
+    check(f"{key}/recovery", assertion)
+
+
+extended = native.connect(CONFIG["host"], CONFIG["port"], CONFIG["user"], CONFIG["database"])
+types_sql = """SELECT 42::int2 AS a, 42::int4 AS b, 9223372036854775807::int8 AS c, true AS d,
+ 'héllo'::text AS e, '\\x0041ff'::bytea AS f, 1.234567890123456789::numeric AS g,
+ DATE '2024-02-29' AS h, TIME '12:34:56.789' AS i, TIMESTAMP '2024-02-29 12:34:56.789' AS j,
+ '0f8fad5b-d9cb-469f-a165-70867728950e'::uuid AS k, '{"a":1}'::json AS l,
+ '{"a": 1}'::jsonb AS m, 'abc'::varchar AS n, 'pad'::bpchar AS o"""
+
+text_key = "extended/binary/text-format"
+binary_key = "extended/binary/binary-format"
+text_rows = rows_of(extended.execute_with_param_formats(types_sql, [], [], []))
+binary_rows = rows_of(extended.execute_with_param_formats(types_sql, [], [], [1]))
+actual[text_key] = text_rows[0]["rows"]
+actual[binary_key] = binary_rows[0]["rows"]
+expect_equal(f"{text_key}/columns", text_rows[0]["columns"], binary_rows[0]["columns"])
+expect_equal(f"{binary_key}/equals-text", binary_rows[0]["rows"], text_rows[0]["rows"])
+
+mixed = rows_of(extended.execute_with_param_formats("SELECT 42::int4 AS a, 'abc'::text AS b", [], [], [1, 0]))
+actual["extended/binary/mixed-formats"] = mixed[0]["rows"]
+expect_equal("extended/binary/mixed-formats/rows", mixed[0]["rows"], [["42", "abc"]])
+
+binary_param = rows_of(
+    extended.execute_with_param_formats(
+        "SELECT $1::int4 + 1 AS r",
+        [(1, bytes([0, 0, 0, 42]))],
+        [23],
+        [],
+    )
+)
+actual["extended/param/binary-int4"] = binary_param[0]["rows"]
+expect_equal("extended/param/binary-int4/rows", binary_param[0]["rows"], [["43"]])
+
+nulls = rows_of(
+    extended.execute_with_param_formats(
+        "SELECT $1::int4 IS NULL AS a, $2::text IS NULL AS b",
+        [(1, None), (0, None)],
+        [23, 25],
+        [],
+    )
+)
+actual["extended/param/null"] = nulls[0]["rows"]
+expect_equal("extended/param/null/rows", nulls[0]["rows"], [["t", "t"]])
+
+unknown_key = "extended/param/unknown-oid"
+unknown_error = None
+try:
+    extended.execute_with_param_formats("SELECT $1", [(0, b"1")], [999999], [])
+except PostgresError as error:
+    unknown_error = error
+actual[unknown_key] = {
+    "code": None if unknown_error is None else split_error(str(unknown_error)),
+    "message": None if unknown_error is None else str(unknown_error),
+}
+expect_equal(f"{unknown_key}/code", None if unknown_error is None else split_error(str(unknown_error)), "XX000")
+check(
+    f"{unknown_key}/message",
+    lambda: None
+    if unknown_error is not None and "cache lookup failed for type 999999" in str(unknown_error)
+    else (_ for _ in ()).throw(AssertionError(f"unexpected message {unknown_error}")),
+)
+expect_recovery(unknown_key, extended)
+
+unsupported_key = "extended/binary/unsupported-type"
+unsupported_error = None
+try:
+    extended.execute_with_param_formats("SELECT 1::float8 AS f", [], [], [1])
+except PostgresError as error:
+    unsupported_error = str(error)
+actual[unsupported_key] = {"error": unsupported_error}
+expect_equal(f"{unsupported_key}/error", unsupported_error, "unsupported: binary-result-type-701")
+expect_recovery(unsupported_key, extended)
+
+limit_key = "extended/param/limit"
+limit_error = None
+try:
+    extended.execute_with_param_formats("SELECT 1", [(0, None)] * 65536, [], [])
+except PostgresError as error:
+    limit_error = str(error)
+actual[limit_key] = {"error": limit_error}
+expect_equal(f"{limit_key}/error", limit_error, "at most 65535 parameters can be bound")
+expect_recovery(limit_key, extended)
+
+extended.execute("DROP TABLE IF EXISTS extended_portal_probe")
+extended.execute("CREATE TEMP TABLE extended_portal_probe (n int)")
+extended.execute("INSERT INTO extended_portal_probe VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)")
+statement = extended.prepare("SELECT n FROM extended_portal_probe ORDER BY n", [])
+
+lost_key = "extended/portal/lost-at-sync"
+lost_error = None
+try:
+    extended.bind_portal(statement.name, "lost_portal", [], [])
+    extended.execute_portal("lost_portal", 4)
+except PostgresError as error:
+    lost_error = str(error)
+actual[lost_key] = {"error": lost_error}
+expect_equal(f"{lost_key}/error", lost_error, '34000: portal "lost_portal" does not exist')
+expect_recovery(lost_key, extended)
+
+extended.execute("BEGIN")
+portal = extended.bind_portal(statement.name, "p1", [], [])
+actual["extended/portal/bind"] = {"name": portal.name, "parameters": list(portal.parameters), "columns": len(portal.columns)}
+expect_equal("extended/portal/bind/name", portal.name, "p1")
+expect_equal("extended/portal/bind/columns", len(portal.columns), 1)
+for index, (limit, suspended, expected_rows, expected_tag) in enumerate(
+    [
+        (4, True, [["1"], ["2"], ["3"], ["4"]], ""),
+        (4, True, [["5"], ["6"], ["7"], ["8"]], ""),
+        (4, False, [["9"], ["10"]], "SELECT 2"),
+    ]
+):
+    key = f"extended/portal/batch-{index}"
+    report = extended.execute_portal("p1", limit)
+    results = rows_of(report.results)
+    first = results[0] if results else None
+    actual[key] = {"suspended": report.suspended, "rows": None if first is None else first["rows"], "tag": None if first is None else first["tag"]}
+    expect_equal(f"{key}/suspended", report.suspended, suspended)
+    expect_equal(f"{key}/rows", None if first is None else first["rows"], expected_rows)
+    expect_equal(f"{key}/tag", None if first is None else first["tag"], expected_tag)
+
+extended.close_portal("p1")
+actual["extended/portal/close"] = {"closed": True}
+closed_key = "extended/portal/closed"
+closed_error = None
+try:
+    extended.execute_portal("p1", 4)
+except PostgresError as error:
+    closed_error = str(error)
+actual[closed_key] = {"error": closed_error}
+expect_equal(f"{closed_key}/error", closed_error, '34000: portal "p1" does not exist')
+extended.execute("COMMIT")
+expect_recovery(closed_key, extended)
+
+repeated = extended.prepare("SELECT $1::int4 * 2 AS v", [23])
+for value in ["1", "2", "3", None]:
+    label = "null" if value is None else value
+    results = rows_of(extended.execute_prepared(repeated.name, [value]))
+    actual[f"extended/prepared/repeat/{label}"] = results[0]["rows"]
+    expect_equal(f"extended/prepared/repeat/{label}", results[0]["rows"], [[None if value is None else str(int(value) * 2)]])
+
+first = extended.prepare("SELECT $1::int4 AS a", [23])
+second = extended.prepare("SELECT $1::int4 AS a", [23])
+unique_key = "extended/prepared/unique-names"
+actual[unique_key] = {"distinct": first.name != second.name, "prefixed": first.name.startswith("pg_rs_")}
+check(
+    f"{unique_key}/distinct",
+    lambda: None
+    if first.name != second.name
+    else (_ for _ in ()).throw(AssertionError("expected two distinct statement names")),
+)
+first.close()
+after_close_key = "extended/prepared/after-close"
+after_close_error = None
+try:
+    extended.execute_prepared(first.name, ["1"])
+except PostgresError as error:
+    after_close_error = split_error(str(error))
+actual[after_close_key] = {"code": after_close_error}
+expect_equal(f"{after_close_key}/code", after_close_error, "26000")
+survivor = rows_of(extended.execute_prepared(second.name, ["1"]))
+actual[f"{after_close_key}/survivor"] = survivor[0]["rows"]
+expect_equal(f"{after_close_key}/survivor", survivor[0]["rows"], [["1"]])
+second.close()
+expect_recovery(after_close_key, extended)
+
+deallocated = extended.prepare("SELECT 7 AS n", [])
+extended.execute(f"DEALLOCATE {deallocated.name}")
+deallocate_key = "extended/prepared/deallocate"
+deallocate_error = None
+try:
+    extended.execute_prepared(deallocated.name, [])
+except PostgresError as error:
+    deallocate_error = split_error(str(error))
+actual[deallocate_key] = {"code": deallocate_error}
+expect_equal(f"{deallocate_key}/code", deallocate_error, "26000")
+expect_recovery(deallocate_key, extended)
+
+bind_failure_key = "extended/prepared/bind-failure"
+doomed = extended.prepare("SELECT $1::int4 AS v", [23])
+bind_error = None
+try:
+    extended.execute_prepared(doomed.name, ["abc"])
+except PostgresError as error:
+    bind_error = split_error(str(error))
+actual[bind_failure_key] = {"code": bind_error}
+expect_equal(f"{bind_failure_key}/code", bind_error, "22P02")
+after_bind = rows_of(extended.execute_prepared(doomed.name, ["7"]))
+actual[f"{bind_failure_key}/after"] = after_bind[0]["rows"]
+expect_equal(f"{bind_failure_key}/after", after_bind[0]["rows"], [["7"]])
+doomed.close()
+expect_recovery(bind_failure_key, extended)
+statement.close()
+extended.close()
+
 protocol_executed = counters["executed"]
 
 # -------------------------------------------------------------------------------

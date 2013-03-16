@@ -197,7 +197,7 @@ function compare(runs) {
         name: 'consistency',
         output: lines.join('\n'),
         counts: { executed: names.length, skipped: 0, failed },
-        floor: 367,
+        floor: 396,
     };
 }
 
