@@ -131,6 +131,70 @@ impl ExecutionReport {
     }
 }
 
+/// Outcome of one `COPY ... FROM STDIN` round trip.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct CopyInReport {
+    #[pyo3(get)]
+    tag: String,
+    #[pyo3(get)]
+    error: Option<ErrorInfo>,
+    #[pyo3(get)]
+    notices: Vec<NoticeInfo>,
+}
+
+#[pymethods]
+impl CopyInReport {
+    #[new]
+    fn new(tag: String, error: Option<ErrorInfo>, notices: Vec<NoticeInfo>) -> Self {
+        Self { tag, error, notices }
+    }
+}
+
+/// Outcome of one `COPY ... TO STDOUT` round trip.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct CopyOutReport {
+    /// Every `CopyData` payload concatenated in wire order.
+    #[pyo3(get)]
+    data: Vec<u8>,
+    #[pyo3(get)]
+    tag: String,
+    #[pyo3(get)]
+    error: Option<ErrorInfo>,
+    #[pyo3(get)]
+    notices: Vec<NoticeInfo>,
+}
+
+#[pymethods]
+impl CopyOutReport {
+    #[new]
+    fn new(data: Vec<u8>, tag: String, error: Option<ErrorInfo>, notices: Vec<NoticeInfo>) -> Self {
+        Self { data, tag, error, notices }
+    }
+}
+
+/// One decoded `CopyInResponse`, `CopyOutResponse` or `CopyBothResponse`.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct CopyResponseInfo {
+    /// `0` for text and `1` for binary.
+    #[pyo3(get)]
+    format: u32,
+    #[pyo3(get)]
+    columns: u32,
+    #[pyo3(get)]
+    column_formats: Vec<u32>,
+}
+
+#[pymethods]
+impl CopyResponseInfo {
+    #[new]
+    fn new(format: u32, columns: u32, column_formats: Vec<u32>) -> Self {
+        Self { format, columns, column_formats }
+    }
+}
+
 /// Effective `psql` options.
 #[pyclass(from_py_object)]
 #[derive(Clone)]
@@ -339,6 +403,42 @@ impl Connection {
             return Err(closed_error());
         };
         connection.close_prepared(name).map_err(native)
+    }
+
+    /// Streams `chunks` as `COPY ... FROM STDIN` data for one statement.
+    ///
+    /// Data is only written after the server answered `CopyInResponse`. A
+    /// failure keeps its tag, error and notices instead of raising, so the
+    /// caller can tell how many rows the server accepted.
+    fn copy_in(&self, sql: &str, chunks: Vec<Vec<u8>>) -> PyResult<CopyInReport> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        let slices: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_slice()).collect();
+        let report = connection.copy_in(sql, &slices).map_err(native)?;
+        Ok(CopyInReport {
+            tag: report.tag,
+            error: report.error.as_ref().and_then(error_info),
+            notices: report.notices.iter().map(notice_info).collect(),
+        })
+    }
+
+    /// Collects every `CopyData` payload of one `COPY ... TO STDOUT` statement.
+    ///
+    /// A failure keeps the bytes that already arrived instead of discarding them.
+    fn copy_out(&self, sql: &str) -> PyResult<CopyOutReport> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let Some(connection) = guard.as_mut() else {
+            return Err(closed_error());
+        };
+        let report = connection.copy_out(sql).map_err(native)?;
+        Ok(CopyOutReport {
+            data: report.data,
+            tag: report.tag,
+            error: report.error.as_ref().and_then(error_info),
+            notices: report.notices.iter().map(notice_info).collect(),
+        })
     }
 
     /// Shuts the socket down on the wire.
@@ -560,6 +660,35 @@ fn decode_parameter_description(payload: Vec<u8>) -> PyResult<Vec<u32>> {
     postgres_client::protocol::parameter_description(&payload).map_err(native)
 }
 
+/// Builds one `CopyData` message carrying a chunk of the copy stream.
+#[pyfunction]
+fn encode_copy_data(data: Vec<u8>) -> PyResult<Vec<u8>> {
+    postgres_client::protocol::copy_data_packet(&data).map_err(native)
+}
+
+/// Builds the `CopyDone` message that ends a `COPY ... FROM STDIN` stream.
+#[pyfunction]
+fn encode_copy_done() -> Vec<u8> {
+    postgres_client::protocol::copy_done_packet()
+}
+
+/// Builds a `CopyFail` message carrying a human readable reason.
+#[pyfunction]
+fn encode_copy_fail(reason: &str) -> PyResult<Vec<u8>> {
+    postgres_client::protocol::copy_fail_packet(reason).map_err(native)
+}
+
+/// Decodes a `CopyInResponse`, `CopyOutResponse` or `CopyBothResponse` payload.
+#[pyfunction]
+fn decode_copy_response(payload: Vec<u8>) -> PyResult<CopyResponseInfo> {
+    let response = postgres_client::protocol::copy_response(&payload).map_err(native)?;
+    Ok(CopyResponseInfo {
+        format: response.format as u32,
+        columns: response.columns as u32,
+        column_formats: response.column_formats.into_iter().map(u32::from).collect(),
+    })
+}
+
 /// OID of the named SQL type, or `None` when the mapping has no entry.
 #[pyfunction]
 fn parameter_type_oid(name: &str) -> Option<u32> {
@@ -723,6 +852,9 @@ fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ErrorInfo>()?;
     module.add_class::<NoticeInfo>()?;
     module.add_class::<ExecutionReport>()?;
+    module.add_class::<CopyInReport>()?;
+    module.add_class::<CopyOutReport>()?;
+    module.add_class::<CopyResponseInfo>()?;
     module.add_class::<PsqlOptions>()?;
     module.add_class::<Store>()?;
     module.add_class::<StoreRow>()?;
@@ -747,6 +879,10 @@ fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(encode_sync_message, module)?)?;
     module.add_function(wrap_pyfunction!(encode_close_message, module)?)?;
     module.add_function(wrap_pyfunction!(decode_parameter_description, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_copy_data, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_copy_done, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_copy_fail, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_copy_response, module)?)?;
     module.add_function(wrap_pyfunction!(parameter_type_oid, module)?)?;
     module.add_function(wrap_pyfunction!(encode_bytea, module)?)?;
     module.add_function(wrap_pyfunction!(parse_psql_arguments, module)?)?;

@@ -309,6 +309,64 @@ pub fn close_packet(target: u8, name: &str) -> Result<Vec<u8>, PostgresError> {
     frame(b'C', payload)
 }
 
+// ---------------------------------------------------------------------------
+// COPY subprotocol: server `G`/`H`/`W`, client `d`/`c`/`f`.
+// ---------------------------------------------------------------------------
+
+/// Overall and per-column formats carried by `CopyInResponse`,
+/// `CopyOutResponse` and `CopyBothResponse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyResponse {
+    /// `0` for text and `1` for binary.
+    pub format: u8,
+    pub columns: u16,
+    /// One format code per column.
+    pub column_formats: Vec<u16>,
+}
+
+/// Decodes a `CopyInResponse`, `CopyOutResponse` or `CopyBothResponse` payload.
+pub fn copy_response(payload: &[u8]) -> Result<CopyResponse, PostgresError> {
+    if payload.len() < 3 {
+        return Err(PostgresError::Protocol("truncated PostgreSQL copy response".into()));
+    }
+    let format = payload[0];
+    if format > 1 {
+        return Err(PostgresError::Protocol(format!("invalid PostgreSQL copy format {format}")));
+    }
+    let columns = u16::from_be_bytes([payload[1], payload[2]]);
+    let expected = 3 + columns as usize * 2;
+    if payload.len() != expected {
+        return Err(PostgresError::Protocol("PostgreSQL copy response column count does not match its length".into()));
+    }
+    let mut column_formats = Vec::with_capacity(columns as usize);
+    for index in 0..columns as usize {
+        let offset = 3 + index * 2;
+        let code = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        if code > 1 {
+            return Err(PostgresError::Protocol(format!("invalid PostgreSQL copy column format {code}")));
+        }
+        column_formats.push(code);
+    }
+    Ok(CopyResponse { format, columns, column_formats })
+}
+
+/// One `CopyData` message carrying a chunk of the copy stream.
+pub fn copy_data_packet(data: &[u8]) -> Result<Vec<u8>, PostgresError> {
+    frame(b'd', data.to_vec())
+}
+
+/// One `CopyDone` message.
+pub fn copy_done_packet() -> Vec<u8> {
+    vec![b'c', 0, 0, 0, 4]
+}
+
+/// One `CopyFail` message carrying a human readable reason.
+pub fn copy_fail_packet(reason: &str) -> Result<Vec<u8>, PostgresError> {
+    let mut payload = Vec::with_capacity(reason.len() + 1);
+    push_text(&mut payload, reason);
+    frame(b'f', payload)
+}
+
 /// One `Sync` message, which ends every extended-protocol round trip.
 pub fn sync_packet() -> Vec<u8> {
     let mut packet = Vec::with_capacity(5);

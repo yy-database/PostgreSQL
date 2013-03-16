@@ -110,6 +110,34 @@ pub struct Report {
     pub notices: Vec<Notice>,
 }
 
+/// One `COPY ... FROM STDIN` round trip.
+///
+/// `tag` is the `CommandComplete` tag, such as `COPY 2`. `error` keeps the
+/// server error instead of throwing it, because the copy may have failed after
+/// the client already streamed rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyInReport {
+    pub tag: String,
+    pub error: Option<PostgresError>,
+    pub notices: Vec<Notice>,
+}
+
+/// One `COPY ... TO STDOUT` round trip.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyOutReport {
+    /// Every `CopyData` payload concatenated in wire order.
+    pub data: Vec<u8>,
+    pub tag: String,
+    pub error: Option<PostgresError>,
+    pub notices: Vec<Notice>,
+}
+
+/// Tag and error shared by both copy directions.
+struct CopyOutcome {
+    tag: String,
+    error: Option<PostgresError>,
+}
+
 /// Response of one extended-protocol round trip.
 struct ExtendedOutcome {
     results: Vec<QueryResult>,
@@ -418,6 +446,129 @@ impl Connection {
             return Err(PostgresError::Protocol("Close returned a result set".into()));
         }
         Ok(())
+    }
+
+    /// Streams `chunks` as `COPY ... FROM STDIN` data for one statement.
+    ///
+    /// The chunks are only written once the server answered `CopyInResponse`.
+    /// A server error, before or during the copy, ends the round trip with
+    /// `ReadyForQuery`, which is drained before returning, so the next call on
+    /// the same connection still works.
+    pub fn copy_in(&mut self, sql: &str, chunks: &[&[u8]]) -> Result<CopyInReport, PostgresError> {
+        self.ensure_usable()?;
+        let start = self.notices.len();
+        let outcome = match self.run_copy_in(sql, chunks) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
+        let notices = self.notices.split_off(start);
+        Ok(CopyInReport { tag: outcome.tag, error: outcome.error, notices })
+    }
+
+    /// Collects every `CopyData` payload of one `COPY ... TO STDOUT` statement.
+    ///
+    /// A server error keeps whatever data already arrived and is reported in
+    /// `error` instead of thrown, so the caller can still inspect the prefix.
+    pub fn copy_out(&mut self, sql: &str) -> Result<CopyOutReport, PostgresError> {
+        self.ensure_usable()?;
+        let start = self.notices.len();
+        let (data, outcome) = match self.run_copy_out(sql) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
+        let notices = self.notices.split_off(start);
+        Ok(CopyOutReport { data, tag: outcome.tag, error: outcome.error, notices })
+    }
+
+    fn run_copy_in(&mut self, sql: &str, chunks: &[&[u8]]) -> Result<CopyOutcome, PostgresError> {
+        self.stream.write_all(&protocol::query_packet(sql)?).map_err(io_error)?;
+        let mut tag = String::new();
+        let mut failure: Option<PostgresError> = None;
+        let mut streaming = false;
+        loop {
+            let (byte, payload) = self.read_message()?;
+            if failure.is_some() {
+                if byte == b'Z' {
+                    if payload.len() != 1 {
+                        return Err(PostgresError::Protocol("invalid ReadyForQuery".into()));
+                    }
+                    return Ok(CopyOutcome { tag, error: failure });
+                }
+                continue;
+            }
+            match byte {
+                b'G' if !streaming => {
+                    protocol::copy_response(&payload)?;
+                    for chunk in chunks {
+                        self.stream.write_all(&protocol::copy_data_packet(chunk)?).map_err(io_error)?;
+                    }
+                    self.stream.write_all(&protocol::copy_done_packet()).map_err(io_error)?;
+                    streaming = true;
+                }
+                b'C' => tag = protocol::command_tag(&payload)?,
+                b'E' => failure = Some(protocol::error_response(&payload)),
+                b'S' | b'K' => {}
+                b'N' => self.record_notice(&payload)?,
+                b'Z' => {
+                    if payload.len() != 1 {
+                        return Err(PostgresError::Protocol("invalid ReadyForQuery".into()));
+                    }
+                    return Ok(CopyOutcome { tag, error: None });
+                }
+                other => {
+                    return Err(PostgresError::Protocol(format!(
+                        "unsupported PostgreSQL copy-in response tag {other}"
+                    )))
+                }
+            }
+        }
+    }
+
+    fn run_copy_out(&mut self, sql: &str) -> Result<(Vec<u8>, CopyOutcome), PostgresError> {
+        self.stream.write_all(&protocol::query_packet(sql)?).map_err(io_error)?;
+        let mut data = Vec::new();
+        let mut tag = String::new();
+        let mut failure: Option<PostgresError> = None;
+        loop {
+            let (byte, payload) = self.read_message()?;
+            if failure.is_some() {
+                if byte == b'Z' {
+                    if payload.len() != 1 {
+                        return Err(PostgresError::Protocol("invalid ReadyForQuery".into()));
+                    }
+                    return Ok((data, CopyOutcome { tag, error: failure }));
+                }
+                continue;
+            }
+            match byte {
+                b'H' => {
+                    protocol::copy_response(&payload)?;
+                }
+                b'd' => data.extend_from_slice(&payload),
+                b'c' => {}
+                b'C' => tag = protocol::command_tag(&payload)?,
+                b'E' => failure = Some(protocol::error_response(&payload)),
+                b'S' | b'K' => {}
+                b'N' => self.record_notice(&payload)?,
+                b'Z' => {
+                    if payload.len() != 1 {
+                        return Err(PostgresError::Protocol("invalid ReadyForQuery".into()));
+                    }
+                    return Ok((data, CopyOutcome { tag, error: None }));
+                }
+                other => {
+                    return Err(PostgresError::Protocol(format!(
+                        "unsupported PostgreSQL copy-out response tag {other}"
+                    )))
+                }
+            }
+        }
     }
 
     fn read_extended(&mut self, packet: &[u8]) -> Result<ExtendedOutcome, PostgresError> {

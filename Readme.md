@@ -149,6 +149,32 @@ and, through the poison rule above, cannot leave half a result behind. This
 repository has no `statement_timeout` GUC of its own; the boundary it owns is
 the 5 s socket read limit.
 
+**COPY subprotocol.** `Connection::copy_in(sql, chunks)` writes the chunks as
+`CopyData` only after the server answered `CopyInResponse`, then sends
+`CopyDone` and drains `CommandComplete`/`ErrorResponse` through
+`ReadyForQuery`. The returned report keeps the tag and the server error instead
+of throwing, so a copy that failed on a later row still reports what the server
+accepted and leaves the session usable; a transport loss poisons the socket.
+`Connection::copy_out(sql)` concatenates every `CopyData` payload in wire order,
+keeps the prefix on error and reports the `COPY n` tag. `encodeCopyData` /
+`encodeCopyDone` / `encodeCopyFail` / `decodeCopyResponse` expose the frames
+byte for byte in both bindings.
+
+`COPY ... TO STDOUT` is compared against PGlite for text and CSV, with `HEADER`
+and `DELIMITER` options, covering a NULL, a delimiter inside a value, an
+embedded quote, a doubled backslash and a 504-row output. `COPY ... FROM STDIN`
+cannot be exercised against PGlite: its socket server answers `CopyInResponse`
+(`format 0`, two columns) and then fails with `08006 unexpected EOF on client
+connection with an open transaction` (`copyfromparse.c`, `CopyGetData`),
+followed by `08P01 terminating connection because protocol synchronization was
+lost` (`postgres.c`, `PostgresMainLongJmp`), which tears the whole server down.
+The harness records those bytes as an **oracle limitation** from a throwaway
+server before the suites start, and both suites assert them. The direction
+itself is verified against fixed byte scripts in
+`postgres-client/tests/robustness.rs`: success, a mid-copy `22P02`, a rejection
+before `CopyInResponse` that must not stream any data, 500 chunks, and a peer
+that closes mid-stream.
+
 ## Testing
 
 ```shell
@@ -157,8 +183,9 @@ pnpm test
 
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
-one shared corpus on both language surfaces. Floors: node 1086, python 1086,
-rust 41; TS and Python results must match case by case; `skipped` must stay 0.
+one shared corpus on both language surfaces. Floors: node 1145, python 1145,
+rust 48, consistency 367; TS and Python results must match case by case;
+`skipped` must stay 0.
 
 ## Wiring SQL onto this repository's storage (not started)
 

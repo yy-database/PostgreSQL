@@ -68,6 +68,33 @@ export interface ExecutionReport {
     notices: NoticeInfo[];
 }
 
+/** Outcome of one `COPY ... FROM STDIN` round trip. */
+export interface CopyInReport {
+    /** `CommandComplete` tag, such as `COPY 2`. */
+    tag: string;
+    /** The server error that stopped the copy, or `null` when it finished. */
+    error: ErrorInfo | null;
+    notices: NoticeInfo[];
+}
+
+/** Outcome of one `COPY ... TO STDOUT` round trip. */
+export interface CopyOutReport {
+    /** Every `CopyData` payload concatenated in wire order. */
+    data: Buffer;
+    tag: string;
+    /** The server error that stopped the copy, or `null` when it finished. */
+    error: ErrorInfo | null;
+    notices: NoticeInfo[];
+}
+
+/** One decoded `CopyInResponse`, `CopyOutResponse` or `CopyBothResponse`. */
+export interface CopyResponseInfo {
+    /** `0` for text and `1` for binary. */
+    format: number;
+    columns: number;
+    columnFormats: number[];
+}
+
 /** One named prepared statement on a live connection. */
 export interface PreparedStatement {
     name(): string;
@@ -95,6 +122,10 @@ export interface Connection {
     prepare(sql: string, types: number[]): PreparedStatement;
     executePrepared(name: string, params: (string | null)[]): StatementResult[];
     closePrepared(name: string): void;
+    /** Streams `chunks` as `COPY ... FROM STDIN` data for one statement. */
+    copyIn(sql: string, chunks: Buffer[]): CopyInReport;
+    /** Collects every `CopyData` payload of one `COPY ... TO STDOUT` statement. */
+    copyOut(sql: string): CopyOutReport;
     close(): void;
 }
 
@@ -155,6 +186,13 @@ export interface PostgresNative {
     encodeSyncMessage(): Buffer;
     encodeCloseMessage(target: 'statement' | 'portal', name: string): Buffer;
     decodeParameterDescription(payload: Buffer): number[];
+    /** One `CopyData` message carrying a chunk of the copy stream. */
+    encodeCopyData(data: Buffer): Buffer;
+    /** The `CopyDone` message that ends a `COPY ... FROM STDIN` stream. */
+    encodeCopyDone(): Buffer;
+    /** A `CopyFail` message carrying a human readable reason. */
+    encodeCopyFail(reason: string): Buffer;
+    decodeCopyResponse(payload: Buffer): CopyResponseInfo;
     parameterTypeOid(name: string): number | null;
     encodeBytea(bytes: Buffer): string;
     parsePsqlArguments(args: string[]): CommandOptions;

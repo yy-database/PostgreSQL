@@ -211,3 +211,248 @@ fn cancel_without_backend_key_data_is_a_protocol_error() {
     assert_eq!(error.message(), "server sent no BackendKeyData to cancel");
     handle.join().expect("server thread");
 }
+
+fn copy_response_payload() -> Vec<u8> {
+    // Text format, two columns, both text.
+    vec![0, 0, 2, 0, 0, 0, 0]
+}
+
+fn read_copy_stream(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+    let mut frames = Vec::new();
+    loop {
+        let (tag, payload) = read_tagged(stream);
+        frames.push((tag, payload));
+        if tag != b'd' {
+            return frames;
+        }
+    }
+}
+
+#[test]
+fn copy_in_streams_every_chunk_and_reports_the_tag() {
+    let (sender, receiver) = mpsc::channel::<Vec<(u8, Vec<u8>)>>();
+    let (port, handle) = spawn_server(move |listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((11, 12)));
+
+        let (tag, payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'Q');
+        assert_eq!(payload, b"COPY t FROM STDIN\0");
+        server.write_all(&frame(b'G', &copy_response_payload())).expect("CopyInResponse");
+
+        let frames = read_copy_stream(&mut server);
+        sender.send(frames).expect("captured copy stream");
+        server.write_all(&frame(b'C', b"COPY 2\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        let (_tag, _payload) = read_tagged(&mut server);
+        server.write_all(&frame(b'T', &row_description("n"))).expect("RowDescription");
+        server.write_all(&frame(b'D', &data_row("1"))).expect("DataRow");
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let report = connection
+        .copy_in("COPY t FROM STDIN", &[b"1\ta\n".as_slice(), b"2\tb\n".as_slice()])
+        .expect("copy in");
+    assert_eq!(report.tag, "COPY 2");
+    assert!(report.error.is_none(), "unexpected {:?}", report.error);
+
+    let frames = receiver.recv_timeout(WAIT).expect("copy stream");
+    assert_eq!(frames.len(), 3, "two data chunks and one CopyDone");
+    assert_eq!(frames[0], (b'd', b"1\ta\n".to_vec()));
+    assert_eq!(frames[1], (b'd', b"2\tb\n".to_vec()));
+    assert_eq!(frames[2], (b'c', Vec::new()));
+
+    let results = connection.execute("SELECT 1 AS n").expect("same session after copy in");
+    assert_eq!(results[0].rows, vec![vec![Some("1".to_owned())]]);
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}
+
+#[test]
+fn copy_in_mid_error_keeps_the_connection_usable() {
+    let (port, handle) = spawn_server(|listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((13, 14)));
+
+        let (tag, _payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'Q');
+        server.write_all(&frame(b'G', &copy_response_payload())).expect("CopyInResponse");
+        let _frames = read_copy_stream(&mut server);
+        server
+            .write_all(&frame(b'E', b"SERROR\0VERROR\0C22P02\0Minvalid input syntax for type integer\0\0"))
+            .expect("ErrorResponse");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        let (tag, _payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'Q');
+        server.write_all(&frame(b'T', &row_description("n"))).expect("RowDescription");
+        server.write_all(&frame(b'D', &data_row("2"))).expect("DataRow");
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let report = connection.copy_in("COPY t FROM STDIN", &[b"1\ta\n".as_slice(), b"bad\n".as_slice()]).expect("copy in");
+    let error = report.error.expect("the server error is reported, not thrown");
+    assert_eq!(error.code(), Some("22P02"));
+    assert_eq!(report.tag, "", "no CommandComplete arrived");
+    let results = connection.execute("SELECT 1 AS n").expect("same session after a mid-copy error");
+    assert_eq!(results[0].rows, vec![vec![Some("2".to_owned())]]);
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}
+
+#[test]
+fn copy_in_rejected_before_copy_response_sends_no_data() {
+    let (port, handle) = spawn_server(|listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((15, 16)));
+
+        let (tag, _payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'Q');
+        server
+            .write_all(&frame(b'E', b"SERROR\0VERROR\0C42P01\0Mrelation \"missing\" does not exist\0\0"))
+            .expect("ErrorResponse");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        let (next, _payload) = read_tagged(&mut server);
+        assert_eq!(next, b'Q', "the client must not stream CopyData without CopyInResponse");
+        server.write_all(&frame(b'T', &row_description("n"))).expect("RowDescription");
+        server.write_all(&frame(b'D', &data_row("3"))).expect("DataRow");
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let report = connection.copy_in("COPY missing FROM STDIN", &[b"1\ta\n".as_slice()]).expect("copy in");
+    assert_eq!(report.error.expect("server error").code(), Some("42P01"));
+    let results = connection.execute("SELECT 1 AS n").expect("same session after a rejected copy");
+    assert_eq!(results[0].rows, vec![vec![Some("3".to_owned())]]);
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}
+
+#[test]
+fn copy_out_collects_every_chunk_and_reports_the_tag() {
+    let (port, handle) = spawn_server(|listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((17, 18)));
+
+        let (tag, _payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'Q');
+        server.write_all(&frame(b'H', &copy_response_payload())).expect("CopyOutResponse");
+        server.write_all(&frame(b'd', b"1\ta\n")).expect("CopyData");
+        server.write_all(&frame(b'd', b"2\t\\N\n")).expect("CopyData");
+        server.write_all(&frame(b'c', &[])).expect("CopyDone");
+        server.write_all(&frame(b'C', b"COPY 2\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        let (_tag, _payload) = read_tagged(&mut server);
+        server.write_all(&frame(b'T', &row_description("n"))).expect("RowDescription");
+        server.write_all(&frame(b'D', &data_row("4"))).expect("DataRow");
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let report = connection.copy_out("COPY t TO STDOUT").expect("copy out");
+    assert_eq!(report.data, b"1\ta\n2\t\\N\n".to_vec());
+    assert_eq!(report.tag, "COPY 2");
+    assert!(report.error.is_none(), "unexpected {:?}", report.error);
+    let results = connection.execute("SELECT 1 AS n").expect("same session after copy out");
+    assert_eq!(results[0].rows, vec![vec![Some("4".to_owned())]]);
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}
+
+#[test]
+fn copy_in_streams_a_large_batch_without_buffering_it() {
+    let (sender, receiver) = mpsc::channel::<usize>();
+    let (port, handle) = spawn_server(move |listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((23, 24)));
+
+        let (tag, _payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'Q');
+        server.write_all(&frame(b'G', &copy_response_payload())).expect("CopyInResponse");
+        let frames = read_copy_stream(&mut server);
+        sender.send(frames.len()).expect("frame count");
+        server.write_all(&frame(b'C', b"COPY 500\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let chunks: Vec<Vec<u8>> = (0..500).map(|index| format!("{index}\n").into_bytes()).collect();
+    let slices: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_slice()).collect();
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let report = connection.copy_in("COPY t FROM STDIN", &slices).expect("copy in");
+    assert_eq!(report.tag, "COPY 500");
+    assert_eq!(receiver.recv_timeout(WAIT).expect("frame count"), 501, "500 chunks and one CopyDone");
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}
+
+#[test]
+fn copy_in_transport_loss_poisons_the_connection() {
+    let (port, handle) = spawn_server(|listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((25, 26)));
+
+        let (tag, _payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'Q');
+        server.write_all(&frame(b'G', &copy_response_payload())).expect("CopyInResponse");
+        let _data = read_tagged(&mut server);
+        let _done = read_tagged(&mut server);
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let error = connection
+        .copy_in("COPY t FROM STDIN", &[b"1\ta\n".as_slice()])
+        .expect_err("a closed peer must throw");
+    assert!(matches!(error, PostgresError::Io(_)), "unexpected {error:?}");
+    let second = connection.execute("SELECT 1").expect_err("poisoned connection");
+    assert!(
+        second.to_string().starts_with("connection is unusable after"),
+        "unexpected {second}"
+    );
+    handle.join().expect("server thread");
+}
+
+#[test]
+fn copy_out_error_keeps_the_prefix_and_the_connection_usable() {
+    let (port, handle) = spawn_server(|listener| {
+        let (mut server, _) = listener.accept().expect("session");
+        read_startup(&mut server);
+        startup_ok(&mut server, Some((19, 20)));
+
+        let (tag, _payload) = read_tagged(&mut server);
+        assert_eq!(tag, b'Q');
+        server.write_all(&frame(b'H', &copy_response_payload())).expect("CopyOutResponse");
+        server.write_all(&frame(b'd', b"1\ta\n")).expect("CopyData");
+        server
+            .write_all(&frame(b'E', b"SERROR\0VERROR\0C22025\0Minvalid escape sequence\0\0"))
+            .expect("ErrorResponse");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+
+        let (_tag, _payload) = read_tagged(&mut server);
+        server.write_all(&frame(b'C', b"SELECT 1\0")).expect("CommandComplete");
+        server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
+    });
+
+    let mut connection = Connection::open(&config(port)).expect("open");
+    let report = connection.copy_out("COPY t TO STDOUT").expect("copy out");
+    assert_eq!(report.data, b"1\ta\n".to_vec(), "the received prefix is kept");
+    assert_eq!(report.tag, "", "no CommandComplete arrived");
+    assert_eq!(report.error.expect("server error").code(), Some("22025"));
+    connection.execute("SELECT 1").expect("same session after a copy-out error");
+    handle.join().expect("server thread");
+    let _ = connection.close();
+}

@@ -17,7 +17,9 @@ pub mod protocol;
 pub mod psql;
 pub mod store;
 
-pub use client::{BackendKeyData, ClientConfig, Column, Connection, Prepared, QueryResult, Report};
+pub use client::{
+    BackendKeyData, ClientConfig, Column, Connection, CopyInReport, CopyOutReport, Prepared, QueryResult, Report,
+};
 pub use error::{MessageField, Notice, PostgresError};
 pub use psql::PsqlOptions;
 pub use store::Store;

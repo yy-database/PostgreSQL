@@ -697,6 +697,126 @@ for item in protocol["decodeCommandTag"]:
         actual[key] = tag
         expect_equal(f"{key}/tag", tag, item["expect"])
 
+# -------------------------------------------------------------------------------
+# COPY subprotocol. `TO STDOUT` is byte-comparable with PGlite. `FROM STDIN`
+# cannot be expressed by the oracle's socket server: it answers `CopyInResponse`
+# and then fails with `08006 unexpected EOF ...` and `08P01 terminating ...`,
+# so that direction is labelled `oracle-limitation` here and verified against
+# scripted protocol fixtures in `postgres-client/tests/robustness.rs`.
+# -------------------------------------------------------------------------------
+for item in protocol["encodeCopy"]:
+    key = f"protocol/copy/{item['name']}"
+    if item["kind"] == "data":
+        packet = to_bytes(native.encode_copy_data(item["data"].encode("utf-8")))
+    elif item["kind"] == "fail":
+        packet = to_bytes(native.encode_copy_fail(item["reason"]))
+    else:
+        packet = to_bytes(native.encode_copy_done())
+    actual[key] = packet.hex()
+    expect_equal(f"{key}/bytes", packet.hex(), item["expectHex"])
+    expect_equal(f"{key}/length", len(packet), len(item["expectHex"]) // 2)
+    expect_equal(f"{key}/tag", packet[0], 0x64 if item["kind"] == "data" else 0x66 if item["kind"] == "fail" else 0x63)
+    expect_equal(f"{key}/length-field", int.from_bytes(packet[1:5], "big"), len(packet) - 1)
+
+for item in protocol["decodeCopyResponse"]:
+    key = f"protocol/copy-response/{item['name']}"
+    payload = bytes.fromhex(item["payloadHex"])
+    if item.get("expectError"):
+        expect_error(key, lambda payload=payload: native.decode_copy_response(payload), item["expectError"])
+        actual[key] = item["expectError"]
+    else:
+        response = native.decode_copy_response(payload)
+        decoded = {"format": response.format, "columns": response.columns, "columnFormats": list(response.column_formats)}
+        actual[key] = decoded
+        expect_equal(f"{key}/response", decoded, item["expect"])
+
+copy = native.connect(CONFIG["host"], CONFIG["port"], CONFIG["user"], CONFIG["database"])
+copy.execute("DROP TABLE IF EXISTS copy_out_probe")
+copy.execute("CREATE TEMP TABLE copy_out_probe (n int, s text)")
+copy.execute("INSERT INTO copy_out_probe VALUES (1, 'a,b'), (2, NULL), (3, 'x\"y'), (4, 'back\\\\slash')")
+copy_cases = [
+    {
+        "name": "text",
+        "sql": "COPY copy_out_probe TO STDOUT",
+        "hex": "3109612c620a32095c4e0a33097822790a34096261636b5c5c5c5c736c6173680a",
+    },
+    {
+        "name": "text-delimiter",
+        "sql": "COPY copy_out_probe TO STDOUT WITH (FORMAT text, DELIMITER ';')",
+        "hex": "313b612c620a323b5c4e0a333b7822790a343b6261636b5c5c5c5c736c6173680a",
+    },
+    {
+        "name": "csv-header",
+        "sql": "COPY copy_out_probe TO STDOUT WITH (FORMAT csv, HEADER true)",
+        "hex": "6e2c730a312c22612c62220a322c0a332c2278222279220a342c6261636b5c5c736c6173680a",
+    },
+    {
+        "name": "csv-header-delimiter",
+        "sql": "COPY copy_out_probe TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER ';')",
+        "hex": "6e3b730a313b612c620a323b0a333b2278222279220a343b6261636b5c5c736c6173680a",
+    },
+]
+for item in copy_cases:
+    key = f"copy/out/{item['name']}"
+    report = copy.copy_out(item["sql"])
+    data = to_bytes(report.data)
+    actual[key] = {"dataHex": data.hex(), "tag": report.tag, "error": None}
+    expect_equal(f"{key}/data", data.hex(), item["hex"])
+    expect_equal(f"{key}/tag", report.tag, "COPY 4")
+    expect_equal(f"{key}/error", report.error, None)
+
+error_key = "copy/out/missing-relation"
+error_report = copy.copy_out("COPY missing_copy_out TO STDOUT")
+error_data = to_bytes(error_report.data)
+error_info = (
+    None
+    if error_report.error is None
+    else {
+        "code": error_report.error.code,
+        "message": error_report.error.message,
+        "fields": field_pairs(error_report.error.fields),
+    }
+)
+actual[error_key] = {"dataHex": error_data.hex(), "tag": error_report.tag, "error": error_info}
+expect_equal(f"{error_key}/data", len(error_data), 0)
+expect_equal(f"{error_key}/tag", error_report.tag, "")
+expect_equal(f"{error_key}/code", error_report.error.code, "42P01")
+expect_equal(f"{error_key}/message", error_report.error.message, 'relation "missing_copy_out" does not exist')
+recovery = copy.execute("SELECT 1 AS n")
+actual[error_key]["recovery"] = recovery[0].rows[0]
+expect_equal(f"{error_key}/recovery", recovery[0].rows[0], ["1"])
+
+copy.execute("INSERT INTO copy_out_probe SELECT n, 'r' || n FROM generate_series(5, 504) AS n")
+volume_key = "copy/out/row-volume"
+volume = copy.copy_out("COPY copy_out_probe TO STDOUT")
+volume_data = to_bytes(volume.data)
+lines = volume_data.decode("utf-8").count("\n")
+actual[volume_key] = {"tag": volume.tag, "lines": lines, "error": None}
+expect_equal(f"{volume_key}/tag", volume.tag, "COPY 504")
+expect_equal(f"{volume_key}/lines", lines, 504)
+copy.close()
+
+in_key = "copy/in/oracle-limitation"
+evidence = json.loads(os.environ["POSTGRES_COPY_IN_EVIDENCE"])
+actual[in_key] = evidence
+expect_equal(f"{in_key}/copy-in-response", evidence["copyInResponse"], {"format": 0, "columns": 2, "columnFormats": [0, 0]})
+expect_equal(f"{in_key}/error-code", evidence["error"]["code"], "08006")
+expect_equal(
+    f"{in_key}/error-message",
+    evidence["error"]["message"],
+    "unexpected EOF on client connection with an open transaction",
+)
+expect_equal(f"{in_key}/error-file", evidence["error"]["file"], "copyfromparse.c")
+expect_equal(f"{in_key}/error-routine", evidence["error"]["routine"], "CopyGetData")
+expect_equal(f"{in_key}/fatal-code", evidence["fatal"]["code"], "08P01")
+expect_equal(
+    f"{in_key}/fatal-message",
+    evidence["fatal"]["message"],
+    "terminating connection because protocol synchronization was lost",
+)
+expect_equal(f"{in_key}/fatal-file", evidence["fatal"]["file"], "postgres.c")
+expect_equal(f"{in_key}/fatal-routine", evidence["fatal"]["routine"], "PostgresMainLongJmp")
+
 protocol_executed = counters["executed"]
 
 # -------------------------------------------------------------------------------

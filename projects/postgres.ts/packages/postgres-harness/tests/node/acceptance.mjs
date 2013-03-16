@@ -708,6 +708,138 @@ for (const item of protocol.decodeCommandTag) {
     }
 }
 
+// -------------------------------------------------------------------------------
+// COPY subprotocol. `TO STDOUT` is byte-comparable with PGlite. `FROM STDIN`
+// cannot be expressed by the oracle's socket server: it answers `CopyInResponse`
+// and then fails with `08006 unexpected EOF ...` and `08P01 terminating ...`,
+// so that direction is labelled `oracle-limitation` here and verified against
+// scripted protocol fixtures in `postgres-client/tests/robustness.rs`.
+// -------------------------------------------------------------------------------
+for (const item of protocol.encodeCopy) {
+    const key = `protocol/copy/${item.name}`;
+    const packet =
+        item.kind === 'data'
+            ? native.encodeCopyData(Buffer.from(item.data, 'utf8'))
+            : item.kind === 'fail'
+              ? native.encodeCopyFail(item.reason)
+              : native.encodeCopyDone();
+    actual[key] = packet.toString('hex');
+    expectEqual(`${key}/bytes`, packet.toString('hex'), item.expectHex);
+    expectEqual(`${key}/length`, packet.length, item.expectHex.length / 2);
+    expectEqual(`${key}/tag`, packet[0], item.kind === 'data' ? 0x64 : item.kind === 'fail' ? 0x66 : 0x63);
+    expectEqual(`${key}/length-field`, packet.readUInt32BE(1), packet.length - 1);
+}
+
+for (const item of protocol.decodeCopyResponse) {
+    const key = `protocol/copy-response/${item.name}`;
+    if (item.expectError) {
+        expectError(key, () => native.decodeCopyResponse(Buffer.from(item.payloadHex, 'hex')), item.expectError);
+        actual[key] = item.expectError;
+    } else {
+        const response = native.decodeCopyResponse(Buffer.from(item.payloadHex, 'hex'));
+        actual[key] = response;
+        expectEqual(`${key}/response`, response, item.expect);
+    }
+}
+
+{
+    const copy = native.connect(config);
+    copy.execute('DROP TABLE IF EXISTS copy_out_probe');
+    copy.execute('CREATE TEMP TABLE copy_out_probe (n int, s text)');
+    copy.execute(
+        "INSERT INTO copy_out_probe VALUES (1, 'a,b'), (2, NULL), (3, 'x\"y'), (4, 'back\\\\slash')",
+    );
+    const cases = [
+        {
+            name: 'text',
+            sql: 'COPY copy_out_probe TO STDOUT',
+            hex: '3109612c620a32095c4e0a33097822790a34096261636b5c5c5c5c736c6173680a',
+        },
+        {
+            name: 'text-delimiter',
+            sql: "COPY copy_out_probe TO STDOUT WITH (FORMAT text, DELIMITER ';')",
+            hex: '313b612c620a323b5c4e0a333b7822790a343b6261636b5c5c5c5c736c6173680a',
+        },
+        {
+            name: 'csv-header',
+            sql: 'COPY copy_out_probe TO STDOUT WITH (FORMAT csv, HEADER true)',
+            hex: '6e2c730a312c22612c62220a322c0a332c2278222279220a342c6261636b5c5c736c6173680a',
+        },
+        {
+            name: 'csv-header-delimiter',
+            sql: "COPY copy_out_probe TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER ';')",
+            hex: '6e3b730a313b612c620a323b0a333b2278222279220a343b6261636b5c5c736c6173680a',
+        },
+    ];
+    for (const item of cases) {
+        const key = `copy/out/${item.name}`;
+        const report = copy.copyOut(item.sql);
+        actual[key] = { dataHex: report.data.toString('hex'), tag: report.tag, error: report.error ?? null };
+        expectEqual(`${key}/data`, report.data.toString('hex'), item.hex);
+        expectEqual(`${key}/tag`, report.tag, 'COPY 4');
+        expectEqual(`${key}/error`, report.error ?? null, null);
+    }
+
+    const errorKey = 'copy/out/missing-relation';
+    const errorReport = copy.copyOut('COPY missing_copy_out TO STDOUT');
+    const errorInfo = errorReport.error
+        ? {
+              code: errorReport.error.code,
+              message: errorReport.error.message,
+              fields: fieldPairs(errorReport.error.fields),
+          }
+        : null;
+    actual[errorKey] = { dataHex: errorReport.data.toString('hex'), tag: errorReport.tag, error: errorInfo };
+    expectEqual(`${errorKey}/data`, errorReport.data.length, 0);
+    expectEqual(`${errorKey}/tag`, errorReport.tag, '');
+    expectEqual(`${errorKey}/code`, errorReport.error?.code, '42P01');
+    expectEqual(
+        `${errorKey}/message`,
+        errorReport.error?.message,
+        'relation "missing_copy_out" does not exist',
+    );
+    const recovery = copy.execute('SELECT 1 AS n');
+    actual[errorKey].recovery = recovery[0].rows[0].values;
+    expectEqual(`${errorKey}/recovery`, recovery[0].rows[0].values, ['1']);
+
+    copy.execute("INSERT INTO copy_out_probe SELECT n, 'r' || n FROM generate_series(5, 504) AS n");
+    const volumeKey = 'copy/out/row-volume';
+    const volume = copy.copyOut('COPY copy_out_probe TO STDOUT');
+    const lines = volume.data.toString('utf8').split('\n').length - 1;
+    actual[volumeKey] = { tag: volume.tag, lines, error: null };
+    expectEqual(`${volumeKey}/tag`, volume.tag, 'COPY 504');
+    expectEqual(`${volumeKey}/lines`, lines, 504);
+
+    copy.close();
+}
+
+{
+    const key = 'copy/in/oracle-limitation';
+    const evidence = JSON.parse(process.env.POSTGRES_COPY_IN_EVIDENCE);
+    actual[key] = evidence;
+    expectEqual(`${key}/copy-in-response`, evidence.copyInResponse, {
+        format: 0,
+        columns: 2,
+        columnFormats: [0, 0],
+    });
+    expectEqual(`${key}/error-code`, evidence.error?.code, '08006');
+    expectEqual(
+        `${key}/error-message`,
+        evidence.error?.message,
+        'unexpected EOF on client connection with an open transaction',
+    );
+    expectEqual(`${key}/error-file`, evidence.error?.file, 'copyfromparse.c');
+    expectEqual(`${key}/error-routine`, evidence.error?.routine, 'CopyGetData');
+    expectEqual(`${key}/fatal-code`, evidence.fatal?.code, '08P01');
+    expectEqual(
+        `${key}/fatal-message`,
+        evidence.fatal?.message,
+        'terminating connection because protocol synchronization was lost',
+    );
+    expectEqual(`${key}/fatal-file`, evidence.fatal?.file, 'postgres.c');
+    expectEqual(`${key}/fatal-routine`, evidence.fatal?.routine, 'PostgresMainLongJmp');
+}
+
 const protocolExecuted = counters.executed;
 
 // -------------------------------------------------------------------------------

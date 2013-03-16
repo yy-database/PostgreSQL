@@ -91,6 +91,33 @@ pub struct ExecutionReport {
     pub notices: Vec<NoticeInfo>,
 }
 
+/// Outcome of one `COPY ... FROM STDIN` round trip.
+#[napi(object)]
+pub struct CopyInReport {
+    pub tag: String,
+    pub error: Option<ErrorInfo>,
+    pub notices: Vec<NoticeInfo>,
+}
+
+/// Outcome of one `COPY ... TO STDOUT` round trip.
+#[napi(object)]
+pub struct CopyOutReport {
+    /// Every `CopyData` payload concatenated in wire order.
+    pub data: Buffer,
+    pub tag: String,
+    pub error: Option<ErrorInfo>,
+    pub notices: Vec<NoticeInfo>,
+}
+
+/// One decoded `CopyInResponse`, `CopyOutResponse` or `CopyBothResponse`.
+#[napi(object)]
+pub struct CopyResponseInfo {
+    /// `0` for text and `1` for binary.
+    pub format: u32,
+    pub columns: u32,
+    pub column_formats: Vec<u32>,
+}
+
 /// One stored row.
 #[napi(object)]
 pub struct StoreRow {
@@ -228,6 +255,40 @@ impl Connection {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
         connection.close_prepared(&name).map_err(native)
+    }
+
+    /// Streams `chunks` as `COPY ... FROM STDIN` data for one statement.
+    ///
+    /// Data is only written after the server answered `CopyInResponse`. A
+    /// failure keeps its tag, error and notices instead of throwing, so the
+    /// caller can tell how many rows the server accepted.
+    #[napi]
+    pub fn copy_in(&self, sql: String, chunks: Vec<Buffer>) -> Result<CopyInReport> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        let slices: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_ref()).collect();
+        let report = connection.copy_in(&sql, &slices).map_err(native)?;
+        Ok(CopyInReport {
+            tag: report.tag,
+            error: report.error.as_ref().and_then(error_info),
+            notices: report.notices.iter().map(notice_info).collect(),
+        })
+    }
+
+    /// Collects every `CopyData` payload of one `COPY ... TO STDOUT` statement.
+    ///
+    /// A failure keeps the bytes that already arrived instead of discarding them.
+    #[napi]
+    pub fn copy_out(&self, sql: String) -> Result<CopyOutReport> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        let report = connection.copy_out(&sql).map_err(native)?;
+        Ok(CopyOutReport {
+            data: Buffer::from(report.data),
+            tag: report.tag,
+            error: report.error.as_ref().and_then(error_info),
+            notices: report.notices.iter().map(notice_info).collect(),
+        })
     }
 
     /// Shuts the socket down on the wire.
@@ -462,6 +523,39 @@ pub fn encode_close_message(target: String, name: String) -> Result<Buffer> {
 #[napi]
 pub fn decode_parameter_description(payload: Buffer) -> Result<Vec<u32>> {
     postgres_client::protocol::parameter_description(payload.as_ref()).map_err(native)
+}
+
+/// Builds one `CopyData` message carrying a chunk of the copy stream.
+#[napi]
+pub fn encode_copy_data(data: Buffer) -> Result<Buffer> {
+    postgres_client::protocol::copy_data_packet(data.as_ref())
+        .map(Buffer::from)
+        .map_err(native)
+}
+
+/// Builds the `CopyDone` message that ends a `COPY ... FROM STDIN` stream.
+#[napi]
+pub fn encode_copy_done() -> Buffer {
+    Buffer::from(postgres_client::protocol::copy_done_packet())
+}
+
+/// Builds a `CopyFail` message carrying a human readable reason.
+#[napi]
+pub fn encode_copy_fail(reason: String) -> Result<Buffer> {
+    postgres_client::protocol::copy_fail_packet(&reason)
+        .map(Buffer::from)
+        .map_err(native)
+}
+
+/// Decodes a `CopyInResponse`, `CopyOutResponse` or `CopyBothResponse` payload.
+#[napi]
+pub fn decode_copy_response(payload: Buffer) -> Result<CopyResponseInfo> {
+    let response = postgres_client::protocol::copy_response(payload.as_ref()).map_err(native)?;
+    Ok(CopyResponseInfo {
+        format: response.format as u32,
+        columns: response.columns as u32,
+        column_formats: response.column_formats.into_iter().map(u32::from).collect(),
+    })
 }
 
 /// OID of the named SQL type, or `null` when the mapping has no entry.

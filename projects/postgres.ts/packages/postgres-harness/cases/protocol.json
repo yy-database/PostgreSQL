@@ -57,6 +57,80 @@
             "expectHex": "0000001004d2162effffffffffffffff"
         }
     ],
+    "encodeCopy": [
+        {
+            "name": "copy-data-row",
+            "kind": "data",
+            "data": "1\ta\n",
+            "expectHex": "64000000083109610a"
+        },
+        {
+            "name": "copy-data-empty",
+            "kind": "data",
+            "data": "",
+            "expectHex": "6400000004"
+        },
+        {
+            "name": "copy-data-unicode",
+            "kind": "data",
+            "data": "中文",
+            "expectHex": "640000000ae4b8ade69687"
+        },
+        {
+            "name": "copy-done",
+            "kind": "done",
+            "expectHex": "6300000004"
+        },
+        {
+            "name": "copy-fail-reason",
+            "kind": "fail",
+            "reason": "row 2 is bad",
+            "expectHex": "6600000011726f7720322069732062616400"
+        },
+        {
+            "name": "copy-fail-empty-reason",
+            "kind": "fail",
+            "reason": "",
+            "expectHex": "660000000500"
+        }
+    ],
+    "decodeCopyResponse": [
+        {
+            "name": "copy-text-two-columns",
+            "payloadHex": "00000200000000",
+            "expect": { "format": 0, "columns": 2, "columnFormats": [0, 0] }
+        },
+        {
+            "name": "copy-binary-one-column",
+            "payloadHex": "0100010001",
+            "expect": { "format": 1, "columns": 1, "columnFormats": [1] }
+        },
+        {
+            "name": "copy-zero-columns",
+            "payloadHex": "000000",
+            "expect": { "format": 0, "columns": 0, "columnFormats": [] }
+        },
+        {
+            "name": "copy-truncated",
+            "payloadHex": "00",
+            "expectError": "truncated PostgreSQL copy response"
+        },
+        {
+            "name": "copy-invalid-format",
+            "payloadHex": "0200010000",
+            "expectError": "invalid PostgreSQL copy format 2"
+        },
+        {
+            "name": "copy-missing-column-formats",
+            "payloadHex": "000001",
+            "expectError": "PostgreSQL copy response column count does not match its length"
+        },
+        {
+            "name": "copy-invalid-column-format",
+            "payloadHex": "0000010002",
+            "expectError": "invalid PostgreSQL copy column format 2"
+        }
+    ],
     "decodeError": [
         {
             "name": "error-code-and-message",
