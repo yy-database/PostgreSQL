@@ -2,7 +2,7 @@
     "name": "@yydb/postgres",
     "version": "0.1.0",
     "private": true,
-    "description": "PostgreSQL protocol-v3 client primitives and a psql-compatible command line",
+    "description": "PostgreSQL protocol-v3 client primitives, a protocol-v3 server and a psql-compatible command line",
     "license": "MPL-2.0",
     "type": "module",
     "main": "./dist/index.js",
@@ -26,7 +26,8 @@
         }
     },
     "bin": {
-        "psql": "./bin/psql.mjs"
+        "psql": "./bin/psql.mjs",
+        "postgres-server": "./bin/postgres-server.mjs"
     },
     "files": [
         "bin",

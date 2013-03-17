@@ -1,8 +1,9 @@
 # PostgreSQL
 
-Protocol-v3 client primitives, a `psql`-compatible command line, and an
-independent `.yyds`/`.yykv` key-value store, shared by a Rust crate, a Node-API
-binding and a PyO3 binding, with TypeScript and Python surfaces on top.
+Protocol-v3 client primitives, a protocol-v3 server, a `psql`-compatible
+command line, and an independent `.yyds`/`.yykv` key-value store, shared by a
+Rust crate, a Node-API binding and a PyO3 binding, with TypeScript and Python
+surfaces on top.
 
 ## What this repository implements
 
@@ -12,6 +13,14 @@ binding and a PyO3 binding, with TypeScript and Python surfaces on top.
 - **Socket client.** `Connection::open` connects to a server and
   `Connection::execute` sends one simple-query packet and decodes the replies
   (`projects/postgres.rs/postgres-client/src/client.rs`).
+- **Wire server.** `startPostgresServer` in
+  `projects/postgres.ts/packages/postgres/src/server/` listens on TCP and speaks
+  protocol v3 as the backend: startup, trust or cleartext-password
+  authentication, `SET`, `SHOW`, literal `SELECT` lists, `ErrorResponse` plus
+  `ReadyForQuery` on failure, and a clean `\q`. Frames are encoded in
+  `server/protocol.ts`, sessions and their GUC maps live in `server/server.ts`.
+  The server is TypeScript, not Rust, so the Rust side keeps no server main loop.
+  `postgres-server --port 5432` runs it.
 - **Bindings and surfaces.** `postgres-napi`, `postgres-pyo3`, and the
   TypeScript and Python packages composed on top of them.
 - **`psql` surface.** Argument parsing and result rendering.
@@ -20,10 +29,12 @@ binding and a PyO3 binding, with TypeScript and Python surfaces on top.
 
 ## What this repository does NOT implement
 
-There is no SQL parser, planner, executor or storage engine here.
-`Connection.execute(sql)` serialises the statement text and reads the reply.
-Types, casts, operators, command tags, error codes, transactions, `RETURNING`
-and catalog tables are all decided by the server on the other end of the socket.
+There is no SQL parser, planner, executor or storage engine here. The server
+answers literal `SELECT` lists, `SET` and `SHOW` only; DDL and DML are the next
+batch. `Connection.execute(sql)` serialises the statement text and reads the
+reply. Types, casts, operators, command tags, error codes, transactions,
+`RETURNING` and catalog tables are still decided by the server on the other end
+of the socket.
 
 The acceptance harness runs **PGlite 0.5.15** as that server:
 
@@ -55,6 +66,48 @@ database, or in its own PostgreSQL data directory when one is configured
 unrelated KV primitive: `local-0.yyds` and `local-0.yykv` are written only when
 a caller uses `Store` directly. `postgres-client` neither imports nor calls
 `Store`, so **SQL and the `.yyds`/`.yykv` store are not wired together**.
+
+## Wire server (connectivity batch)
+
+`postgres-server --port 5432` (or `startPostgresServer`) listens on TCP and
+speaks protocol v3 as the backend. It answers startup, `AuthenticationOk` for
+trust and `AuthenticationCleartextPassword` for `--password`, `SET`, `SHOW`,
+literal `SELECT` lists such as `SELECT 1`, and closes on `Terminate`. Every
+statement failure is `ErrorResponse` followed by `ReadyForQuery`, so the
+session survives.
+
+Evidence from a real `psql` 16.9 (`LC_MESSAGES=C`) against
+`postgres-server --port 55432`:
+
+```text
+$ psql -h 127.0.0.1 -p 55432 -U postgres -d postgres -c "SELECT 1"
+ ?column?
+----------
+        1
+(1 row)
+
+$ psql ... -c "SHOW server_version" -c "SET application_name = 'psql-batch-one'" -c "SHOW application_name"
+ server_version
+----------------
+ 16.9
+(1 row)
+
+SET
+ application_name
+------------------
+ psql-batch-one
+(1 row)
+
+$ psql ... -c "CREATE TABLE batch_one (a int)"
+ERROR:  feature not supported
+DETAIL:  statement is not implemented: CREATE TABLE batch_one (a int)
+```
+
+The harness `server` stage starts this server in-process and drives it with
+fixed wire bytes and the `pg` driver. When `PSQL_BIN` points at a real `psql`
+it also runs three `psql` cases and records their stdout and stderr verbatim.
+Authentication is checked both ways: a rejected password is `FATAL 28P01`
+without `ReadyForQuery`, an unknown database is `FATAL 3D000`.
 
 ## SQL compatibility gaps
 
@@ -217,8 +270,9 @@ pnpm test
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
 one shared corpus on both language surfaces. Floors: node 1203, python 1203,
-rust 58, consistency 396; TS and Python results must match case by case;
-`skipped` must stay 0.
+rust 58, consistency 396, server 14; TS and Python results must match case by
+case; `skipped` must stay 0. With `PSQL_BIN` set the `server` stage executes 17
+cases because the three `psql` cases join the run.
 
 ## Wiring SQL onto this repository's storage (not started)
 

@@ -1,5 +1,6 @@
 export * from './client.ts';
 export * from './cli.ts';
+export * from './server/server.ts';
 export { loadNative, nativeBindingName, platformKey } from './native.ts';
 export type {
     ClientOptions,
