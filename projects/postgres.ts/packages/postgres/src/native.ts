@@ -188,6 +188,27 @@ export interface Store {
     catalogPath(): string;
 }
 
+/** One mutation inside a `ServerStore` commit batch. */
+export interface ServerStoreChange {
+    kind: 'put' | 'delete';
+    namespace: string;
+    key: Buffer;
+    /** Required for `put`, omitted for `delete`. */
+    value?: Buffer;
+}
+
+/** One durable server data directory: `.yyds` catalog, `.yykv` shard and lock. */
+export interface ServerStore {
+    scan(namespace: string, prefix: Buffer, after: Buffer | null, before: Buffer | null, limit: number): StoreRow[];
+    commitChanges(changes: ServerStoreChange[]): void;
+    close(): void;
+    durableAtomicCommit(): boolean;
+    dataDir(): string;
+    shardPath(): string;
+    catalogPath(): string;
+    lockPath(): string;
+}
+
 /** Effective `psql` options, as normalized by the binding. */
 export interface CommandOptions extends ClientOptions {
     sql: string;
@@ -244,6 +265,7 @@ export interface PostgresNative {
     parsePsqlArguments(args: string[]): CommandOptions;
     formatPsqlResults(results: StatementResult[], options: CommandOptions): string[];
     Store: new (dataDir: string) => Store;
+    ServerStore: new (dataDir: string) => ServerStore;
 }
 
 /** Map Node platform/arch to the optionalDependency package suffix. */

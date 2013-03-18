@@ -949,6 +949,146 @@ impl Store {
     }
 }
 
+/// One mutation inside a `ServerStore` commit batch.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct ServerStoreChange {
+    /// `put` or `delete`.
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    namespace: String,
+    #[pyo3(get)]
+    key: Vec<u8>,
+    /// Required for `put`, ignored for `delete`.
+    #[pyo3(get)]
+    value: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl ServerStoreChange {
+    #[new]
+    fn new(kind: String, namespace: String, key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        Self { kind, namespace, key, value }
+    }
+}
+
+/// One durable server data directory: `.yyds` catalog, `.yykv` shard and lock.
+#[pyclass]
+pub struct ServerStore {
+    inner: Mutex<Option<postgres_client::ServerStore>>,
+}
+
+#[pymethods]
+impl ServerStore {
+    #[new]
+    fn new(data_dir: String) -> PyResult<Self> {
+        postgres_client::ServerStore::open(&data_dir)
+            .map(|inner| Self { inner: Mutex::new(Some(inner)) })
+            .map_err(native)
+    }
+
+    /// Ordered prefix scan inside one namespace.
+    #[pyo3(signature = (namespace, prefix, after=None, before=None, limit=0))]
+    fn scan(
+        &self,
+        namespace: String,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        before: Option<Vec<u8>>,
+        limit: usize,
+    ) -> PyResult<Vec<StoreRow>> {
+        let mut guard = self.inner.lock().map_err(|_| native_message("server store lock poisoned"))?;
+        let store = guard.as_mut().ok_or_else(|| native_message("server store is closed"))?;
+        store
+            .scan(&namespace, &prefix, after.as_deref(), before.as_deref(), limit)
+            .map(|rows| rows.into_iter().map(|row| StoreRow { key: row.key, value: row.value }).collect())
+            .map_err(native)
+    }
+
+    /// Applies one batch as a single durable atomic commit.
+    fn commit_changes(&self, changes: Vec<ServerStoreChange>) -> PyResult<()> {
+        let mut batch = Vec::with_capacity(changes.len());
+        for change in changes {
+            batch.push(match change.kind.as_str() {
+                "put" => postgres_client::ServerChange::Put {
+                    namespace: change.namespace,
+                    key: change.key,
+                    value: change.value.ok_or_else(|| native_message("put change carries no value"))?,
+                },
+                "delete" => postgres_client::ServerChange::Delete { namespace: change.namespace, key: change.key },
+                other => return Err(native_message(format!("unknown server store change kind {other}"))),
+            });
+        }
+        let mut guard = self.inner.lock().map_err(|_| native_message("server store lock poisoned"))?;
+        let store = guard.as_mut().ok_or_else(|| native_message("server store is closed"))?;
+        store.commit_changes(batch).map_err(native)
+    }
+
+    /// Releases the directory lock.
+    fn close(&self) -> PyResult<()> {
+        let mut guard = self.inner.lock().map_err(|_| native_message("server store lock poisoned"))?;
+        if let Some(store) = guard.take() {
+            store.close().map_err(native)?;
+        }
+        Ok(())
+    }
+
+    /// Whether every commit survives process exit.
+    fn durable_atomic_commit(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(postgres_client::ServerStore::durable_atomic_commit))
+            .unwrap_or(false)
+    }
+
+    /// Data directory.
+    fn data_dir(&self) -> PyResult<String> {
+        Ok(self.locked()?.data_dir())
+    }
+
+    /// `.yykv` shard path.
+    fn shard_path(&self) -> PyResult<String> {
+        Ok(self.locked()?.shard_path())
+    }
+
+    /// `.yyds` catalog path.
+    fn catalog_path(&self) -> PyResult<String> {
+        Ok(self.locked()?.catalog_path())
+    }
+
+    /// `postmaster.pid` lock path.
+    fn lock_path(&self) -> PyResult<String> {
+        Ok(self.locked()?.lock_path())
+    }
+}
+
+/// Guard that dereferences to the live store, never to a closed slot.
+struct StoreGuard<'a>(std::sync::MutexGuard<'a, Option<postgres_client::ServerStore>>);
+
+impl std::ops::Deref for StoreGuard<'_> {
+    type Target = postgres_client::ServerStore;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("server store is open")
+    }
+}
+
+impl ServerStore {
+    fn locked(&self) -> PyResult<StoreGuard<'_>> {
+        let guard = self.inner.lock().map_err(|_| native_message("server store lock poisoned"))?;
+        if guard.is_none() {
+            return Err(native_message("server store is closed"));
+        }
+        Ok(StoreGuard(guard))
+    }
+}
+
+fn native_message(message: impl Into<String>) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(message.into())
+}
+
 fn statement(result: QueryResult) -> StatementResult {
     StatementResult {
         columns: result.columns.into_iter().map(|column| ColumnInfo { name: column.name }).collect(),
@@ -1049,6 +1189,8 @@ fn postgres_pyo3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PsqlOptions>()?;
     module.add_class::<Store>()?;
     module.add_class::<StoreRow>()?;
+    module.add_class::<ServerStore>()?;
+    module.add_class::<ServerStoreChange>()?;
     module.add("PostgresError", module.py().get_type::<PostgresError>())?;
     module.add_function(wrap_pyfunction!(connect, module)?)?;
     module.add_function(wrap_pyfunction!(version, module)?)?;

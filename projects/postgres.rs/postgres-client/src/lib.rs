@@ -15,6 +15,7 @@ mod client;
 mod error;
 pub mod protocol;
 pub mod psql;
+pub mod server_store;
 pub mod store;
 
 pub use client::{
@@ -23,4 +24,5 @@ pub use client::{
 };
 pub use error::{MessageField, Notice, PostgresError};
 pub use psql::PsqlOptions;
+pub use server_store::{ServerChange, ServerRow, ServerStore};
 pub use store::Store;

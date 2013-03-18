@@ -1,6 +1,16 @@
 import net from 'node:net';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { randomInt } from 'node:crypto';
 
+import { loadNative, type ServerStore } from '../native.ts';
+import { ServerError } from './errors.ts';
+import { storageFor } from './store.ts';
+import { Database, type Storage } from './sql/database.ts';
+import { describeSelect, runStatement, type Field, type Outcome } from './sql/engine.ts';
+import { parseStatement } from './sql/parser.ts';
+import { TEXT, formatValue, typeLength, typeOid, type SqlValue } from './sql/types.ts';
 import {
     authenticationCleartextPassword,
     authenticationOk,
@@ -40,29 +50,27 @@ export interface PostgresServerOptions {
     database?: string;
     /** Defaults to `trust`. */
     auth?: ServerAuth;
+    /**
+     * Directory that owns `local-0.yyds`, `local-0.yykv` and `postmaster.pid`.
+     *
+     * A second server started on the same directory fails its startup, and a
+     * fresh temporary directory is used when this is omitted.
+     */
+    dataDir?: string;
 }
 
 export interface PostgresServerHandle {
     host: string;
     port: number;
-    /** Stops listening and destroys every open session. */
+    /** Directory the server locked for this run. */
+    dataDir: string;
+    /** Stops listening, destroys every open session and releases the lock. */
     close(): Promise<void>;
 }
 
-const INT4_OID = 23;
-const TEXT_OID = 25;
+export { ServerError };
 
-/** A statement-level failure that turns into an `ErrorResponse`. */
-export class ServerError extends Error {
-    readonly code: string;
-    readonly detail: string | undefined;
-
-    constructor(code: string, message: string, detail?: string) {
-        super(message);
-        this.code = code;
-        this.detail = detail;
-    }
-}
+const TEXT_OID = typeOid(TEXT);
 
 interface SessionState {
     parameters: Map<string, string>;
@@ -70,14 +78,23 @@ interface SessionState {
     database: string;
 }
 
-type Outcome =
-    | { kind: 'empty' }
-    | { kind: 'command'; tag: string }
-    | { kind: 'rows'; fields: RowField[]; rows: (string | null)[][]; tag: string };
+/** Turns engine fields and values into the protocol's row description and cells. */
+function wireFields(fields: Field[]): RowField[] {
+    return fields.map((field) => ({
+        name: field.name,
+        typeOid: typeOid(field.type),
+        typeLength: typeLength(field.type),
+        typeModifier: field.type.typmod,
+    }));
+}
 
-function truncate(sql: string, limit = 64): string {
-    const text = sql.trim().replace(/\s+/g, ' ');
-    return text.length <= limit ? text : `${text.slice(0, limit)}...`;
+function wireRows(outcome: { fields: Field[]; rows: SqlValue[][] }): (string | null)[][] {
+    return outcome.rows.map((row) =>
+        row.map((value, index) => {
+            const type = outcome.fields[index]?.type ?? TEXT;
+            return formatValue(value, type);
+        }),
+    );
 }
 
 function unquote(value: string): string {
@@ -133,65 +150,9 @@ export function splitStatements(sql: string): string[] {
     return statements.map((statement) => statement.trim()).filter((statement) => statement.length > 0);
 }
 
-/** Literal-only `SELECT` list: integers, strings, `NULL` and bound `$n` parameters. */
-function selectColumns(sql: string, parameters: (string | null)[]): { fields: RowField[]; values: (string | null)[] } {
-    const match = /^select\s+([\s\S]+)$/i.exec(sql.trim());
-    if (!match || match[1] === undefined) throw new ServerError('0A000', 'feature not supported', 'not a SELECT list');
-    const list = match[1];
-    const items: string[] = [];
-    let current = '';
-    let single = false;
-    for (let index = 0; index < list.length; index += 1) {
-        const character = list[index];
-        if (character === "'") single = !single;
-        if (character === ',' && !single) {
-            items.push(current);
-            current = '';
-            continue;
-        }
-        current += character;
-    }
-    items.push(current);
-
-    const fields: RowField[] = [];
-    const values: (string | null)[] = [];
-    for (const raw of items) {
-        const item = raw.trim();
-        const integer = /^-?\d+$/.exec(item);
-        if (integer) {
-            fields.push({ name: '?column?', typeOid: INT4_OID, typeLength: 4 });
-            values.push(item);
-            continue;
-        }
-        if (/^null$/i.test(item)) {
-            fields.push({ name: '?column?', typeOid: TEXT_OID, typeLength: -1 });
-            values.push(null);
-            continue;
-        }
-        const text = /^'((?:[^']|'')*)'$/.exec(item);
-        if (text && text[1] !== undefined) {
-            fields.push({ name: '?column?', typeOid: TEXT_OID, typeLength: -1 });
-            values.push(text[1].replaceAll("''", "'"));
-            continue;
-        }
-        const parameter = /^\$(\d+)$/.exec(item);
-        if (parameter && parameter[1] !== undefined) {
-            const position = Number(parameter[1]);
-            if (position < 1 || position > parameters.length) {
-                throw new ServerError('42P02', `there is no parameter $${position}`);
-            }
-            fields.push({ name: '?column?', typeOid: TEXT_OID, typeLength: -1 });
-            values.push(parameters[position - 1] ?? null);
-            continue;
-        }
-        throw new ServerError('0A000', 'feature not supported', `expression is not implemented: ${item}`);
-    }
-    return { fields, values };
-}
-
-function executeStatement(state: SessionState, sql: string, parameters: (string | null)[]): Outcome {
+/** Runs one statement: session GUCs first, then the SQL engine. */
+function runSql(state: SessionState, database: Database, sql: string, parameters: SqlValue[]): Outcome {
     const statement = sql.trim();
-    if (statement.length === 0) return { kind: 'empty' };
 
     const set = /^(?:set|set\s+session|set\s+local)\s+([a-z_][a-z0-9_.]*)\s*(?:=|to)\s*([\s\S]+)$/i.exec(statement);
     if (set && set[1] !== undefined && set[2] !== undefined) {
@@ -200,38 +161,30 @@ function executeStatement(state: SessionState, sql: string, parameters: (string 
         return { kind: 'command', tag: 'SET' };
     }
 
-    if (/^select\s/i.test(statement)) {
-        const { fields, values } = selectColumns(statement, parameters);
-        return { kind: 'rows', fields, rows: [values], tag: 'SELECT 1' };
-    }
-
     const show = /^show\s+([a-z_][a-z0-9_.]*)$/i.exec(statement);
     if (show && show[1] !== undefined) {
         const name = show[1].toLowerCase();
         const value = state.parameters.get(name);
         if (value === undefined) throw new ServerError('42704', `unrecognized configuration parameter "${name}"`);
-        return {
-            kind: 'rows',
-            fields: [{ name, typeOid: TEXT_OID, typeLength: -1 }],
-            rows: [[value]],
-            tag: 'SHOW',
-        };
+        return { kind: 'rows', fields: [{ name, type: TEXT }], rows: [[value]], tag: 'SHOW' };
     }
 
-    throw new ServerError('0A000', 'feature not supported', `statement is not implemented: ${truncate(statement)}`);
+    return runStatement(database, parseStatement(statement), parameters);
 }
 
 /**
  * Decodes frontend messages while driving the backend side of protocol v3.
  *
- * Every session owns its GUC map, its prepared statements and its portals.
- * Batch 1 answers `SET`, `SHOW` and literal `SELECT` lists only.
+ * Every session owns its GUC map, its prepared statements and its portals. One
+ * message shares one `Database`, so its statements either all become durable
+ * through a single `commitChanges` call or are discarded together.
  */
 class Session {
     private readonly socket: net.Socket;
     private readonly user: string;
     private readonly database: string;
     private readonly auth: ServerAuth;
+    private readonly storage: Storage;
     private readonly pid = randomInt(1, 2 ** 31 - 1);
     private readonly secret = randomInt(1, 2 ** 31 - 1);
 
@@ -245,11 +198,12 @@ class Session {
     private extendedFailed = false;
     private closing = false;
 
-    constructor(socket: net.Socket, options: PostgresServerOptions) {
+    constructor(socket: net.Socket, options: PostgresServerOptions, storage: Storage) {
         this.socket = socket;
         this.user = options.user ?? 'postgres';
         this.database = options.database ?? 'postgres';
         this.auth = options.auth ?? 'trust';
+        this.storage = storage;
     }
 
     start(): void {
@@ -453,13 +407,26 @@ class Session {
             this.socket.write(readyForQuery('I'));
             return;
         }
+
+        const database = Database.open(this.storage);
+        const outcomes: Outcome[] = [];
         try {
-            for (const statement of statements) {
-                this.emitOutcome(executeStatement(state, statement, []));
-            }
+            for (const statement of statements) outcomes.push(runSql(state, database, statement, []));
+        } catch (error) {
+            // Statements that already ran are reported, the whole batch is discarded.
+            for (const outcome of outcomes) this.emitOutcome(outcome);
+            this.sendError(error);
+            this.socket.write(readyForQuery('I'));
+            return;
+        }
+        try {
+            database.commit();
         } catch (error) {
             this.sendError(error);
+            this.socket.write(readyForQuery('I'));
+            return;
         }
+        for (const outcome of outcomes) this.emitOutcome(outcome);
         this.socket.write(readyForQuery('I'));
     }
 
@@ -548,15 +515,15 @@ class Session {
     private describeSql(sql: string, parameterCount: number): Buffer {
         const statement = sql.trim();
         if (statement.length === 0) return noData();
-        if (/^select\s/i.test(statement)) {
-            const placeholders = Array.from({ length: parameterCount }, () => null);
-            return rowDescription(selectColumns(statement, placeholders).fields);
-        }
         const show = /^show\s+([a-z_][a-z0-9_.]*)$/i.exec(statement);
         if (show && show[1] !== undefined) {
             return rowDescription([{ name: show[1].toLowerCase(), typeOid: TEXT_OID, typeLength: -1 }]);
         }
-        return noData();
+        const parsed = parseStatement(statement);
+        if (parsed.kind !== 'select') return noData();
+        const placeholders = Array.from({ length: parameterCount }, () => null);
+        const database = Database.open(this.storage);
+        return rowDescription(wireFields(describeSelect(database, parsed, placeholders)));
     }
 
     private handleExecute(payload: Buffer): void {
@@ -571,7 +538,10 @@ class Session {
             if (!portal) throw new ServerError('34000', `portal "${portalName}" does not exist`);
             const prepared = this.prepared.get(portal.statement);
             if (!prepared) throw new ServerError('26000', `prepared statement "${portal.statement}" does not exist`);
-            this.emitOutcome(executeStatement(state, prepared.sql, portal.parameters), portal.described);
+            const database = Database.open(this.storage);
+            const outcome = runSql(state, database, prepared.sql, portal.parameters);
+            database.commit();
+            this.emitOutcome(outcome, portal.described);
         } catch (error) {
             this.sendExtendedError(error);
         }
@@ -592,16 +562,12 @@ class Session {
     }
 
     private emitOutcome(outcome: Outcome, described = false): void {
-        if (outcome.kind === 'empty') {
-            this.socket.write(emptyQueryResponse());
-            return;
-        }
         if (outcome.kind === 'command') {
             this.socket.write(commandComplete(outcome.tag));
             return;
         }
-        if (!described) this.socket.write(rowDescription(outcome.fields));
-        for (const values of outcome.rows) this.socket.write(dataRow(values));
+        if (!described) this.socket.write(rowDescription(wireFields(outcome.fields)));
+        for (const values of wireRows(outcome)) this.socket.write(dataRow(values));
         this.socket.write(commandComplete(outcome.tag));
     }
 
@@ -632,17 +598,29 @@ class Session {
 
 /** Starts a protocol-v3 server that accepts real `psql` and `pg` clients. */
 export function startPostgresServer(options: PostgresServerOptions = {}): Promise<PostgresServerHandle> {
+    const dataDir = options.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-data-'));
+    let store: ServerStore;
+    try {
+        store = new (loadNative().ServerStore)(dataDir);
+    } catch (error) {
+        return Promise.reject(error);
+    }
+    const storage = storageFor(store);
+
     const sockets = new Set<net.Socket>();
     const host = options.host ?? '127.0.0.1';
     const server = net.createServer((socket) => {
         sockets.add(socket);
         socket.on('close', () => sockets.delete(socket));
-        const session = new Session(socket, options);
+        const session = new Session(socket, options, storage);
         session.start();
     });
 
     return new Promise((resolve, reject) => {
-        const onError = (error: Error): void => reject(error);
+        const onError = (error: Error): void => {
+            store.close();
+            reject(error);
+        };
         server.once('error', onError);
         server.listen(options.port ?? 0, host, () => {
             server.off('error', onError);
@@ -651,11 +629,15 @@ export function startPostgresServer(options: PostgresServerOptions = {}): Promis
             resolve({
                 host,
                 port,
+                dataDir,
                 close: () =>
                     new Promise<void>((done) => {
                         for (const socket of sockets) socket.destroy();
                         sockets.clear();
-                        server.close(() => done());
+                        server.close(() => {
+                            store.close();
+                            done();
+                        });
                     }),
             });
         });

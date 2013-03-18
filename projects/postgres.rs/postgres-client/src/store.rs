@@ -261,7 +261,7 @@ fn decode_shard(bytes: &[u8]) -> Result<(BTreeMap<(String, Vec<u8>), Record>, u6
     Ok((shard, next_revision))
 }
 
-fn encode_catalog_bytes(shard_id: &str) -> Result<Vec<u8>, PostgresError> {
+pub(crate) fn encode_catalog_bytes(shard_id: &str) -> Result<Vec<u8>, PostgresError> {
     let message = match encode_catalog(None, None, &[ShardId(shard_id.to_owned())], None, &[]) {
         Ok(bytes) => return Ok(bytes),
         Err(error) => format!("cannot encode .yyds catalog: {error}"),
@@ -274,7 +274,7 @@ fn encode_catalog_bytes(shard_id: &str) -> Result<Vec<u8>, PostgresError> {
 /// Decoding and single-registration validation come from `database-formats`;
 /// this wrapper only keeps the PostgreSQL-facing wording and the legacy
 /// big-endian pre-check.
-fn decode_catalog_shard_id(bytes: &[u8]) -> Result<String, PostgresError> {
+pub(crate) fn decode_catalog_shard_id(bytes: &[u8]) -> Result<String, PostgresError> {
     if legacy_catalog_bytes(bytes) {
         return Err(protocol("legacy PostgreSQL catalog layout: delete the store directory and reinitialize"));
     }

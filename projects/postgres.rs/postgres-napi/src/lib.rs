@@ -922,3 +922,136 @@ fn closed_error() -> Error {
 fn native(error: PostgresError) -> Error {
     Error::from_reason(error.to_string())
 }
+
+/// One mutation inside a `ServerStore` commit batch.
+#[napi(object)]
+pub struct ServerStoreChange {
+    /// `put` or `delete`.
+    pub kind: String,
+    pub namespace: String,
+    pub key: Buffer,
+    /// Required for `put`, ignored for `delete`.
+    pub value: Option<Buffer>,
+}
+
+/// One row returned by `ServerStore.scan`.
+#[napi(object)]
+pub struct ServerStoreRow {
+    pub key: Buffer,
+    pub value: Buffer,
+}
+
+/// One durable server data directory: `.yyds` catalog, `.yykv` shard and lock.
+#[napi]
+pub struct ServerStore {
+    inner: Mutex<Option<postgres_client::ServerStore>>,
+}
+
+fn with_server_store<T>(
+    inner: &Mutex<Option<postgres_client::ServerStore>>,
+    run: impl FnOnce(&mut postgres_client::ServerStore) -> Result<T>,
+) -> Result<T> {
+    let mut guard = inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+    let store = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+    run(store)
+}
+
+#[napi]
+impl ServerStore {
+    /// Opens or creates the data directory and takes its lock.
+    #[napi(constructor)]
+    pub fn new(data_dir: String) -> Result<Self> {
+        postgres_client::ServerStore::open(&data_dir)
+            .map(|inner| Self { inner: Mutex::new(Some(inner)) })
+            .map_err(native)
+    }
+
+    /// Ordered prefix scan inside one namespace.
+    #[napi]
+    pub fn scan(
+        &self,
+        namespace: String,
+        prefix: Buffer,
+        after: Option<Buffer>,
+        before: Option<Buffer>,
+        limit: u32,
+    ) -> Result<Vec<ServerStoreRow>> {
+        with_server_store(&self.inner, |store| {
+            store
+                .scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize)
+                .map_err(native)
+        })
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| ServerStoreRow { key: Buffer::from(row.key), value: Buffer::from(row.value) })
+                .collect()
+        })
+    }
+
+    /// Applies one batch as a single durable atomic commit.
+    #[napi]
+    pub fn commit_changes(&self, changes: Vec<ServerStoreChange>) -> Result<()> {
+        let mut batch = Vec::with_capacity(changes.len());
+        for change in changes {
+            batch.push(match change.kind.as_str() {
+                "put" => postgres_client::ServerChange::Put {
+                    namespace: change.namespace,
+                    key: change.key.to_vec(),
+                    value: change
+                        .value
+                        .ok_or_else(|| Error::from_reason("put change carries no value"))?
+                        .to_vec(),
+                },
+                "delete" => {
+                    postgres_client::ServerChange::Delete { namespace: change.namespace, key: change.key.to_vec() }
+                }
+                other => return Err(Error::from_reason(format!("unknown server store change kind {other}"))),
+            });
+        }
+        with_server_store(&self.inner, |store| store.commit_changes(batch).map_err(native))
+    }
+
+    /// Releases the directory lock.
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+        if let Some(store) = guard.take() {
+            store.close().map_err(native)?;
+        }
+        Ok(())
+    }
+
+    /// Whether every commit survives process exit.
+    #[napi]
+    pub fn durable_atomic_commit(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(postgres_client::ServerStore::durable_atomic_commit))
+            .unwrap_or(false)
+    }
+
+    /// Data directory.
+    #[napi]
+    pub fn data_dir(&self) -> Result<String> {
+        with_server_store(&self.inner, |store| Ok(store.data_dir()))
+    }
+
+    /// `.yykv` shard path.
+    #[napi]
+    pub fn shard_path(&self) -> Result<String> {
+        with_server_store(&self.inner, |store| Ok(store.shard_path()))
+    }
+
+    /// `.yyds` catalog path.
+    #[napi]
+    pub fn catalog_path(&self) -> Result<String> {
+        with_server_store(&self.inner, |store| Ok(store.catalog_path()))
+    }
+
+    /// `postmaster.pid` lock path.
+    #[napi]
+    pub fn lock_path(&self) -> Result<String> {
+        with_server_store(&self.inner, |store| Ok(store.lock_path()))
+    }
+}

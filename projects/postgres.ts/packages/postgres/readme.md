@@ -1,9 +1,16 @@
-`@yydb/postgres` is the TypeScript surface for PostgreSQL protocol-v3 clients.
+`@yydb/postgres` is the TypeScript surface for PostgreSQL protocol-v3 clients,
+plus a protocol-v3 server that persists to `.yyds`/`.yykv`.
 
-This package contains no SQL engine. `query()` sends the statement text to the
-server at `host`/`port` and decodes the reply that server produces; in the test
-harness that server is PGlite. `.yyds`/`.yykv` (`Store`) is a separate key/value
-primitive and is not used by the SQL path.
+The client side contains no SQL engine. `query()` sends the statement text to
+the server at `host`/`port` and decodes the reply that server produces; in the
+client acceptance harness that server is PGlite.
+
+The server side does own a small engine, under `src/server/sql/`: a parser, a
+catalog projection, an executor and a storage adapter. `startPostgresServer({
+dataDir })` locks `dataDir` with `postmaster.pid`, opens one native
+`ServerStore` and answers DDL/DML plus the catalog SQL that `psql` uses for
+`\dt` and `\d`. One message runs its statements against one `Database` and then
+commits once, so a multi-statement simple query is all-or-nothing.
 
 The package owns no wire code of its own. `loadNative()` resolves the platform
 binding, `query()` opens and closes one connection around a single statement,

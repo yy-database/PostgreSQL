@@ -16,11 +16,12 @@ surfaces on top.
 - **Wire server.** `startPostgresServer` in
   `projects/postgres.ts/packages/postgres/src/server/` listens on TCP and speaks
   protocol v3 as the backend: startup, trust or cleartext-password
-  authentication, `SET`, `SHOW`, literal `SELECT` lists, `ErrorResponse` plus
-  `ReadyForQuery` on failure, and a clean `\q`. Frames are encoded in
-  `server/protocol.ts`, sessions and their GUC maps live in `server/server.ts`.
-  The server is TypeScript, not Rust, so the Rust side keeps no server main loop.
-  `postgres-server --port 5432` runs it.
+  authentication, `SET`, `SHOW`, DDL/DML, the catalog subset `psql` needs for
+  `\dt` and `\d`, and `ErrorResponse` plus `ReadyForQuery` on failure. Rows live
+  in `.yyds`/`.yykv` through the native `ServerStore` primitive; the SQL parser,
+  catalog projection and executor are TypeScript under `server/sql/`, so the
+  Rust side keeps no server main loop. `postgres-server --port 5432 --data-dir DIR`
+  runs it.
 - **Bindings and surfaces.** `postgres-napi`, `postgres-pyo3`, and the
   TypeScript and Python packages composed on top of them.
 - **`psql` surface.** Argument parsing and result rendering.
@@ -29,12 +30,20 @@ surfaces on top.
 
 ## What this repository does NOT implement
 
-There is no SQL parser, planner, executor or storage engine here. The server
-answers literal `SELECT` lists, `SET` and `SHOW` only; DDL and DML are the next
-batch. `Connection.execute(sql)` serialises the statement text and reads the
-reply. Types, casts, operators, command tags, error codes, transactions,
-`RETURNING` and catalog tables are still decided by the server on the other end
-of the socket.
+There is no planner and no general-purpose server engine. Batch 2 implements a
+parser, a catalog projection and an executor for the batch-2 surface only:
+`CREATE TABLE`/`DROP TABLE`, `INSERT`/`UPDATE`/`DELETE` with `RETURNING`, and the
+catalog SQL `psql` sends for `\dt` and `\d`. Types are `int2`/`int4`/`int8`/
+`float4`/`float8`/`bool`/`text`/`varchar(n)`/`char(n)`/`date`/`timestamp`/
+`timestamptz`/`uuid`; constraints are `NOT NULL`, literal `DEFAULT`,
+`PRIMARY KEY` and `UNIQUE`.
+
+Still missing: `numeric`, transactions, cursors, `ALTER`, views and indexes
+outside `PRIMARY KEY`/`UNIQUE`, and user-table `JOIN`/aggregate acceptance (they
+work incidentally where the catalog queries exercise them but are not gated).
+`Connection.execute(sql)` still serialises the statement text and reads the
+reply; the acceptance suites for the client surfaces keep talking to PGlite as
+their independent reference.
 
 The acceptance harness runs **PGlite 0.5.15** as that server:
 
@@ -60,54 +69,96 @@ implemented here:
   (`CREATE` vs `CREATE TABLE`) while our client decodes the full
   `CommandComplete` payload.
 
-SQL data never lands in `.yyds`/`.yykv`. PGlite keeps it in its in-memory
-database, or in its own PostgreSQL data directory when one is configured
-(`base/`, `global/`, `pg_wal/`, `PG_VERSION`, `postgresql.conf`). `Store` is an
-unrelated KV primitive: `local-0.yyds` and `local-0.yykv` are written only when
-a caller uses `Store` directly. `postgres-client` neither imports nor calls
-`Store`, so **SQL and the `.yyds`/`.yykv` store are not wired together**.
+The client-surface suites keep PGlite's SQL data in its own in-memory database;
+that is the oracle, not this repository's server. Inside `postgres-server` the
+SQL path does land in `.yyds`/`.yykv`: the catalog document lives under
+`pg_catalog/catalog` and every user relation under `pg_data.<relOid>`, written
+through `ServerStore.commitChanges`. The standalone `Store` primitive is
+unchanged and remains unrelated to the client suites.
 
-## Wire server (connectivity batch)
+## Wire server (batch 2)
 
-`postgres-server --port 5432` (or `startPostgresServer`) listens on TCP and
-speaks protocol v3 as the backend. It answers startup, `AuthenticationOk` for
-trust and `AuthenticationCleartextPassword` for `--password`, `SET`, `SHOW`,
-literal `SELECT` lists such as `SELECT 1`, and closes on `Terminate`. Every
-statement failure is `ErrorResponse` followed by `ReadyForQuery`, so the
-session survives.
+`postgres-server --port 5432 --data-dir DIR` (or `startPostgresServer`) listens
+on TCP and speaks protocol v3 as the backend. It answers startup,
+`AuthenticationOk` for trust and `AuthenticationCleartextPassword` for
+`--password`, `SET`, `SHOW`, `SELECT`, DDL/DML, and closes on `Terminate`. Every
+statement failure is `ErrorResponse` followed by `ReadyForQuery`, so the session
+survives.
 
-Evidence from a real `psql` 16.9 (`LC_MESSAGES=C`) against
-`postgres-server --port 55432`:
+Storage layout under `--data-dir`:
+
+- `postmaster.pid` is the lock. A second server started on the same directory
+  fails with `lock file "..." already exists: another server owns this data
+  directory` and never starts listening. A hard kill leaves the file behind,
+  exactly like PostgreSQL, so the operator removes it once the old process is
+  gone.
+- `local-0.yyds` holds the catalog document. `local-0.yykv` holds shards; the
+  catalog is `pg_catalog/catalog`, and each user relation is `pg_data.<relOid>`
+  with zero-padded row ids as keys.
+- One statement message opens one `Database`, runs its statements, then calls
+  `ServerStore.commitChanges` once. A multi-statement simple query therefore
+  behaves like one implicit transaction: either every statement becomes durable
+  or the whole batch is discarded. `RETURNING` rows are emitted only after the
+  commit succeeded.
+- `pg_catalog.*` is a pure projection of that single catalog document; there is
+  no second copy of table metadata.
+
+Two accepted limitations, recorded so the next change does not need a fresh
+investigation:
+
+1. **Whole-shard re-encode.** `FileShard::commit_changes` re-encodes the entire
+   shard on every commit. Splitting one shard per table is the planned fix.
+2. **One handle.** One `ServerStore` handle per process owns one data directory.
+   Concurrent writers are serialised by the native mutex instead of having a
+   shared page cache.
+
+Evidence from real `psql` 16.9 (`LC_MESSAGES=C`) against this server, compared
+byte for byte with a real PostgreSQL 16.9 instance holding the same schema
+(`CREATE TABLE t (id int PRIMARY KEY, name text DEFAULT 'x', code varchar(20))`):
 
 ```text
-$ psql -h 127.0.0.1 -p 55432 -U postgres -d postgres -c "SELECT 1"
- ?column?
-----------
-        1
+$ psql ... -c "\dt"
+ List of relations
+ Schema | Name | Type  |  Owner
+--------+------+-------+----------
+ public | t    | table | postgres
 (1 row)
 
-$ psql ... -c "SHOW server_version" -c "SET application_name = 'psql-batch-one'" -c "SHOW application_name"
- server_version
-----------------
- 16.9
-(1 row)
-
-SET
- application_name
-------------------
- psql-batch-one
-(1 row)
-
-$ psql ... -c "CREATE TABLE batch_one (a int)"
-ERROR:  feature not supported
-DETAIL:  statement is not implemented: CREATE TABLE batch_one (a int)
+$ psql ... -c "\d t"
+                         Table "public.t"
+ Column |         Type          | Collation | Nullable |  Default  
+--------+-----------------------+-----------+----------+-----------
+ id     | integer               |           | not null | 
+ name   | text                  |           |          | 'x'::text
+ code   | character varying(20) |           |          | 
+Indexes:
+    "t_pkey" PRIMARY KEY, btree (id)
 ```
 
-The harness `server` stage starts this server in-process and drives it with
-fixed wire bytes and the `pg` driver. When `PSQL_BIN` points at a real `psql`
-it also runs three `psql` cases and records their stdout and stderr verbatim.
-Authentication is checked both ways: a rejected password is `FATAL 28P01`
-without `ReadyForQuery`, an unknown database is `FATAL 3D000`.
+`Buffer.compare` on the two captured outputs returned `0` for `\dt`, `\d t`,
+`\d types` (13 types plus literal defaults) and `\d u` (`PRIMARY KEY` +
+`UNIQUE`). The 10 catalog statements `psql` emits are frozen in
+`packages/postgres-harness/fixtures/catalog-queries.json`; the `server` stage
+asserts each one parses, executes and returns the real row count, and compares
+the two `psql` transcripts with the captured real ones.
+
+SQLSTATE evidence through the `pg` driver: `22P02` invalid input syntax,
+`42703` unknown column, `42P01` unknown relation, `42P07` duplicate relation,
+`23502` not-null, `23505` duplicate key with `Key (id)=(2) already exists.`
+
+`numeric`, transactions, cursors and `ALTER` remain `0A000` + `DETAIL`.
+
+Build cost of bringing `database-storage` (and `vos`) into the native graph,
+measured once on this machine with clean release target directories:
+
+```text
+cargo build -p postgres-napi --release     43.4 s, 111 crates compiled
+cargo build -p database-storage --release  38.2 s,  86 crates compiled
+```
+
+So the storage dependency accounts for 86 of the 111 crates and about 38 of the
+43 seconds; the napi crate plus everything it had before is roughly the
+remaining 5 seconds and 25 crates.
 
 ## SQL compatibility gaps
 
@@ -270,27 +321,26 @@ pnpm test
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
 one shared corpus on both language surfaces. Floors: node 1203, python 1203,
-rust 58, consistency 396, server 14; TS and Python results must match case by
-case; `skipped` must stay 0. With `PSQL_BIN` set the `server` stage executes 17
-cases because the three `psql` cases join the run.
+rust 58, consistency 396, native 4, server 20; TS and Python results must match
+case by case; `skipped` must stay 0. With `PSQL_BIN` set the `server` stage
+executes 25 cases because the five `psql` cases join the run.
 
-## Wiring SQL onto this repository's storage (not started)
+## Wiring SQL onto this repository's storage (batch 2 landed)
 
-Two routes, neither implemented in this round:
+Route 2 was taken. Relation data and catalog metadata live in `.yyds`/`.yykv`,
+and the TypeScript server supplies the relational semantics:
 
-1. **Reuse the `database.rs` yydb/yyds gateway.** Run a protocol-v3 server in
-   front of the gateway and persist relations through `.yyds`/`.yykv`. Cost: the
-   gateway is a KV contract today, so relational semantics (catalog, visibility,
-   transaction boundaries, crash recovery) still have to be supplied; storage
-   format unchanged.
-2. **Build a minimal SQL engine here.** Parse, plan and execute into `.yykv`,
-   with catalog metadata in `.yyds`. Cost: type system, expression evaluation,
-   joins/aggregates, error catalogue and a durability story; higher up-front
-   cost, no external service.
+- `server/sql/parser.ts` turns statement text into AST nodes.
+- `server/sql/catalog.ts` treats one JSON catalog document as the single truth
+  and projects every `pg_catalog` relation from it.
+- `server/sql/engine.ts` executes SELECT, DDL and DML over that projection.
+- `server/sql/database.ts` reads and stages rows per relation and hands one
+  change batch to `ServerStore.commitChanges`.
 
-Either route must first change write granularity: `Store::put` rewrites the whole
-shard on every mutation (`store.rs` lines 317-327), which is not viable for
-per-statement SQL writes.
+Atomicity comes from `FileShard::commit_changes`, not from a second
+`commit_many` path on the standalone `Store`. The remaining write-granularity
+cost is that every commit re-encodes the whole shard; per-table shards are the
+planned fix.
 
 ## Commit messages
 

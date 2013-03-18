@@ -15,6 +15,8 @@ export type {
     PostgresNative,
     PreparedStatement,
     ServerErrorInfo,
+    ServerStore,
+    ServerStoreChange,
     StatementResult,
     Store,
     StoreRow,

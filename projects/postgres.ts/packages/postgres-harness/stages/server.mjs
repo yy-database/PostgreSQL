@@ -1,4 +1,7 @@
 import net from 'node:net';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 import pg from 'pg';
@@ -218,6 +221,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
 
     const trust = await startPostgresServer({});
     const password = await startPostgresServer({ auth: { password: 'batch1-secret' } });
+    const batch2 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch2-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -255,7 +259,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
 
         await check('error/unknown-statement', async () => {
             const wire = await openTrustSession(trust.host, trust.port);
-            const messages = await wire.query('CREATE TABLE batch_one (a int)');
+            const messages = await wire.query('ALTER TABLE batch_one ADD COLUMN a int');
             requireTags(messages, 'EZ');
             const error = onlyError(messages);
             assert(error.code === '0A000' && error.message === 'feature not supported', `error is ${error.code} ${error.message}`);
@@ -367,7 +371,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 await client.query("SET application_name = 'pg-batch-one'");
                 const show = await client.query('SHOW application_name');
                 assert(show.rows[0]?.application_name === 'pg-batch-one', `pg SHOW returned ${JSON.stringify(show.rows)}`);
-                const failure = await client.query('CREATE TABLE batch_one (a int)').then(
+                const failure = await client.query('ALTER TABLE batch_one ADD COLUMN a int').then(
                     () => null,
                     (error) => error,
                 );
@@ -408,13 +412,137 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             assert(error && error.code === '28P01', `pg rejection is ${error?.code}`);
         });
 
+        const withClient = async (server, body) => {
+            const client = new pg.Client({ host: server.host, port: server.port, user: 'postgres', database: 'postgres' });
+            await client.connect();
+            try {
+                return await body(client);
+            } finally {
+                await client.end();
+            }
+        };
+
+        await check('ddl/create-defaults', async () => {
+            await withClient(batch2, async (client) => {
+                const created = await client.query("CREATE TABLE t (id int PRIMARY KEY, name text DEFAULT 'x', code varchar(20))");
+                assert(created.command === 'CREATE', `command tag is ${created.command}`);
+                const inserted = await client.query('INSERT INTO t (id) VALUES (1), (2) RETURNING id, name, code');
+                assert(inserted.command === 'INSERT' && inserted.rowCount === 2, `INSERT is ${inserted.command}/${inserted.rowCount}`);
+                assert(
+                    JSON.stringify(inserted.rows) ===
+                        JSON.stringify([
+                            { id: 1, name: 'x', code: null },
+                            { id: 2, name: 'x', code: null },
+                        ]),
+                    `defaults are ${JSON.stringify(inserted.rows)}`,
+                );
+                const updated = await client.query("UPDATE t SET name = 'y' WHERE id = 2 RETURNING id, name");
+                assert(updated.command === 'UPDATE' && updated.rowCount === 1, `UPDATE is ${updated.command}/${updated.rowCount}`);
+                assert(updated.rows[0]?.name === 'y', 'UPDATE RETURNING');
+                const deleted = await client.query('DELETE FROM t WHERE id = 1');
+                assert(deleted.command === 'DELETE' && deleted.rowCount === 1, `DELETE is ${deleted.command}/${deleted.rowCount}`);
+            });
+        });
+
+        await check('ddl/error-codes', async () => {
+            await withClient(batch2, async (client) => {
+                const code = async (sql) => {
+                    try {
+                        await client.query(sql);
+                        return null;
+                    } catch (error) {
+                        return error.code;
+                    }
+                };
+                assert((await code("INSERT INTO t (id) VALUES ('bad')")) === '22P02', '22P02');
+                assert((await code('SELECT nope FROM t')) === '42703', '42703');
+                assert((await code('SELECT * FROM missing')) === '42P01', '42P01');
+                assert((await code('CREATE TABLE t (x int)')) === '42P07', '42P07');
+                assert((await code('INSERT INTO t (id) VALUES (NULL)')) === '23502', '23502');
+                const duplicate = await client.query('INSERT INTO t (id) VALUES (2)').then(
+                    () => null,
+                    (error) => error,
+                );
+                assert(duplicate?.code === '23505', `23505 is ${duplicate?.code}`);
+                assert(duplicate?.detail === 'Key (id)=(2) already exists.', `detail is ${duplicate?.detail}`);
+            });
+        });
+
+        await check('batch/atomic', async () => {
+            await withClient(batch2, async (client) => {
+                const failure = await client
+                    .query("INSERT INTO t (id, name) VALUES (3, 'c'); INSERT INTO t (id) VALUES ('bad')")
+                    .then(() => null, (error) => error);
+                assert(failure?.code === '22P02', `batch error is ${failure?.code}`);
+                const after = await client.query('SELECT id FROM t ORDER BY id');
+                assert(JSON.stringify(after.rows) === '[{"id":2}]', `rows after rollback are ${JSON.stringify(after.rows)}`);
+            });
+        });
+
+        await check('order/null-placement', async () => {
+            await withClient(batch2, async (client) => {
+                await client.query('CREATE TABLE n (v int, w int)');
+                await client.query('INSERT INTO n VALUES (1,2),(NULL,1),(2,1),(NULL,2)');
+                const asc = await client.query('SELECT v FROM n ORDER BY v');
+                assert(JSON.stringify(asc.rows) === '[{"v":1},{"v":2},{"v":null},{"v":null}]', `ASC ${JSON.stringify(asc.rows)}`);
+                const desc = await client.query('SELECT v FROM n ORDER BY v DESC');
+                assert(JSON.stringify(desc.rows) === '[{"v":null},{"v":null},{"v":2},{"v":1}]', `DESC ${JSON.stringify(desc.rows)}`);
+                const first = await client.query('SELECT v FROM n ORDER BY v NULLS FIRST');
+                assert(JSON.stringify(first.rows) === '[{"v":null},{"v":null},{"v":1},{"v":2}]', `NULLS FIRST ${JSON.stringify(first.rows)}`);
+                const last = await client.query('SELECT v,w FROM n ORDER BY v ASC, w DESC');
+                assert(
+                    JSON.stringify(last.rows) ===
+                        '[{"v":1,"w":2},{"v":2,"w":1},{"v":null,"w":2},{"v":null,"w":1}]',
+                    `multi-column ${JSON.stringify(last.rows)}`,
+                );
+                await client.query('DROP TABLE n');
+            });
+        });
+
+        await check('catalog/fixtures', async () => {
+            const fixture = JSON.parse(fs.readFileSync(path.join(harnessDir, 'fixtures', 'catalog-queries.json'), 'utf8'));
+            await withClient(batch2, async (client) => {
+                const oid = await client.query("SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relname = 't'");
+                assert(oid.rows.length === 1, `catalog lookup returned ${oid.rows.length} rows`);
+                const oidText = String(oid.rows[0].oid);
+                for (const item of fixture.cases) {
+                    const result = await client.query(item.sql.replaceAll('__OID__', oidText));
+                    assert(result.rowCount === item.rows, `${item.name}: ${result.rowCount} rows, expected ${item.rows}`);
+                }
+            });
+        });
+
+        await check('restart/persistence', async () => {
+            const persistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-persist-'));
+            let persist = await startPostgresServer({ dataDir: persistDir });
+            try {
+                await withClient(persist, async (client) => {
+                    await client.query('CREATE TABLE p (id int PRIMARY KEY, v text)');
+                    await client.query("INSERT INTO p VALUES (7, 'kept')");
+                });
+                await persist.close();
+                persist = await startPostgresServer({ dataDir: persistDir });
+                await withClient(persist, async (client) => {
+                    const rows = await client.query('SELECT id, v FROM p');
+                    assert(JSON.stringify(rows.rows) === '[{"id":7,"v":"kept"}]', `persisted rows are ${JSON.stringify(rows.rows)}`);
+                });
+                const locked = await startPostgresServer({ dataDir: persistDir }).then(
+                    () => null,
+                    (error) => error,
+                );
+                assert(locked !== null && /already exists/.test(locked.message), `lock error is ${locked?.message}`);
+            } finally {
+                await persist.close();
+            }
+        });
+
         const psql = process.env.PSQL_BIN;
         if (psql) {
-            const run = (sql, password = '') =>
+            const runOn = (server, sql, password = '') =>
                 new Promise((resolve, reject) => {
                     const child = spawn(
                         psql,
-                        ['-h', trust.host, '-p', String(trust.port), '-U', 'postgres', '-d', 'postgres', '-c', sql],
+                        ['-h', server.host, '-p', String(server.port), '-U', 'postgres', '-d', 'postgres', '-c', sql],
                         { env: { ...process.env, PGPASSWORD: password, LANG: 'C', LC_ALL: 'C', LC_MESSAGES: 'C' }, stdio: ['ignore', 'pipe', 'pipe'] },
                     );
                     let stdout = '';
@@ -428,6 +556,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                     child.once('error', reject);
                     child.once('close', (status) => resolve({ stdout, stderr, status: status ?? 1 }));
                 });
+            const run = (sql, password = '') => runOn(trust, sql, password);
 
             await check('psql/select-1', async () => {
                 const result = await run('SELECT 1');
@@ -445,12 +574,28 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
 
             await check('psql/error-then-recover', async () => {
-                const failure = await run('CREATE TABLE batch_one (a int)');
+                const failure = await run('ALTER TABLE batch_one ADD COLUMN a int');
                 assert(failure.status === 1, `psql exited ${failure.status}`);
                 assert(failure.stderr.includes('ERROR:') && failure.stderr.includes('feature not supported'), `psql stderr ${failure.stderr}`);
                 const recovery = await run('SELECT 1');
                 assert(recovery.status === 0, 'a second psql connection reaches the same server');
                 lines.push(`  psql stderr:\n${failure.stderr.trimEnd().replace(/^/gm, '    ')}`);
+            });
+
+            await check('psql/describe-dt', async () => {
+                const result = await runOn(batch2, '\\dt');
+                assert(result.status === 0, `psql exited ${result.status}: ${result.stderr}`);
+                const expected = fs.readFileSync(path.join(harnessDir, 'fixtures', 'psql-dt.txt'), 'utf8');
+                assert(result.stdout === expected, `psql \\dt differs from the real fixture:\n${result.stdout}`);
+                lines.push(`  \\dt matches pg16 fixture (${expected.length} bytes)`);
+            });
+
+            await check('psql/describe-d-t', async () => {
+                const result = await runOn(batch2, '\\d t');
+                assert(result.status === 0, `psql exited ${result.status}: ${result.stderr}`);
+                const expected = fs.readFileSync(path.join(harnessDir, 'fixtures', 'psql-d-t.txt'), 'utf8');
+                assert(result.stdout === expected, `psql \\d t differs from the real fixture:\n${result.stdout}`);
+                lines.push(`  \\d t matches pg16 fixture (${expected.length} bytes)`);
             });
         }
 
@@ -458,10 +603,11 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 14,
+            floor: 20,
         };
     } finally {
         await trust.close();
         await password.close();
+        await batch2.close();
     }
 }

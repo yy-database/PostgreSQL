@@ -1306,6 +1306,35 @@ def budget():
 check("store-stress/budget", budget)
 actual["store-stress"] = {"inserted": inserted, "prefixCount": len(pairs), "reopened": 1000}
 
+# -------------------------------------------------------------------------------
+# `ServerStore`: one data directory, one atomic batch, one lock.
+# -------------------------------------------------------------------------------
+server_root = os.path.join(STORE_ROOT, "server-store")
+shutil.rmtree(server_root, ignore_errors=True)
+os.makedirs(server_root, exist_ok=True)
+server_store = native.ServerStore(server_root)
+server_namespace = "pg_data.16384"
+server_store.commit_changes(
+    [
+        native.ServerStoreChange("put", server_namespace, b"0000000001", b"[1]"),
+        native.ServerStoreChange("put", server_namespace, b"0000000002", b"[2]"),
+    ]
+)
+batch_rows = server_store.scan(server_namespace, b"")
+expect_equal("server-store/batch", [read_text(row.key) for row in batch_rows], ["0000000001", "0000000002"])
+expect_equal("server-store/durable", server_store.durable_atomic_commit(), True)
+
+
+def second_handle():
+    native.ServerStore(server_root)
+
+
+expect_error("server-store/lock", second_handle)
+server_store.close()
+reopened = native.ServerStore(server_root)
+expect_equal("server-store/reopen", len(reopened.scan(server_namespace, b"")), 2)
+reopened.close()
+
 store_executed = counters["executed"]
 
 # -------------------------------------------------------------------------------

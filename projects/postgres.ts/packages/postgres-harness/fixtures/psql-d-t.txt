@@ -1,0 +1,9 @@
+                         Table "public.t"
+ Column |         Type          | Collation | Nullable |  Default  
+--------+-----------------------+-----------+----------+-----------
+ id     | integer               |           | not null | 
+ name   | text                  |           |          | 'x'::text
+ code   | character varying(20) |           |          | 
+Indexes:
+    "t_pkey" PRIMARY KEY, btree (id)
+
