@@ -7,7 +7,8 @@ import { randomInt } from 'node:crypto';
 import { loadNative, type ServerStore } from '../native.ts';
 import { ServerError } from './errors.ts';
 import { storageFor } from './store.ts';
-import { Database, type Storage } from './sql/database.ts';
+import { createSessionRuntime, Database, type SessionRuntime, type Storage } from './sql/database.ts';
+import type { TransactionStatement } from './sql/parser.ts';
 import { describeSelect, runStatement, type Field, type Outcome } from './sql/engine.ts';
 import { parseStatement } from './sql/parser.ts';
 import { TEXT, formatValue, typeLength, typeOid, type SqlValue } from './sql/types.ts';
@@ -23,6 +24,7 @@ import {
     emptyQueryResponse,
     errorResponse,
     noData,
+    noticeResponse,
     parameterDescription,
     parameterStatus,
     parseComplete,
@@ -197,6 +199,9 @@ class Session {
     private portals = new Map<string, { statement: string; parameters: (string | null)[]; described: boolean }>();
     private extendedFailed = false;
     private closing = false;
+    private readonly runtime: SessionRuntime = createSessionRuntime();
+    /** Set while an explicit `BEGIN` transaction is open, across messages. */
+    private transaction: { database: Database; savepoints: { name: string; state: Database }[]; aborted: boolean } | null = null;
 
     constructor(socket: net.Socket, options: PostgresServerOptions, storage: Storage) {
         this.socket = socket;
@@ -369,11 +374,11 @@ class Session {
             case 'P':
                 this.handleParse(payload);
                 return;
-            case 'B':
-                this.handleBind(payload);
-                return;
             case 'D':
                 this.handleDescribe(payload);
+                return;
+            case 'B':
+                this.handleBind(payload);
                 return;
             case 'E':
                 this.handleExecute(payload);
@@ -404,30 +409,187 @@ class Session {
         const statements = splitStatements(sql);
         if (statements.length === 0) {
             this.socket.write(emptyQueryResponse());
-            this.socket.write(readyForQuery('I'));
+            this.socket.write(readyForQuery(this.transactionStatus()));
             return;
         }
 
-        const database = Database.open(this.storage);
         const outcomes: Outcome[] = [];
+        let implicit: Database | null = null;
         try {
-            for (const statement of statements) outcomes.push(runSql(state, database, statement, []));
+            for (const statement of statements) {
+                // Only transaction control needs a parsed statement here; other
+                // statements go through `runSql`, which also owns `SET`/`SHOW`.
+                if (/^(?:begin|start|commit|end|rollback|abort|savepoint|release)\b/i.test(statement)) {
+                    const parsed = parseStatement(statement) as TransactionStatement;
+                    // `BEGIN` finishes any implicit work that came before it.
+                    if (parsed.command === 'begin' && implicit !== null) {
+                        implicit.commit();
+                        implicit = null;
+                    }
+                    outcomes.push(this.runTransaction(parsed));
+                    continue;
+                }
+                if (this.transaction?.aborted) {
+                    throw new ServerError('25P02', 'current transaction is aborted, commands ignored until end of transaction block');
+                }
+                if (this.transaction !== null) {
+                    const database = this.transaction.database;
+                    const before = database.clone();
+                    try {
+                        outcomes.push(runSql(state, database, statement, []));
+                    } catch (error) {
+                        database.restore(before);
+                        throw error;
+                    }
+                }
+                else {
+                    implicit ??= Database.open(this.storage, this.runtime);
+                    const before = implicit.clone();
+                    try {
+                        outcomes.push(runSql(state, implicit, statement, []));
+                    } catch (error) {
+                        implicit.restore(before);
+                        throw error;
+                    }
+                }
+            }
+            if (implicit !== null) implicit.commit();
         } catch (error) {
-            // Statements that already ran are reported, the whole batch is discarded.
+            // Statements that already ran are reported, the batch is discarded.
             for (const outcome of outcomes) this.emitOutcome(outcome);
+            if (this.transaction !== null) this.transaction.aborted = true;
             this.sendError(error);
-            this.socket.write(readyForQuery('I'));
-            return;
-        }
-        try {
-            database.commit();
-        } catch (error) {
-            this.sendError(error);
-            this.socket.write(readyForQuery('I'));
+            this.socket.write(readyForQuery(this.transactionStatus()));
             return;
         }
         for (const outcome of outcomes) this.emitOutcome(outcome);
-        this.socket.write(readyForQuery('I'));
+        this.socket.write(readyForQuery(this.transactionStatus()));
+    }
+
+    /** Status byte for `ReadyForQuery`: idle, in a transaction, or aborted. */
+    private transactionStatus(): 'I' | 'T' | 'E' {
+        if (this.transaction === null) return 'I';
+        return this.transaction.aborted ? 'E' : 'T';
+    }
+
+    private warn(code: string, message: string): void {
+        this.socket.write(noticeResponse({ severity: 'WARNING', code, message }));
+    }
+
+    /** Runs `BEGIN`/`COMMIT`/`ROLLBACK`/savepoint commands and returns their tag. */
+    private runTransaction(statement: TransactionStatement): Outcome {
+        switch (statement.command) {
+            case 'begin':
+                if (this.transaction !== null) {
+                    if (this.transaction.aborted) {
+                        throw new ServerError('25P02', 'current transaction is aborted, commands ignored until end of transaction block');
+                    }
+                    this.warn('25001', 'there is already a transaction in progress');
+                    return { kind: 'command', tag: 'BEGIN' };
+                }
+                this.transaction = { database: Database.open(this.storage, this.runtime), savepoints: [], aborted: false };
+                return { kind: 'command', tag: 'BEGIN' };
+            case 'commit':
+                if (this.transaction === null) {
+                    this.warn('25P01', 'there is no transaction in progress');
+                    return { kind: 'command', tag: 'COMMIT' };
+                }
+                if (this.transaction.aborted) {
+                    this.transaction = null;
+                    return { kind: 'command', tag: 'ROLLBACK' };
+                }
+                try {
+                    this.transaction.database.commit();
+                } finally {
+                    this.transaction = null;
+                }
+                return { kind: 'command', tag: 'COMMIT' };
+            case 'rollback':
+                if (this.transaction === null) {
+                    this.warn('25P01', 'there is no transaction in progress');
+                    return { kind: 'command', tag: 'ROLLBACK' };
+                }
+                this.transaction = null;
+                return { kind: 'command', tag: 'ROLLBACK' };
+            case 'savepoint': {
+                const name = statement.name ?? '';
+                if (this.transaction === null) {
+                    throw new ServerError('25P01', 'SAVEPOINT can only be used in transaction blocks');
+                }
+                if (this.transaction.aborted) {
+                    throw new ServerError('25P02', 'current transaction is aborted, commands ignored until end of transaction block');
+                }
+                this.transaction.savepoints.push({ name, state: this.transaction.database.clone() });
+                return { kind: 'command', tag: 'SAVEPOINT' };
+            }
+            case 'release': {
+                const name = statement.name ?? '';
+                if (this.transaction === null) {
+                    throw new ServerError('25P01', 'RELEASE SAVEPOINT can only be used in transaction blocks');
+                }
+                if (this.transaction.aborted) {
+                    throw new ServerError('25P02', 'current transaction is aborted, commands ignored until end of transaction block');
+                }
+                const index = this.findSavepoint(name);
+                if (index < 0) throw new ServerError('3B001', `savepoint "${name}" does not exist`);
+                this.transaction.savepoints.splice(index);
+                return { kind: 'command', tag: 'RELEASE' };
+            }
+            case 'rollback-to': {
+                const name = statement.name ?? '';
+                if (this.transaction === null) {
+                    throw new ServerError('25P01', 'ROLLBACK TO SAVEPOINT can only be used in transaction blocks');
+                }
+                const index = this.findSavepoint(name);
+                if (index < 0) throw new ServerError('3B001', `savepoint "${name}" does not exist`);
+                const saved = this.transaction.savepoints[index];
+                if (saved) this.transaction.database.restore(saved.state.clone());
+                this.transaction.savepoints.splice(index + 1);
+                this.transaction.aborted = false;
+                return { kind: 'command', tag: 'ROLLBACK' };
+            }
+        }
+    }
+
+    private findSavepoint(name: string): number {
+        if (this.transaction === null) return -1;
+        for (let index = this.transaction.savepoints.length - 1; index >= 0; index -= 1) {
+            if (this.transaction.savepoints[index]?.name === name) return index;
+        }
+        return -1;
+    }
+
+    /** Runs one extended-protocol statement, committing outside a transaction. */
+    private executeStatement(sql: string, parameters: SqlValue[]): Outcome {
+        const state = this.state;
+        if (!state) throw new ServerError('08006', 'session is not authenticated');
+        const trimmed = sql.trim();
+        if (/^(?:begin|start|commit|end|rollback|abort|savepoint|release)\b/i.test(trimmed)) {
+            return this.runTransaction(parseStatement(trimmed) as TransactionStatement);
+        }
+        if (this.transaction?.aborted) {
+            throw new ServerError('25P02', 'current transaction is aborted, commands ignored until end of transaction block');
+        }
+        if (this.transaction !== null) {
+            const database = this.transaction.database;
+            const before = database.clone();
+            try {
+                return runSql(state, database, sql, parameters);
+            } catch (error) {
+                database.restore(before);
+                throw error;
+            }
+        }
+        const database = Database.open(this.storage, this.runtime);
+        const before = database.clone();
+        try {
+            const outcome = runSql(state, database, sql, parameters);
+            database.commit();
+            return outcome;
+        } catch (error) {
+            database.restore(before);
+            throw error;
+        }
     }
 
     private handleParse(payload: Buffer): void {
@@ -522,7 +684,7 @@ class Session {
         const parsed = parseStatement(statement);
         if (parsed.kind !== 'select') return noData();
         const placeholders = Array.from({ length: parameterCount }, () => null);
-        const database = Database.open(this.storage);
+        const database = this.transaction?.database ?? Database.open(this.storage, this.runtime);
         return rowDescription(wireFields(describeSelect(database, parsed, placeholders)));
     }
 
@@ -538,9 +700,7 @@ class Session {
             if (!portal) throw new ServerError('34000', `portal "${portalName}" does not exist`);
             const prepared = this.prepared.get(portal.statement);
             if (!prepared) throw new ServerError('26000', `prepared statement "${portal.statement}" does not exist`);
-            const database = Database.open(this.storage);
-            const outcome = runSql(state, database, prepared.sql, portal.parameters);
-            database.commit();
+            const outcome = this.executeStatement(prepared.sql, portal.parameters);
             this.emitOutcome(outcome, portal.described);
         } catch (error) {
             this.sendExtendedError(error);
@@ -558,7 +718,7 @@ class Session {
     private handleSync(): void {
         this.extendedFailed = false;
         this.portals.delete('');
-        this.socket.write(readyForQuery('I'));
+        this.socket.write(readyForQuery(this.transactionStatus()));
     }
 
     private emitOutcome(outcome: Outcome, described = false): void {

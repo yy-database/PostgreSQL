@@ -1,0 +1,11 @@
+            List of relations
+ Schema |    Name     | Type  |  Owner   
+--------+-------------+-------+----------
+ public | b3_cascade  | table | postgres
+ public | b3_ck       | table | postgres
+ public | b3_num      | table | postgres
+ public | b3_p        | table | postgres
+ public | b3_restrict | table | postgres
+ public | b3_setnull  | table | postgres
+(6 rows)
+

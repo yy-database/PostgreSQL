@@ -80,6 +80,8 @@ export interface InExpr extends ExprBase {
     kind: 'in';
     expr: Expr;
     list: Expr[];
+    /** `IN (SELECT ...)`, exactly one of `list` and `select` is set. */
+    select: SelectStatement | undefined;
     negated: boolean;
 }
 
@@ -154,6 +156,12 @@ export interface RelationRef {
     schema: string | undefined;
     name: string;
     alias: string | undefined;
+    /** Present when the reference is a set-returning function call in `FROM`. */
+    args: Expr[] | undefined;
+    /** `WITH ORDINALITY` adds a trailing position column. */
+    ordinality?: boolean;
+    /** `AS alias(c1, c2, ...)` renames the function's output columns. */
+    columnAliases?: string[];
 }
 
 export interface SubqueryRef {
@@ -180,6 +188,8 @@ export interface SelectCore {
     groupBy: Expr[];
     having: Expr | undefined;
     distinct: boolean;
+    /** `VALUES (...), (...)` when the core is a values list instead of a SELECT. */
+    values: Expr[][] | undefined;
 }
 
 export interface SelectStatement {
@@ -215,6 +225,24 @@ export interface DeleteStatement {
     returning: Target[] | undefined;
 }
 
+/** `serial`-family pseudo types, resolved to `int2`/`int4`/`int8` by the parser. */
+export type SerialKind = 'small' | 'normal' | 'big';
+
+/** One `REFERENCES` clause: target relation, columns and referential actions. */
+export interface ReferenceClause {
+    table: RelationRef;
+    columns: string[] | undefined;
+    onDelete: 'a' | 'r' | 'c' | 'n' | 'd' | undefined;
+    onUpdate: 'a' | 'r' | 'c' | 'n' | 'd' | undefined;
+}
+
+export interface ColumnCheck {
+    name: string | undefined;
+    expr: Expr;
+    /** Source spelling of the expression, rendered by `pg_get_constraintdef`. */
+    source: string;
+}
+
 export interface ColumnDef {
     name: string;
     type: DataType;
@@ -222,12 +250,33 @@ export interface ColumnDef {
     defaultExpr: Expr | undefined;
     primaryKey: boolean;
     unique: boolean;
+    serial: SerialKind | undefined;
+    check: ColumnCheck | undefined;
+    references: ReferenceClause | undefined;
 }
 
-export interface TableConstraint {
+export interface PrimaryKeyConstraint {
     kind: 'primary' | 'unique';
+    name: string | undefined;
     columns: string[];
 }
+
+export interface CheckConstraint {
+    kind: 'check';
+    name: string | undefined;
+    expr: Expr;
+    source: string;
+    notValid: boolean;
+}
+
+export interface ForeignKeyConstraint {
+    kind: 'foreign';
+    name: string | undefined;
+    columns: string[];
+    reference: ReferenceClause;
+}
+
+export type TableConstraint = PrimaryKeyConstraint | CheckConstraint | ForeignKeyConstraint;
 
 export interface CreateTableStatement {
     kind: 'create-table';
@@ -241,6 +290,44 @@ export interface DropTableStatement {
     kind: 'drop-table';
     table: RelationRef;
     ifExists: boolean;
+    cascade: boolean;
+}
+
+export interface CreateIndexStatement {
+    kind: 'create-index';
+    name: string;
+    table: RelationRef;
+    unique: boolean;
+    ifNotExists: boolean;
+    method: string;
+    columns: string[];
+    where: Expr | undefined;
+    /** Source spelling of the predicate, rendered by `pg_get_indexdef`. */
+    whereSource: string | undefined;
+}
+
+export interface DropIndexStatement {
+    kind: 'drop-index';
+    name: string;
+    ifExists: boolean;
+    cascade: boolean;
+}
+
+export type AlterTableAction =
+    | { kind: 'add-check'; name: string | undefined; expr: Expr; source: string; notValid: boolean }
+    | { kind: 'add-foreign'; name: string | undefined; columns: string[]; reference: ReferenceClause }
+    | { kind: 'validate'; name: string };
+
+export interface AlterTableStatement {
+    kind: 'alter-table';
+    table: RelationRef;
+    action: AlterTableAction;
+}
+
+export interface TransactionStatement {
+    kind: 'transaction';
+    command: 'begin' | 'commit' | 'rollback' | 'savepoint' | 'release' | 'rollback-to';
+    name: string | undefined;
 }
 
 export type Statement =
@@ -249,7 +336,11 @@ export type Statement =
     | UpdateStatement
     | DeleteStatement
     | CreateTableStatement
-    | DropTableStatement;
+    | DropTableStatement
+    | CreateIndexStatement
+    | DropIndexStatement
+    | AlterTableStatement
+    | TransactionStatement;
 
 type TokenKind = 'ident' | 'qident' | 'number' | 'string' | 'param' | 'op' | 'punct' | 'eof';
 
@@ -263,17 +354,24 @@ interface Token {
 const MULTI_OPERATORS = ['!~*', '::', '<>', '<=', '>=', '!=', '!~', '||', '~*'];
 
 const RESERVED = new Set([
+    'ABORT',
+    'ACTION',
+    'ADD',
     'ALL',
+    'ALTER',
     'AND',
     'ANY',
     'AS',
     'ASC',
+    'BEGIN',
     'BETWEEN',
     'BY',
+    'CASCADE',
     'CASE',
     'CAST',
     'CHECK',
     'COLLATE',
+    'COMMIT',
     'CONSTRAINT',
     'CREATE',
     'CROSS',
@@ -287,6 +385,7 @@ const RESERVED = new Set([
     'EXCEPT',
     'EXISTS',
     'FALSE',
+    'FOREIGN',
     'FROM',
     'FULL',
     'GROUP',
@@ -294,6 +393,7 @@ const RESERVED = new Set([
     'IF',
     'ILIKE',
     'IN',
+    'INDEX',
     'INNER',
     'INSERT',
     'INTERSECT',
@@ -314,21 +414,30 @@ const RESERVED = new Set([
     'OUTER',
     'PRIMARY',
     'REFERENCES',
+    'RELEASE',
+    'RESTRICT',
     'RETURNING',
     'RIGHT',
+    'ROLLBACK',
+    'SAVEPOINT',
     'SELECT',
     'SET',
     'SOME',
+    'START',
     'TABLE',
     'THEN',
+    'TRANSACTION',
     'TRUE',
     'UNION',
     'UNIQUE',
     'UPDATE',
     'USING',
+    'VALID',
+    'VALIDATE',
     'VALUES',
     'WHEN',
     'WHERE',
+    'WORK',
 ]);
 
 function syntax(message: string, token: Token): ServerError {
@@ -466,11 +575,18 @@ class Lexer {
 }
 
 class Parser {
+    private readonly sql: string;
     private readonly tokens: Token[];
     private index = 0;
 
     constructor(sql: string) {
+        this.sql = sql;
         this.tokens = new Lexer(sql).tokens();
+    }
+
+    /** Source text of the tokens consumed since `start`, trimmed. */
+    private sourceSince(start: number): string {
+        return this.sql.slice(start, this.peek().start).trim();
     }
 
     parseStatement(): Statement {
@@ -482,6 +598,19 @@ class Parser {
         if (token.upper === 'DELETE') return this.parseDelete();
         if (token.upper === 'CREATE') return this.parseCreate();
         if (token.upper === 'DROP') return this.parseDrop();
+        if (token.upper === 'ALTER') return this.parseAlter();
+        if (token.upper === 'BEGIN' || token.upper === 'START') return this.parseBegin();
+        if (token.upper === 'COMMIT' || token.upper === 'END') return this.parseTransaction('commit');
+        if (token.upper === 'ROLLBACK' || token.upper === 'ABORT') return this.parseRollback();
+        if (token.upper === 'SAVEPOINT') {
+            this.next();
+            return { kind: 'transaction', command: 'savepoint', name: this.identifier() };
+        }
+        if (token.upper === 'RELEASE') {
+            this.next();
+            this.accept('SAVEPOINT');
+            return { kind: 'transaction', command: 'release', name: this.identifier() };
+        }
         throw new ServerError('0A000', 'feature not supported', `statement is not implemented: ${token.upper || 'end of input'}`);
     }
 
@@ -547,6 +676,25 @@ class Parser {
     }
 
     private parseSelectCore(): SelectCore {
+        if (this.at('VALUES')) {
+            this.next();
+            const values: Expr[][] = [];
+            do {
+                this.expect('(');
+                values.push(this.parseExprList());
+                this.expect(')');
+            } while (this.accept(','));
+            return {
+                kind: 'select',
+                targets: [],
+                from: [],
+                where: undefined,
+                groupBy: [],
+                having: undefined,
+                distinct: false,
+                values,
+            };
+        }
         this.expect('SELECT');
         const distinct = this.accept('DISTINCT');
         this.accept('ALL');
@@ -558,7 +706,7 @@ class Parser {
         const where = this.at('WHERE') ? (this.next(), this.parseExpr()) : undefined;
         const groupBy = this.at('GROUP') ? (this.next(), this.expect('BY'), this.parseExprList()) : [];
         const having = this.at('HAVING') ? (this.next(), this.parseExpr()) : undefined;
-        return { kind: 'select', targets, from, where, groupBy, having, distinct };
+        return { kind: 'select', targets, from, where, groupBy, having, distinct, values: undefined };
     }
 
     private parseTarget(): Target {
@@ -643,16 +791,41 @@ class Parser {
             // A set-returning function in FROM: parsed, but only executed when
             // the surrounding subquery itself runs.
             this.next();
-            if (!this.at(')')) this.parseExprList();
+            const args = this.at(')') ? [] : this.parseExprList();
             this.expect(')');
-            const alias = this.parseAlias();
+            let ordinality = false;
+            if (this.at('WITH')) {
+                this.next();
+                this.expect('ORDINALITY');
+                ordinality = true;
+            }
+            let alias: string | undefined;
+            let columnAliases: string[] | undefined;
+            if (this.at('AS')) {
+                this.next();
+                alias = this.identifier();
+            } else {
+                const next = this.peek();
+                if ((next.kind === 'ident' || next.kind === 'qident') && !RESERVED.has(next.upper)) {
+                    this.next();
+                    alias = next.kind === 'qident' ? next.value : next.value.toLowerCase();
+                }
+            }
+            if (alias !== undefined && this.at('(')) {
+                this.next();
+                columnAliases = [];
+                do {
+                    columnAliases.push(this.identifier());
+                } while (this.accept(','));
+                this.expect(')');
+            }
             const schema = names.length > 1 ? names[names.length - 2] : undefined;
-            return { kind: 'relation', schema, name: names[names.length - 1] ?? '', alias };
+            return { kind: 'relation', schema, name: names[names.length - 1] ?? '', alias, args, ordinality, columnAliases };
         }
         const alias = this.parseAlias();
         const schema = names.length > 1 ? names[names.length - 2] : undefined;
         const name = names[names.length - 1] ?? '';
-        return { kind: 'relation', schema, name, alias };
+        return { kind: 'relation', schema, name, alias, args: undefined };
     }
 
     private parseAlias(): string | undefined {
@@ -768,9 +941,15 @@ class Parser {
                 if (negated) this.next();
                 this.next();
                 this.expect('(');
+                if (this.at('SELECT') || this.at('VALUES')) {
+                    const select = this.parseSelect();
+                    this.expect(')');
+                    left = { kind: 'in', expr: left, list: [], select, negated } satisfies InExpr;
+                    continue;
+                }
                 const list = this.parseExprList();
                 this.expect(')');
-                left = { kind: 'in', expr: left, list, negated } satisfies InExpr;
+                left = { kind: 'in', expr: left, list, select: undefined, negated } satisfies InExpr;
                 continue;
             }
             if (this.at('LIKE') || this.at('ILIKE') || (this.at('NOT') && ['LIKE', 'ILIKE'].includes(this.peek(1).upper))) {
@@ -1067,6 +1246,7 @@ class Parser {
 
     private parseCreate(): Statement {
         this.expect('CREATE');
+        if (this.at('UNIQUE') || this.at('INDEX')) return this.parseCreateIndex();
         this.expect('TABLE');
         const ifNotExists = this.at('IF') ? (this.next(), this.expect('NOT'), this.expect('EXISTS'), true) : false;
         const table = this.parseRelationRef();
@@ -1074,6 +1254,11 @@ class Parser {
         const columns: ColumnDef[] = [];
         const constraints: TableConstraint[] = [];
         do {
+            let constraintName: string | undefined;
+            if (this.at('CONSTRAINT')) {
+                this.next();
+                constraintName = this.identifier();
+            }
             if (this.at('PRIMARY') || this.at('UNIQUE')) {
                 const kind = this.next().upper === 'PRIMARY' ? 'primary' : 'unique';
                 if (kind === 'primary') this.expect('KEY');
@@ -1083,24 +1268,96 @@ class Parser {
                     names.push(this.identifier());
                 } while (this.accept(','));
                 this.expect(')');
-                constraints.push({ kind, columns: names });
+                constraints.push({ kind, name: constraintName, columns: names });
                 continue;
             }
-            const column = this.parseColumnDef();
-            columns.push(column);
+            if (this.at('CHECK')) {
+                this.next();
+                this.expect('(');
+                const start = this.peek().start;
+                const expr = this.parseExpr();
+                const source = this.sourceSince(start);
+                this.expect(')');
+                constraints.push({ kind: 'check', name: constraintName, expr, source, notValid: this.parseNotValid() });
+                continue;
+            }
+            if (this.at('FOREIGN')) {
+                this.next();
+                this.expect('KEY');
+                this.expect('(');
+                const names: string[] = [];
+                do {
+                    names.push(this.identifier());
+                } while (this.accept(','));
+                this.expect(')');
+                this.expect('REFERENCES');
+                constraints.push({
+                    kind: 'foreign',
+                    name: constraintName,
+                    columns: names,
+                    reference: this.parseReferenceTail(),
+                });
+                continue;
+            }
+            if (constraintName !== undefined) throw syntax('syntax error: expected a table constraint', this.peek());
+            columns.push(this.parseColumnDef());
         } while (this.accept(','));
         this.expect(')');
         return { kind: 'create-table', table, ifNotExists, columns, constraints };
     }
 
+    private parseCreateIndex(): CreateIndexStatement {
+        const unique = this.accept('UNIQUE');
+        this.expect('INDEX');
+        const ifNotExists = this.at('IF') ? (this.next(), this.expect('NOT'), this.expect('EXISTS'), true) : false;
+        const name = this.identifier();
+        this.expect('ON');
+        const table = this.parseRelationRef();
+        let method = 'btree';
+        if (this.at('USING')) {
+            this.next();
+            method = this.identifier();
+        }
+        this.expect('(');
+        const columns: string[] = [];
+        do {
+            columns.push(this.identifier());
+            this.accept('ASC');
+            this.accept('DESC');
+        } while (this.accept(','));
+        this.expect(')');
+        let where: Expr | undefined;
+        let whereSource: string | undefined;
+        if (this.at('WHERE')) {
+            this.next();
+            const start = this.peek().start;
+            where = this.parseExpr();
+            whereSource = this.sourceSince(start);
+        }
+        return { kind: 'create-index', name, table, unique, ifNotExists, method, columns, where, whereSource };
+    }
+
     private parseColumnDef(): ColumnDef {
         const name = this.identifier();
+        const serialToken = this.peek().upper;
+        const serial: SerialKind | undefined =
+            serialToken === 'SERIAL' ? 'normal'
+                : serialToken === 'BIGSERIAL' ? 'big'
+                    : serialToken === 'SMALLSERIAL' ? 'small'
+                        : undefined;
         const type = this.parseTypeName();
         let notNull = false;
         let defaultExpr: Expr | undefined;
         let primaryKey = false;
         let unique = false;
+        let check: ColumnCheck | undefined;
+        let references: ReferenceClause | undefined;
         while (true) {
+            let constraintName: string | undefined;
+            if (this.at('CONSTRAINT')) {
+                this.next();
+                constraintName = this.identifier();
+            }
             if (this.at('NOT')) {
                 this.next();
                 this.expect('NULL');
@@ -1128,28 +1385,171 @@ class Parser {
                 unique = true;
                 continue;
             }
-            if (this.at('REFERENCES') || this.at('CHECK') || this.at('CONSTRAINT')) {
-                throw new ServerError('0A000', 'feature not supported', 'foreign keys and check constraints are not implemented');
+            if (this.at('CHECK')) {
+                this.next();
+                this.expect('(');
+                const start = this.peek().start;
+                const expr = this.parseExpr();
+                check = { name: constraintName, expr, source: this.sourceSince(start) };
+                this.expect(')');
+                continue;
             }
-            return { name, type, notNull, defaultExpr, primaryKey, unique };
+            if (this.at('REFERENCES')) {
+                this.next();
+                references = this.parseReferenceTail();
+                continue;
+            }
+            if (constraintName !== undefined) throw syntax('syntax error: expected a column constraint', this.peek());
+            return { name, type, notNull, defaultExpr, primaryKey, unique, serial, check, references };
         }
+    }
+
+    /** Parses everything after `REFERENCES`: target relation, columns and actions. */
+    private parseReferenceTail(): ReferenceClause {
+        const table = this.parseRelationRef();
+        let columns: string[] | undefined;
+        if (this.at('(')) {
+            this.next();
+            columns = [];
+            do {
+                columns.push(this.identifier());
+            } while (this.accept(','));
+            this.expect(')');
+        }
+        let onDelete: ReferenceClause['onDelete'];
+        let onUpdate: ReferenceClause['onUpdate'];
+        while (this.at('ON')) {
+            this.next();
+            if (this.accept('DELETE')) onDelete = this.parseReferenceAction();
+            else if (this.accept('UPDATE')) onUpdate = this.parseReferenceAction();
+            else throw syntax('syntax error: expected "DELETE" or "UPDATE"', this.peek());
+        }
+        return { table, columns, onDelete, onUpdate };
+    }
+
+    private parseReferenceAction(): 'a' | 'r' | 'c' | 'n' | 'd' {
+        if (this.accept('CASCADE')) return 'c';
+        if (this.accept('RESTRICT')) return 'r';
+        if (this.at('NO')) {
+            this.next();
+            this.expect('ACTION');
+            return 'a';
+        }
+        this.expect('SET');
+        if (this.accept('NULL')) return 'n';
+        this.expect('DEFAULT');
+        return 'd';
+    }
+
+    private parseNotValid(): boolean {
+        if (!this.at('NOT')) return false;
+        this.next();
+        this.expect('VALID');
+        return true;
+    }
+
+    private parseAlter(): Statement {
+        this.expect('ALTER');
+        this.expect('TABLE');
+        const table = this.parseRelationRef();
+        if (this.at('VALIDATE')) {
+            this.next();
+            this.expect('CONSTRAINT');
+            return { kind: 'alter-table', table, action: { kind: 'validate', name: this.identifier() } };
+        }
+        this.expect('ADD');
+        let name: string | undefined;
+        if (this.at('CONSTRAINT')) {
+            this.next();
+            name = this.identifier();
+        }
+        if (this.at('CHECK')) {
+            this.next();
+            this.expect('(');
+            const start = this.peek().start;
+            const expr = this.parseExpr();
+            const source = this.sourceSince(start);
+            this.expect(')');
+            return {
+                kind: 'alter-table',
+                table,
+                action: { kind: 'add-check', name, expr, source, notValid: this.parseNotValid() },
+            };
+        }
+        if (this.at('FOREIGN')) {
+            this.next();
+            this.expect('KEY');
+            this.expect('(');
+            const columns: string[] = [];
+            do {
+                columns.push(this.identifier());
+            } while (this.accept(','));
+            this.expect(')');
+            this.expect('REFERENCES');
+            return {
+                kind: 'alter-table',
+                table,
+                action: { kind: 'add-foreign', name, columns, reference: this.parseReferenceTail() },
+            };
+        }
+        throw new ServerError('0A000', 'feature not supported', 'only ADD CHECK, ADD FOREIGN KEY and VALIDATE CONSTRAINT are implemented');
+    }
+
+    private parseBegin(): TransactionStatement {
+        if (this.at('START')) {
+            this.next();
+            this.expect('TRANSACTION');
+        }
+        else {
+            this.next();
+            this.accept('WORK');
+            this.accept('TRANSACTION');
+        }
+        return { kind: 'transaction', command: 'begin', name: undefined };
+    }
+
+    private parseTransaction(command: 'commit'): TransactionStatement {
+        this.next();
+        this.accept('WORK');
+        this.accept('TRANSACTION');
+        return { kind: 'transaction', command, name: undefined };
+    }
+
+    private parseRollback(): TransactionStatement {
+        this.next();
+        if (this.at('TO')) {
+            this.next();
+            this.accept('SAVEPOINT');
+            return { kind: 'transaction', command: 'rollback-to', name: this.identifier() };
+        }
+        this.accept('WORK');
+        this.accept('TRANSACTION');
+        return { kind: 'transaction', command: 'rollback', name: undefined };
     }
 
     private parseDrop(): Statement {
         this.expect('DROP');
+        if (this.at('INDEX')) {
+            this.next();
+            const ifExists = this.at('IF') ? (this.next(), this.expect('EXISTS'), true) : false;
+            const name = this.identifier();
+            const cascade = this.accept('CASCADE');
+            this.accept('RESTRICT');
+            return { kind: 'drop-index', name, ifExists, cascade };
+        }
         this.expect('TABLE');
         const ifExists = this.at('IF') ? (this.next(), this.expect('EXISTS'), true) : false;
         const table = this.parseRelationRef();
-        this.accept('CASCADE');
+        const cascade = this.accept('CASCADE');
         this.accept('RESTRICT');
-        return { kind: 'drop-table', table, ifExists };
+        return { kind: 'drop-table', table, ifExists, cascade };
     }
 
     private parseRelationRef(): RelationRef {
         const names = this.parseNamePath();
         const schema = names.length > 1 ? names[names.length - 2] : undefined;
         const name = names[names.length - 1] ?? '';
-        return { kind: 'relation', schema, name, alias: undefined };
+        return { kind: 'relation', schema, name, alias: undefined, args: undefined };
     }
 }
 

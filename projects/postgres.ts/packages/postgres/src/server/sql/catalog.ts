@@ -3,7 +3,7 @@
 import { ServerError } from '../errors.ts';
 import { type DataType, type SqlValue, formatType, typeOf } from './types.ts';
 
-export const CATALOG_VERSION = 1;
+export const CATALOG_VERSION = 2;
 export const FIRST_USER_OID = 16384;
 
 export const SYSTEM_NAMESPACES = [
@@ -21,8 +21,8 @@ export interface UserRelation {
     oid: number;
     name: string;
     namespace: number;
-    /** `r` for a table, `i` for an index. */
-    relkind: 'r' | 'i';
+    /** `r` for a table, `i` for an index, `S` for a serial sequence. */
+    relkind: 'r' | 'i' | 'S';
     relam: number;
     owner: number;
     relhasindex: boolean;
@@ -39,6 +39,10 @@ export interface UserColumn {
     defaultText: string | null;
     /** Value `INSERT` uses when the column is omitted. */
     defaultValue: SqlValue;
+    /** `sequence` defaults are evaluated through `nextval` at insert time. */
+    defaultKind: 'value' | 'sequence' | null;
+    /** Sequence oid when `defaultKind` is `sequence`. */
+    sequenceOid: number | null;
     defaultOid: number | null;
 }
 
@@ -48,7 +52,10 @@ export interface UserIndex {
     relid: number;
     unique: boolean;
     primary: boolean;
+    method: string;
     indkey: number[];
+    /** Pretty predicate text of a partial index, or `null`. */
+    predicate: string | null;
     constraintOid: number | null;
 }
 
@@ -56,9 +63,25 @@ export interface UserConstraint {
     oid: number;
     name: string;
     relid: number;
-    contype: 'p' | 'u';
-    indexOid: number;
+    contype: 'p' | 'u' | 'c' | 'f';
+    indexOid: number | null;
     conkey: number[];
+    confrelid: number;
+    confkey: number[];
+    /** `a` no action, `r` restrict, `c` cascade, `n` set null, `d` set default. */
+    confupdtype: string;
+    confdeltype: string;
+    convalidated: boolean;
+    /** Pretty expression text for `CHECK`, or `null`. */
+    checkSource: string | null;
+}
+
+export interface UserSequence {
+    oid: number;
+    name: string;
+    /** Relation whose `serial` column owns this sequence. */
+    relid: number;
+    lastValue: number;
 }
 
 export interface CatalogDoc {
@@ -70,10 +93,20 @@ export interface CatalogDoc {
     columns: UserColumn[];
     indexes: UserIndex[];
     constraints: UserConstraint[];
+    sequences: UserSequence[];
 }
 
 export function emptyCatalog(): CatalogDoc {
-    return { version: CATALOG_VERSION, nextOid: FIRST_USER_OID, nextRowId: {}, relations: [], columns: [], indexes: [], constraints: [] };
+    return {
+        version: CATALOG_VERSION,
+        nextOid: FIRST_USER_OID,
+        nextRowId: {},
+        relations: [],
+        columns: [],
+        indexes: [],
+        constraints: [],
+        sequences: [],
+    };
 }
 
 export interface ColumnMeta {
@@ -148,6 +181,30 @@ const SYSTEM_RELATIONS: SystemRelation[] = [
         name: 'pg_namespace',
         oid: 2615,
         columns: columns(['oid', oid], ['nspname', name], ['nspowner', oid], ['nspacl', typeOf('text_array')]),
+    },
+    {
+        // Foreign keys are modelled as constraints only, so this catalog stays
+        // empty; psql still probes it whenever `relhastriggers` is set.
+        name: 'pg_trigger',
+        oid: 1269,
+        columns: columns(
+            ['oid', oid],
+            ['tgrelid', oid],
+            ['tgparentid', oid],
+            ['tgname', name],
+            ['tgfoid', oid],
+            ['tgtype', int2],
+            ['tgenabled', char],
+            ['tgisinternal', bool],
+            ['tgconstrrelid', oid],
+            ['tgconstrindid', oid],
+            ['tgconstraint', oid],
+            ['tgdeferrable', bool],
+            ['tginitdeferred', bool],
+            ['tgnargs', int2],
+            ['tgattr', typeOf('int2_array')],
+            ['tgargs', typeOf('text')],
+        ),
     },
     {
         name: 'pg_attribute',
@@ -415,6 +472,7 @@ const BUILTIN_TYPES: { oid: number; name: string; len: number; byval: boolean; c
     { oid: 26, name: 'oid', len: 4, byval: true, category: 'N', arrayOid: 1028, collation: 0 },
     { oid: 700, name: 'float4', len: 4, byval: true, category: 'N', arrayOid: 1021, collation: 0 },
     { oid: 701, name: 'float8', len: 8, byval: true, category: 'N', arrayOid: 1022, collation: 0 },
+    { oid: 1700, name: 'numeric', len: -1, byval: false, category: 'N', arrayOid: 1231, collation: 0 },
     { oid: 1042, name: 'bpchar', len: -1, byval: false, category: 'S', arrayOid: 1014, collation: 100 },
     { oid: 1043, name: 'varchar', len: -1, byval: false, category: 'S', arrayOid: 1015, collation: 100 },
     { oid: 1082, name: 'date', len: 4, byval: true, category: 'D', arrayOid: 1182, collation: 0 },
@@ -455,6 +513,8 @@ export function typeByOid(typeOidValue: number, typmod: number): DataType {
             return typeOf('float4');
         case 701:
             return typeOf('float8');
+        case 1700:
+            return typeOf('numeric', typmod);
         case 1042:
             return typeOf('bpchar', typmod);
         case 1043:
@@ -554,7 +614,15 @@ export function catalogTables(doc: CatalogDoc): Map<string, TableData> {
     });
 
     const classRow = (relation: UserRelation): Record<string, SqlValue> => {
-        const attributeCount = doc.columns.filter((column) => column.relid === relation.oid).length;
+        const attributeCount = relation.relkind === 'S'
+            ? 0
+            : doc.columns.filter((column) => column.relid === relation.oid).length;
+        const checkCount = doc.constraints.filter((constraint) => constraint.relid === relation.oid && constraint.contype === 'c').length;
+        // Foreign keys install internal triggers on both relations, so psql
+        // only asks for FK (and trigger) details when this flag is set.
+        const hasTriggers = doc.constraints.some(
+            (constraint) => constraint.contype === 'f' && (constraint.relid === relation.oid || constraint.confrelid === relation.oid),
+        );
         return {
             oid: relation.oid,
             relname: relation.name,
@@ -569,19 +637,19 @@ export function catalogTables(doc: CatalogDoc): Map<string, TableData> {
             reltuples: 0,
             relallvisible: 0,
             reltoastrelid: 0,
-            relhasindex: relation.relhasindex,
+            relhasindex: relation.relkind === 'r' ? doc.indexes.some((index) => index.relid === relation.oid) : false,
             relisshared: false,
             relpersistence: 'p',
             relkind: relation.relkind,
             relnatts: attributeCount,
-            relchecks: 0,
+            relchecks: checkCount,
             relhasrules: false,
-            relhastriggers: false,
+            relhastriggers: hasTriggers,
             relhassubclass: false,
             relrowsecurity: false,
             relforcerowsecurity: false,
             relispopulated: true,
-            relreplident: relation.relkind === 'i' ? 'n' : 'd',
+            relreplident: relation.relkind === 'r' ? 'd' : 'n',
             relispartition: false,
             relrewrite: 0,
             relfrozenxid: 0,
@@ -734,19 +802,21 @@ export function catalogTables(doc: CatalogDoc): Map<string, TableData> {
             contype: constraint.contype,
             condeferrable: false,
             condeferred: false,
-            convalidated: true,
+            convalidated: constraint.convalidated,
             conrelid: constraint.relid,
             contypid: 0,
-            conindid: constraint.indexOid,
+            conindid: constraint.indexOid ?? 0,
             conparentid: 0,
-            confrelid: 0,
-            confupdtype: ' ',
-            confdeltype: ' ',
+            confrelid: constraint.confrelid,
+            confupdtype: constraint.confupdtype,
+            confdeltype: constraint.confdeltype,
             confmatchtype: ' ',
             conislocal: true,
             coninhcount: 0,
             connoinherit: true,
             conkey: constraint.conkey.map(String).join(' '),
+            confkey: constraint.confkey.map(String).join(' '),
+            conbin: constraint.checkSource === null ? null : `(${constraint.checkSource})`,
         });
     }
 
@@ -801,24 +871,61 @@ export function pgGetExpr(bin: SqlValue): SqlValue {
     return bin;
 }
 
-/** `pg_get_indexdef(indexrelid, 0, true)`. */
-export function pgGetIndexDef(doc: CatalogDoc, indexOid: SqlValue): SqlValue {
+const REFERENCE_ACTIONS: Record<string, string> = {
+    a: 'NO ACTION',
+    r: 'RESTRICT',
+    c: 'CASCADE',
+    n: 'SET NULL',
+    d: 'SET DEFAULT',
+};
+
+/** `pg_get_indexdef(indexrelid, 0, pretty)`. */
+export function pgGetIndexDef(doc: CatalogDoc, indexOid: SqlValue, pretty = true): SqlValue {
     if (typeof indexOid !== 'number') return null;
     const index = doc.indexes.find((candidate) => candidate.oid === indexOid);
     const relation = index ? relationByOid(doc, index.relid) : undefined;
     if (!index || !relation) return null;
     const names = index.indkey.map((attnum) => doc.columns.find((column) => column.relid === index.relid && column.attnum === attnum)?.name ?? `attnum${attnum}`);
     const unique = index.unique ? 'UNIQUE ' : '';
-    return `CREATE ${unique}INDEX ${index.name} ON ${relation.name} USING btree (${names.join(', ')})`;
+    const table = pretty ? relation.name : `public.${relation.name}`;
+    const predicate = index.predicate === null ? '' : pretty ? ` WHERE ${index.predicate}` : ` WHERE (${index.predicate})`;
+    return `CREATE ${unique}INDEX ${index.name} ON ${table} USING ${index.method} (${names.join(', ')})${predicate}`;
 }
 
-/** `pg_get_constraintdef(oid, true)`. */
-export function pgGetConstraintDef(doc: CatalogDoc, constraintOid: SqlValue): SqlValue {
+function columnNames(doc: CatalogDoc, relid: number, attnums: number[]): string[] {
+    return attnums.map((attnum) => doc.columns.find((column) => column.relid === relid && column.attnum === attnum)?.name ?? `attnum${attnum}`);
+}
+
+/** `pg_get_constraintdef(oid, pretty)`. */
+export function pgGetConstraintDef(doc: CatalogDoc, constraintOid: SqlValue, pretty = true): SqlValue {
     if (typeof constraintOid !== 'number') return null;
     const constraint = doc.constraints.find((candidate) => candidate.oid === constraintOid);
     if (!constraint) return null;
-    const names = constraint.conkey.map((attnum) => doc.columns.find((column) => column.relid === constraint.relid && column.attnum === attnum)?.name ?? `attnum${attnum}`);
-    return `${constraint.contype === 'p' ? 'PRIMARY KEY' : 'UNIQUE'} (${names.join(', ')})`;
+    const names = columnNames(doc, constraint.relid, constraint.conkey);
+    switch (constraint.contype) {
+        case 'p':
+            return `PRIMARY KEY (${names.join(', ')})`;
+        case 'u':
+            return `UNIQUE (${names.join(', ')})`;
+        case 'c': {
+            const expression = constraint.checkSource ?? '';
+            const check = pretty ? `CHECK (${expression})` : `CHECK ((${expression}))`;
+            return constraint.convalidated ? check : `${check} NOT VALID`;
+        }
+        case 'f': {
+            const referenced = relationByOid(doc, constraint.confrelid);
+            const referencedNames = columnNames(doc, constraint.confrelid, constraint.confkey);
+            const target = `${referenced?.name ?? `oid${constraint.confrelid}`}(${referencedNames.join(', ')})`;
+            let definition = `FOREIGN KEY (${names.join(', ')}) REFERENCES ${target}`;
+            if (constraint.confupdtype !== ' ' && constraint.confupdtype !== 'a') {
+                definition += ` ON UPDATE ${REFERENCE_ACTIONS[constraint.confupdtype] ?? constraint.confupdtype}`;
+            }
+            if (constraint.confdeltype !== ' ' && constraint.confdeltype !== 'a') {
+                definition += ` ON DELETE ${REFERENCE_ACTIONS[constraint.confdeltype] ?? constraint.confdeltype}`;
+            }
+            return definition;
+        }
+    }
 }
 
 /** `format_type(oid, typmod)`. */

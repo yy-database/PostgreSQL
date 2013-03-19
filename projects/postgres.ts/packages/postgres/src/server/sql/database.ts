@@ -25,6 +25,8 @@ export interface Storage {
 const CATALOG_NAMESPACE = 'pg_catalog';
 const CATALOG_KEY = 'catalog';
 const DATA_NAMESPACE_PREFIX = 'pg_data.';
+/** Non-transactional `nextval` high-water marks, one key per sequence oid. */
+const SEQUENCE_STATE_NAMESPACE = 'pg_sequence_state';
 
 export function dataNamespace(relOid: number): string {
     return `${DATA_NAMESPACE_PREFIX}${relOid}`;
@@ -57,20 +59,52 @@ export function loadCatalog(storage: Storage): CatalogDoc {
  * one `commitChanges` call, so one message is either fully durable or not at
  * all.
  */
+/** Per-session state that outlives a single statement. */
+export interface SessionRuntime {
+    /** `lastval()` in this session, or `null` when no sequence was advanced. */
+    lastValue: number | null;
+    /** `currval()` per sequence oid in this session. */
+    lastBySequence: Map<number, number>;
+}
+
+export function createSessionRuntime(): SessionRuntime {
+    return { lastValue: null, lastBySequence: new Map() };
+}
+
 export class Database {
-    readonly catalog: CatalogDoc;
+    catalog: CatalogDoc;
+    readonly session: SessionRuntime;
     private readonly storage: Storage;
     private readonly tables = new Map<number, Map<string, SqlValue[]>>();
     private readonly writes = new Map<number, Map<string, SqlValue[] | null>>();
     private catalogDirty = false;
 
-    private constructor(storage: Storage, catalog: CatalogDoc) {
+    private constructor(storage: Storage, catalog: CatalogDoc, session: SessionRuntime) {
         this.storage = storage;
         this.catalog = catalog;
+        this.session = session;
     }
 
-    static open(storage: Storage): Database {
-        return new Database(storage, loadCatalog(storage));
+    static open(storage: Storage, session: SessionRuntime = createSessionRuntime()): Database {
+        const catalog = loadCatalog(storage);
+        // `nextval` survives statement rollback and separate sessions, so the
+        // journal below is authoritative whenever it is ahead of the catalog.
+        for (const stored of storage.scan(SEQUENCE_STATE_NAMESPACE)) {
+            const oid = Number(decode(stored.key));
+            const value = Number(decode(stored.value));
+            const sequence = catalog.sequences.find((candidate) => candidate.oid === oid);
+            if (sequence && Number.isFinite(value) && value > sequence.lastValue) sequence.lastValue = value;
+        }
+        return new Database(storage, catalog, session);
+    }
+
+    /** Copies the working set for `SAVEPOINT`/`ROLLBACK TO`; shares row arrays. */
+    clone(): Database {
+        const copy = new Database(this.storage, structuredClone(this.catalog), this.session);
+        for (const [relOid, rows] of this.tables) copy.tables.set(relOid, new Map(rows));
+        for (const [relOid, rows] of this.writes) copy.writes.set(relOid, new Map(rows));
+        copy.catalogDirty = this.catalogDirty;
+        return copy;
     }
 
     /** Rows of one user relation keyed by row id. */
@@ -122,7 +156,46 @@ export class Database {
         return created;
     }
 
-    /** Sends one statement's whole diff through the single commit boundary. */
+    /** Replaces the working set with another snapshot, used by rollback. */
+    restore(other: Database): void {
+        this.catalog = other.catalog;
+        this.tables.clear();
+        for (const [relOid, rows] of other.tables) this.tables.set(relOid, rows);
+        this.writes.clear();
+        for (const [relOid, rows] of other.writes) this.writes.set(relOid, rows);
+        this.catalogDirty = other.catalogDirty;
+        // Sequences are not transactional: a statement that fails still burns
+        // the values it handed out, exactly like `nextval` in PostgreSQL.
+        for (const sequence of this.catalog.sequences) {
+            const handed = this.session.lastBySequence.get(sequence.oid);
+            if (handed !== undefined && handed > sequence.lastValue) {
+                sequence.lastValue = handed;
+                this.catalogDirty = true;
+            }
+        }
+    }
+
+    /** Advances a sequence, remembering the value for `currval`/`lastval`. */
+    nextSequence(sequenceOid: number): number {
+        const sequence = this.catalog.sequences.find((candidate) => candidate.oid === sequenceOid);
+        if (!sequence) throw new ServerError('55000', 'sequence does not exist');
+        // A discarded working set (failed statement) must not rewind the
+        // counter: the session's highest handed-out value acts as a floor.
+        const handed = this.session.lastBySequence.get(sequenceOid);
+        const base = handed === undefined ? sequence.lastValue : Math.max(sequence.lastValue, handed);
+        sequence.lastValue = base + 1;
+        this.catalogDirty = true;
+        // Persist immediately: like PostgreSQL, a later rollback must not hand
+        // this value out again.
+        this.storage.commitChanges([
+            { kind: 'put', namespace: SEQUENCE_STATE_NAMESPACE, key: encode(String(sequenceOid)), value: encode(String(sequence.lastValue)) },
+        ]);
+        this.session.lastValue = sequence.lastValue;
+        this.session.lastBySequence.set(sequence.oid, sequence.lastValue);
+        return sequence.lastValue;
+    }
+
+    /** Sends one transaction's whole diff through the single commit boundary. */
     commit(): void {
         const changes: StoredChange[] = [];
         for (const [relOid, rows] of this.writes) {
@@ -149,5 +222,7 @@ export class Database {
         } catch (error) {
             throw new ServerError('58030', 'could not write to the data directory', error instanceof Error ? error.message : String(error));
         }
+        this.writes.clear();
+        this.catalogDirty = false;
     }
 }

@@ -1,0 +1,13 @@
+               Table "public.b3_ck"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ id     | integer |           | not null | 
+ v      | integer |           |          | 
+ w      | integer |           |          | 
+Indexes:
+    "b3_ck_pkey" PRIMARY KEY, btree (id)
+Check constraints:
+    "b3_ck_v_check" CHECK (v > 0)
+    "ck_nv" CHECK (v < 100) NOT VALID
+    "ck_w" CHECK (w < v)
+

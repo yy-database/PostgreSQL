@@ -1,0 +1,10 @@
+             Table "public.b3_cascade"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ id     | integer |           | not null | 
+ pid    | integer |           |          | 
+Indexes:
+    "b3_cascade_pkey" PRIMARY KEY, btree (id)
+Foreign-key constraints:
+    "b3_cascade_pid_fkey" FOREIGN KEY (pid) REFERENCES b3_p(id) ON DELETE CASCADE
+

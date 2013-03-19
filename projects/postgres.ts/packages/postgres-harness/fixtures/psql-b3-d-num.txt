@@ -1,0 +1,12 @@
+                               Table "public.b3_num"
+ Column |     Type      | Collation | Nullable |              Default               
+--------+---------------+-----------+----------+------------------------------------
+ id     | integer       |           | not null | nextval('b3_num_id_seq'::regclass)
+ amount | numeric(10,2) |           |          | 
+ qty    | numeric(5,0)  |           |          | 
+Indexes:
+    "b3_num_pkey" PRIMARY KEY, btree (id)
+    "b3_num_amount_idx" btree (amount)
+    "b3_num_partial" btree (amount) WHERE amount IS NOT NULL
+    "b3_num_qty_uniq" UNIQUE, btree (qty)
+

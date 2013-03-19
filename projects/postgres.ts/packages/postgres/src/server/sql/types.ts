@@ -12,6 +12,7 @@ export type TypeKey =
     | 'int8'
     | 'float4'
     | 'float8'
+    | 'numeric'
     | 'text'
     | 'varchar'
     | 'bpchar'
@@ -57,6 +58,7 @@ const TYPE_INFO: Record<TypeKey, TypeInfo> = {
     int8: { oid: 20, typlen: 8 },
     float4: { oid: 700, typlen: 4 },
     float8: { oid: 701, typlen: 8 },
+    numeric: { oid: 1700, typlen: -1 },
     text: { oid: 25, typlen: -1 },
     varchar: { oid: 1043, typlen: -1 },
     bpchar: { oid: 1042, typlen: -1 },
@@ -144,6 +146,12 @@ export function formatType(type: DataType): string {
             return 'real';
         case 'float8':
             return 'double precision';
+        case 'numeric':
+            if (type.typmod > 0) {
+                const { precision, scale } = numericPrecisionScale(type.typmod);
+                return `numeric(${precision},${scale})`;
+            }
+            return 'numeric';
         case 'text':
             return 'text';
         case 'varchar':
@@ -199,11 +207,24 @@ export function formatType(type: DataType): string {
     }
 }
 
+/** Encodes `numeric(p,s)` the way `atttypmod` stores it. */
+export function numericTypmod(precision: number, scale: number): number {
+    return ((precision << 16) | (scale & 0xffff)) + 4;
+}
+
+/** Decodes `numeric` precision and scale out of `atttypmod`. */
+export function numericPrecisionScale(typmod: number): { precision: number; scale: number } {
+    const raw = typmod - 4;
+    return { precision: (raw >> 16) & 0xffff, scale: raw & 0x7ff };
+}
+
 /** Resolves a type name, including its array suffix and modifier. */
 export function typeFromName(parts: string[], modifiers: number[]): DataType {
     const base = parts.map((part) => part.toLowerCase()).join(' ');
     const bare = parts[parts.length - 1]?.toLowerCase() ?? '';
-    const typmod = modifiers.length > 0 ? (modifiers[0] ?? -1) + 4 : -1;
+    const typmod = base === 'numeric' || base === 'decimal'
+        ? (modifiers.length > 0 ? numericTypmod(modifiers[0] ?? 1, modifiers[1] ?? 0) : -1)
+        : modifiers.length > 0 ? (modifiers[0] ?? -1) + 4 : -1;
     switch (base) {
         case 'smallint':
         case 'int2':
@@ -221,6 +242,18 @@ export function typeFromName(parts: string[], modifiers: number[]): DataType {
         case 'double precision':
         case 'float8':
             return typeOf('float8');
+        case 'numeric':
+        case 'decimal':
+            if (modifiers.length > 0 && ((modifiers[0] ?? 0) < 1 || (modifiers[0] ?? 0) > 1000)) {
+                throw new ServerError('22023', `NUMERIC precision ${modifiers[0]} must be between 1 and 1000`);
+            }
+            return typeOf('numeric', typmod);
+        case 'serial':
+            return typeOf('int4');
+        case 'bigserial':
+            return typeOf('int8');
+        case 'smallserial':
+            return typeOf('int2');
         case 'boolean':
         case 'bool':
             return typeOf('bool');
@@ -322,6 +355,71 @@ function uuidText(type: DataType, text: string): string {
     return trimmed;
 }
 
+interface DecimalParts {
+    magnitude: bigint;
+    scale: number;
+    negative: boolean;
+}
+
+/** Splits decimal text into an unsigned significand and a scale. */
+function decimalParts(text: string): DecimalParts | null {
+    const match = /^([+-]?)(\d+)?(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text.trim());
+    if (!match) return null;
+    const intDigits = match[2] ?? '';
+    const fracDigits = match[3] ?? '';
+    if (intDigits === '' && fracDigits === '') return null;
+    const exponent = match[4] === undefined ? 0 : Number(match[4]);
+    if (!Number.isFinite(exponent) || Math.abs(exponent) > 100_000) return null;
+    let digits = intDigits + fracDigits;
+    let scale = fracDigits.length - exponent;
+    if (scale < 0) {
+        digits += '0'.repeat(-scale);
+        scale = 0;
+    }
+    return { magnitude: digits.length === 0 ? 0n : BigInt(digits), scale, negative: match[1] === '-' };
+}
+
+function renderNumeric(sign: string, magnitude: bigint, scale: number): string {
+    const digits = magnitude.toString();
+    if (scale === 0) return `${magnitude === 0n ? '' : sign}${digits}`;
+    const padded = digits.padStart(scale + 1, '0');
+    const split = padded.length - scale;
+    return `${magnitude === 0n ? '' : sign}${padded.slice(0, split)}.${padded.slice(split)}`;
+}
+
+/**
+ * Normalizes a numeric literal, applying the column's precision and scale.
+ *
+ * Rounding is half away from zero, like PostgreSQL. A value that rounds to an
+ * absolute value of `10^precision` or more is a `22003` overflow.
+ */
+function numericText(type: DataType, text: string): string {
+    const parts = decimalParts(text);
+    if (!parts) throw invalid(type, text);
+    let { magnitude, scale } = parts;
+    if (type.typmod > 0) {
+        const { precision, scale: target } = numericPrecisionScale(type.typmod);
+        if (target >= scale) {
+            magnitude *= 10n ** BigInt(target - scale);
+        }
+        else {
+            const divisor = 10n ** BigInt(scale - target);
+            const remainder = magnitude % divisor;
+            magnitude /= divisor;
+            if (remainder * 2n >= divisor) magnitude += 1n;
+        }
+        scale = target;
+        if (magnitude >= 10n ** BigInt(precision)) {
+            throw new ServerError(
+                '22003',
+                'numeric field overflow',
+                `A field with precision ${precision}, scale ${target} must round to an absolute value less than 10^${precision - target}.`,
+            );
+        }
+    }
+    return renderNumeric(parts.negative ? '-' : '', magnitude, scale);
+}
+
 /** Parses one literal string into a value of `type`. */
 export function parseLiteral(text: string, type: DataType): SqlValue {
     switch (type.key) {
@@ -343,6 +441,8 @@ export function parseLiteral(text: string, type: DataType): SqlValue {
             return floatText(type, text);
         case 'float8':
             return floatText(type, text);
+        case 'numeric':
+            return numericText(type, text);
         case 'text':
             return text;
         case 'varchar':
@@ -421,5 +521,15 @@ export function compareValues(left: SqlValue, right: SqlValue): number {
     }
     const a = String(left);
     const b = String(right);
+    const leftDecimal = decimalParts(a);
+    const rightDecimal = decimalParts(b);
+    if (leftDecimal && rightDecimal) {
+        const scale = Math.max(leftDecimal.scale, rightDecimal.scale);
+        const magnitude = (parts: DecimalParts): bigint =>
+            (parts.negative ? -1n : 1n) * parts.magnitude * 10n ** BigInt(scale - parts.scale);
+        const leftValue = magnitude(leftDecimal);
+        const rightValue = magnitude(rightDecimal);
+        return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+    }
     return a < b ? -1 : a > b ? 1 : 0;
 }

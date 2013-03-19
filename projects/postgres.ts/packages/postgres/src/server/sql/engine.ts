@@ -18,32 +18,37 @@ import {
     typeByOid,
 } from './catalog.ts';
 import type { Database } from './database.ts';
-import type {
-    ArrayExpr,
-    AnyExpr,
-    BinaryExpr,
-    CaseExpr,
-    CastExpr,
-    ColumnDef,
-    ColumnExpr,
-    CreateTableStatement,
-    DeleteStatement,
-    DropTableStatement,
-    Expr,
-    FromItem,
-    FunctionExpr,
-    InExpr,
-    InsertStatement,
-    IsNullExpr,
-    OrderItem,
-    ParamExpr,
-    RelationRef,
-    SelectStatement,
-    Statement,
-    SubqueryExpr,
-    Target,
-    UnaryExpr,
-    UpdateStatement,
+import {
+    type ArrayExpr,
+    type AnyExpr,
+    type BinaryExpr,
+    type CaseExpr,
+    type CastExpr,
+    type ColumnDef,
+    type ColumnExpr,
+    type CreateIndexStatement,
+    type CreateTableStatement,
+    type DeleteStatement,
+    type DropIndexStatement,
+    type DropTableStatement,
+    type Expr,
+    type FromItem,
+    type FunctionExpr,
+    type InExpr,
+    type InsertStatement,
+    type IsNullExpr,
+    type OrderItem,
+    type ParamExpr,
+    type ReferenceClause,
+    type RelationRef,
+    type SelectStatement,
+    type Statement,
+    type SubqueryExpr,
+    type Target,
+    type AlterTableStatement,
+    type UnaryExpr,
+    type UpdateStatement,
+    parseExpression,
 } from './parser.ts';
 import {
     BOOL,
@@ -106,6 +111,14 @@ function emptyTagName(statement: Statement): string {
             return 'CREATE TABLE';
         case 'drop-table':
             return 'DROP TABLE';
+        case 'create-index':
+            return 'CREATE INDEX';
+        case 'drop-index':
+            return 'DROP INDEX';
+        case 'alter-table':
+            return 'ALTER TABLE';
+        case 'transaction':
+            return 'TRANSACTION';
     }
 }
 
@@ -126,6 +139,14 @@ export function runStatement(database: Database, statement: Statement, params: S
             return updateRows(database, statement, params);
         case 'delete':
             return deleteRows(database, statement, params);
+        case 'create-index':
+            return createIndex(database, statement);
+        case 'drop-index':
+            return dropIndex(database, statement);
+        case 'alter-table':
+            return alterTable(database, statement);
+        case 'transaction':
+            throw new ServerError('0A000', 'feature not supported', 'transaction control is handled by the session');
     }
     throw new ServerError('0A000', 'feature not supported', `${emptyTagName(statement)} is not implemented`);
 }
@@ -239,6 +260,16 @@ function executeCore(
     outer: Context | undefined,
     orderBy: OrderItem[],
 ): { fields: Field[]; entries: Entry[] } {
+    const valuesList = core.values;
+    if (valuesList) {
+        const width = valuesList[0]?.length ?? 0;
+        const fields: Field[] = Array.from({ length: width }, (_, index) => ({
+            name: `column${index + 1}`,
+            type: staticExprType(valuesList[0]?.[index] ?? { kind: 'literal', value: null, text: 'NULL' }) ?? TEXT,
+        }));
+        const entries = valuesList.map((row) => ({ values: row.map((expr) => evaluate(database, expr, emptyContext(), params)), keys: [] as SqlValue[] }));
+        return { fields, entries };
+    }
     const from = buildFrom(database, core.from, params, outer);
     const targets = expandTargets(database, core.targets, from.columns);
     const fields: Field[] = targets.map((target) => ({
@@ -362,6 +393,13 @@ function functionType(name: string): DataType {
             return BOOL;
         case 'generate_series':
             return INT4;
+        case 'nextval':
+        case 'lastval':
+        case 'currval':
+            return typeOf('int8');
+        case 'length':
+        case 'char_length':
+            return INT4;
         case 'count':
             return typeOf('int8');
         default:
@@ -423,13 +461,40 @@ function buildFrom(database: Database, from: FromItem[], params: SqlValue[], out
     if (from.length === 0) return { columns: [], rows: [[]] };
     let current = buildItem(database, from[0]!, params, outer);
     for (const item of from.slice(1)) {
+        if (item.kind === 'relation' && item.args !== undefined) {
+            // Set-returning functions may refer to earlier items (`LATERAL`),
+            // so build them once per left row and keep their column shape when
+            // the left side is empty.
+            const shape = current.rows.length === 0
+                ? functionColumns(item)
+                : buildRelation(database, item, params, { columns: current.columns, row: current.rows[0] ?? [], outer }).columns;
+            const rows: SqlValue[][] = [];
+            for (const leftRow of current.rows) {
+                const right = buildRelation(database, item, params, { columns: current.columns, row: leftRow, outer });
+                for (const rightRow of right.rows) rows.push([...leftRow, ...rightRow]);
+            }
+            current = { columns: [...current.columns, ...shape], rows };
+            continue;
+        }
         current = crossJoin(current, buildItem(database, item, params, outer));
     }
     return current;
 }
 
+/** Column shape of a `FROM` function, for when no left row exists to evaluate it. */
+function functionColumns(ref: RelationRef): Binding[] {
+    const alias = ref.alias ?? ref.name;
+    const names = ref.columnAliases;
+    const positional = ref.ordinality === true ? 2 : 1;
+    return Array.from({ length: Math.max(positional, names?.length ?? 0) }, (_, index) => ({
+        alias,
+        name: names?.[index] ?? (index === 1 ? 'ordinality' : ref.name),
+        type: index === 1 ? typeOf('int8') : TEXT,
+    }));
+}
+
 function buildItem(database: Database, item: FromItem, params: SqlValue[], outer: Context | undefined): RowSet {
-    if (item.kind === 'relation') return buildRelation(database, item);
+    if (item.kind === 'relation') return buildRelation(database, item, params);
     if (item.kind === 'subquery') {
         const result = executeSelect(database, item.select, params, outer);
         const alias = item.alias ?? '';
@@ -469,8 +534,18 @@ function crossJoin(left: RowSet, right: RowSet): RowSet {
     return { columns, rows };
 }
 
-function buildRelation(database: Database, ref: RelationRef): RowSet {
+function buildRelation(database: Database, ref: RelationRef, params: SqlValue[], context?: Context): RowSet {
     const alias = ref.alias ?? ref.name;
+    if (ref.args !== undefined) {
+        const lowered = ref.name.toLowerCase();
+        if (lowered === 'pg_partition_ancestors') {
+            const argument = ref.args[0] === undefined ? null : evaluate(database, ref.args[0], context ?? emptyContext(), params);
+            const columns = functionColumns(ref);
+            const values: SqlValue[] = ref.ordinality === true ? [argument, 1] : [argument];
+            return { columns, rows: argument === null ? [] : [values] };
+        }
+        throw new ServerError('42883', `function ${ref.name}(${ref.args.length} arguments) does not exist`);
+    }
     const system = ref.schema === 'pg_catalog' ? systemColumns(ref.name) : ref.schema === undefined ? systemColumns(ref.name) : undefined;
     if (system) {
         const table = catalogTables(database.catalog).get(ref.name);
@@ -529,8 +604,10 @@ function evaluate(database: Database, expr: Expr, context: Context, params: SqlV
             if (value === null) return null;
             let matched = false;
             let sawNull = false;
-            for (const item of node.list) {
-                const candidate = evaluate(database, item, context, params);
+            const candidates = node.select
+                ? executeSelect(database, node.select, params, context).rows.map((row) => row[0] ?? null)
+                : node.list.map((item) => evaluate(database, item, context, params));
+            for (const candidate of candidates) {
                 if (candidate === null) sawNull = true;
                 else if (compareValues(value, candidate) === 0) matched = true;
             }
@@ -737,13 +814,39 @@ function evaluateFunction(database: Database, expr: FunctionExpr, context: Conte
         case 'pg_get_expr':
             return pgGetExpr(args[0] ?? null);
         case 'pg_get_indexdef':
-            return pgGetIndexDef(database.catalog, args[0] ?? null);
+            return pgGetIndexDef(database.catalog, args[0] ?? null, args[2] === null ? true : args[2] !== false);
         case 'pg_get_constraintdef':
-            return pgGetConstraintDef(database.catalog, args[0] ?? null);
+            return pgGetConstraintDef(database.catalog, args[0] ?? null, args[1] === null ? true : args[1] !== false);
+        case 'nextval':
+            return nextval(database, args[0] ?? null);
+        case 'lastval': {
+            if (database.session.lastValue === null) {
+                throw new ServerError('55000', 'lastval is not yet defined in this session');
+            }
+            return database.session.lastValue;
+        }
+        case 'currval': {
+            const sequence = resolveSequence(database, args[0] ?? null);
+            const value = database.session.lastBySequence.get(sequence.oid);
+            if (value === undefined) {
+                throw new ServerError('55000', `currval of sequence "${sequence.name}" is not yet defined in this session`);
+            }
+            return value;
+        }
+        case 'length':
+        case 'char_length': {
+            const text = args[0];
+            if (text === null || text === undefined) return null;
+            const rendered = formatValue(text, TEXT);
+            return rendered === null ? null : rendered.length;
+        }
         case 'format_type':
             return formatTypeByOid(args[0] ?? null, args[1] ?? -1);
         case 'pg_get_statisticsobjdef_columns':
             return null;
+        case 'pg_partition_ancestors':
+            // Partition hierarchy is flat here, so a relation is its own ancestor.
+            return args[0] ?? null;
         case 'array_to_string': {
             const array = splitArray(args[0] ?? null);
             const separator = formatValue(args[1] ?? ',', TEXT) ?? ',';
@@ -771,6 +874,175 @@ function evaluateFunction(database: Database, expr: FunctionExpr, context: Conte
 
 const BTREE_OID = 403;
 
+function allocateOid(catalog: CatalogDoc): number {
+    const oid = catalog.nextOid;
+    catalog.nextOid += 1;
+    return oid;
+}
+
+function addSequence(catalog: CatalogDoc, tableOid: number, name: string): number {
+    const oid = allocateOid(catalog);
+    catalog.relations.push({
+        oid,
+        name,
+        namespace: PUBLIC_NAMESPACE,
+        relkind: 'S',
+        relam: 0,
+        owner: 10,
+        relhasindex: false,
+    });
+    catalog.sequences.push({ oid, name, relid: tableOid, lastValue: 0 });
+    return oid;
+}
+
+interface IndexRecordOptions {
+    name: string;
+    unique: boolean;
+    primary: boolean;
+    method?: string;
+    predicate?: string | null;
+    /** When set, a `p`/`u` constraint backed by this index is created too. */
+    constraintName?: string;
+}
+
+function addIndexRecord(database: Database, relid: number, attnums: number[], options: IndexRecordOptions): number {
+    const catalog = database.catalog;
+    if (catalog.relations.some((relation) => relation.name === options.name)) {
+        throw new ServerError('42P07', `relation "${options.name}" already exists`);
+    }
+    const indexOid = allocateOid(catalog);
+    let constraintOid: number | null = null;
+    if (options.constraintName !== undefined) {
+        constraintOid = allocateOid(catalog);
+        catalog.constraints.push({
+            oid: constraintOid,
+            name: options.constraintName,
+            relid,
+            contype: options.primary ? 'p' : 'u',
+            indexOid,
+            conkey: attnums,
+            confrelid: 0,
+            confkey: [],
+            confupdtype: ' ',
+            confdeltype: ' ',
+            convalidated: true,
+            checkSource: null,
+        });
+    }
+    catalog.relations.push({
+        oid: indexOid,
+        name: options.name,
+        namespace: PUBLIC_NAMESPACE,
+        relkind: 'i',
+        relam: BTREE_OID,
+        owner: 10,
+        relhasindex: false,
+    });
+    catalog.indexes.push({
+        oid: indexOid,
+        name: options.name,
+        relid,
+        unique: options.unique,
+        primary: options.primary,
+        method: options.method ?? 'btree',
+        indkey: attnums,
+        predicate: options.predicate ?? null,
+        constraintOid,
+    });
+    database.markCatalogDirty();
+    return indexOid;
+}
+
+function attnumsFor(catalog: CatalogDoc, relid: number, names: string[]): number[] {
+    return names.map((columnName) => {
+        const column = catalog.columns.find((candidate) => candidate.relid === relid && candidate.name === columnName);
+        if (!column) throw new ServerError('42703', `column "${columnName}" does not exist`);
+        return column.attnum;
+    });
+}
+
+function addCheckConstraint(
+    database: Database,
+    relid: number,
+    name: string,
+    source: string,
+    notValid: boolean,
+): void {
+    const catalog = database.catalog;
+    if (catalog.constraints.some((constraint) => constraint.relid === relid && constraint.name === name)) {
+        throw new ServerError('42710', `constraint "${name}" for relation already exists`);
+    }
+    catalog.constraints.push({
+        oid: allocateOid(catalog),
+        name,
+        relid,
+        contype: 'c',
+        indexOid: null,
+        conkey: [],
+        confrelid: 0,
+        confkey: [],
+        confupdtype: ' ',
+        confdeltype: ' ',
+        convalidated: !notValid,
+        checkSource: source,
+    });
+    database.markCatalogDirty();
+}
+
+/** Resolves the referenced columns of a foreign key, defaulting to the parent key. */
+function resolveReference(catalog: CatalogDoc, childRelid: number, reference: ReferenceClause): { confrelid: number; confkey: number[] } {
+    const parent = relationByName(catalog, reference.table.name);
+    if (!parent || parent.relkind !== 'r') {
+        throw new ServerError('42P01', `relation "${reference.table.name}" does not exist`);
+    }
+    if (reference.columns !== undefined) {
+        return { confrelid: parent.oid, confkey: attnumsFor(catalog, parent.oid, reference.columns) };
+    }
+    const primary = catalog.constraints.find((constraint) => constraint.relid === parent.oid && constraint.contype === 'p');
+    if (!primary) {
+        throw new ServerError(
+            '42830',
+            `there is no unique constraint matching given keys for referenced table "${parent.name}"`,
+        );
+    }
+    return { confrelid: parent.oid, confkey: [...primary.conkey] };
+}
+
+function addForeignKey(
+    database: Database,
+    relid: number,
+    tableName: string,
+    conkey: number[],
+    reference: ReferenceClause,
+    nameOverride: string | undefined,
+): void {
+    const catalog = database.catalog;
+    const resolved = resolveReference(catalog, relid, reference);
+    let name = nameOverride;
+    if (name === undefined) {
+        const names = conkey.map((attnum) => catalog.columns.find((column) => column.relid === relid && column.attnum === attnum)?.name ?? `attnum${attnum}`);
+        name = `${tableName}_${names.join('_')}_fkey`;
+    }
+    if (catalog.constraints.some((constraint) => constraint.relid === relid && constraint.name === name)) {
+        throw new ServerError('42710', `constraint "${name}" for relation already exists`);
+    }
+    catalog.constraints.push({
+        oid: allocateOid(catalog),
+        name,
+        relid,
+        contype: 'f',
+        indexOid: null,
+        conkey,
+        confrelid: resolved.confrelid,
+        confkey: resolved.confkey,
+        confupdtype: reference.onUpdate ?? ' ',
+        confdeltype: reference.onDelete ?? ' ',
+        convalidated: true,
+        checkSource: null,
+    });
+    database.markCatalogDirty();
+}
+
 function createTable(database: Database, statement: CreateTableStatement): Outcome {
     const catalog = database.catalog;
     if (statement.table.schema !== undefined && statement.table.schema !== 'public') {
@@ -787,9 +1059,11 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         if (names.has(column.name)) throw new ServerError('42701', `column "${column.name}" specified more than once`);
         names.add(column.name);
     }
+    if (statement.columns.some((column) => column.primaryKey) && statement.constraints.some((constraint) => constraint.kind === 'primary')) {
+        throw new ServerError('42P16', `multiple primary keys for table "${statement.table.name}" are not defined`);
+    }
 
-    const tableOid = catalog.nextOid;
-    catalog.nextOid += 1;
+    const tableOid = allocateOid(catalog);
     const relation = {
         oid: tableOid,
         name: statement.table.name,
@@ -800,23 +1074,46 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         relhasindex: false,
     };
 
-    const prepared: { column: ColumnDef; typeOid: number; typmod: number; defaultText: string | null; defaultValue: SqlValue }[] = [];
+    const prepared: {
+        column: ColumnDef;
+        typeOid: number;
+        typmod: number;
+        defaultText: string | null;
+        defaultValue: SqlValue;
+        defaultKind: 'value' | 'sequence' | null;
+        sequenceOid: number | null;
+    }[] = [];
     for (const column of statement.columns) {
-        const defaultValue = column.defaultExpr ? evaluate(database, column.defaultExpr, emptyContext(), []) : null;
-        const coerced = defaultValue === null ? null : coerce(defaultValue, column.type);
-        const defaultText = coerced === null ? null : renderDefault(coerced, column.type);
+        let defaultText: string | null = null;
+        let defaultValue: SqlValue = null;
+        let defaultKind: 'value' | 'sequence' | null = null;
+        let sequenceOid: number | null = null;
+        if (column.serial !== undefined) {
+            const sequenceName = `${statement.table.name}_${column.name}_seq`.slice(0, 63);
+            sequenceOid = addSequence(catalog, tableOid, sequenceName);
+            defaultText = `nextval('${sequenceName}'::regclass)`;
+            defaultKind = 'sequence';
+            column.notNull = true;
+        }
+        else if (column.defaultExpr !== undefined) {
+            defaultValue = coerce(evaluate(database, column.defaultExpr, emptyContext(), []), column.type);
+            defaultText = renderDefault(defaultValue, column.type);
+            defaultKind = 'value';
+        }
         prepared.push({
             column,
             typeOid: typeOid(column.type),
             typmod: column.type.typmod,
             defaultText,
-            defaultValue: coerced,
+            defaultValue,
+            defaultKind,
+            sequenceOid,
         });
     }
 
+    catalog.relations.push(relation);
     prepared.forEach((entry, index) => {
-        const defaultOid = entry.defaultText === null ? null : catalog.nextOid;
-        if (defaultOid !== null) catalog.nextOid += 1;
+        const defaultOid = entry.defaultText === null ? null : allocateOid(catalog);
         catalog.columns.push({
             relid: tableOid,
             attnum: index + 1,
@@ -826,89 +1123,187 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
             notNull: entry.column.notNull,
             defaultText: entry.defaultText,
             defaultValue: entry.defaultValue,
+            defaultKind: entry.defaultKind,
+            sequenceOid: entry.sequenceOid,
             defaultOid,
         });
     });
 
-    const primaryColumns = collectPrimaryColumns(statement);
-    const uniqueConstraints = collectUniqueConstraints(statement);
-    const constraintCount = (primaryColumns.length > 0 ? 1 : 0) + uniqueConstraints.length;
-    if (constraintCount > 0) relation.relhasindex = true;
-
-    for (const columns of uniqueConstraints) {
-        addIndex(database, tableOid, columns, false, statement.table.name, catalog);
+    // Column-level checks precede table constraints in `pg_constraint`, and
+    // that is the order PostgreSQL evaluates them in.
+    for (const column of statement.columns) {
+        if (!column.check) continue;
+        addCheckConstraint(
+            database,
+            tableOid,
+            column.check.name ?? `${statement.table.name}_${column.name}_check`,
+            column.check.source,
+            false,
+        );
     }
-    if (primaryColumns.length > 0) {
-        addIndex(database, tableOid, primaryColumns, true, statement.table.name, catalog);
-        for (const columnName of primaryColumns) {
-            const column = catalog.columns.find((candidate) => candidate.relid === tableOid && candidate.name === columnName);
-            if (column) column.notNull = true;
+
+    for (const constraint of statement.constraints) {
+        if (constraint.kind === 'primary' || constraint.kind === 'unique') {
+            const attnums = attnumsFor(catalog, tableOid, constraint.columns);
+            const primary = constraint.kind === 'primary';
+            const indexName = constraint.name ?? (primary
+                ? `${statement.table.name}_pkey`
+                : `${statement.table.name}_${constraint.columns.join('_')}_key`);
+            addIndexRecord(database, tableOid, attnums, {
+                name: indexName,
+                unique: true,
+                primary,
+                constraintName: indexName,
+            });
+            if (primary) {
+                for (const attnum of attnums) {
+                    const column = catalog.columns.find((candidate) => candidate.relid === tableOid && candidate.attnum === attnum);
+                    if (column) column.notNull = true;
+                }
+            }
+            continue;
+        }
+        if (constraint.kind === 'check') {
+            addCheckConstraint(
+                database,
+                tableOid,
+                constraint.name ?? `${statement.table.name}_check`,
+                constraint.source,
+                constraint.notValid,
+            );
+            continue;
+        }
+        if (constraint.kind === 'foreign') {
+            addForeignKey(
+                database,
+                tableOid,
+                statement.table.name,
+                attnumsFor(catalog, tableOid, constraint.columns),
+                constraint.reference,
+                constraint.name,
+            );
         }
     }
 
-    catalog.relations.push(relation);
+    for (const column of statement.columns) {
+        if (column.unique) {
+            const attnums = attnumsFor(catalog, tableOid, [column.name]);
+            addIndexRecord(database, tableOid, attnums, {
+                name: `${statement.table.name}_${column.name}_key`,
+                unique: true,
+                primary: false,
+                constraintName: `${statement.table.name}_${column.name}_key`,
+            });
+        }
+        if (column.primaryKey) {
+            addIndexRecord(database, tableOid, attnumsFor(catalog, tableOid, [column.name]), {
+                name: `${statement.table.name}_pkey`,
+                unique: true,
+                primary: true,
+                constraintName: `${statement.table.name}_pkey`,
+            });
+        }
+        if (column.references) {
+            addForeignKey(database, tableOid, statement.table.name, attnumsFor(catalog, tableOid, [column.name]), column.references, undefined);
+        }
+    }
+
     catalog.nextRowId[String(tableOid)] = 1;
     database.markCatalogDirty();
     return { kind: 'command', tag: 'CREATE TABLE' };
 }
 
-function collectPrimaryColumns(statement: CreateTableStatement): string[] {
-    const candidates = [
-        ...statement.columns.filter((column) => column.primaryKey).map((column) => [column.name]),
-        ...statement.constraints.filter((constraint) => constraint.kind === 'primary').map((constraint) => constraint.columns),
-    ];
-    if (candidates.length > 1) throw new ServerError('42P16', `multiple primary keys for table "${statement.table.name}" are not defined`);
-    return candidates[0] ?? [];
+function createIndex(database: Database, statement: CreateIndexStatement): Outcome {
+    const catalog = database.catalog;
+    if (statement.table.schema !== undefined && statement.table.schema !== 'public') {
+        throw new ServerError('3F000', `schema "${statement.table.schema}" does not exist`);
+    }
+    const relation = relationByName(catalog, statement.table.name);
+    if (!relation || relation.relkind !== 'r') throw new ServerError('42P01', `relation "${statement.table.name}" does not exist`);
+    if (statement.method.toLowerCase() !== 'btree') {
+        throw new ServerError('0A000', 'feature not supported', `access method "${statement.method}" is not implemented`);
+    }
+    if (catalog.relations.some((candidate) => candidate.name === statement.name)) {
+        if (statement.ifNotExists) return { kind: 'command', tag: 'CREATE INDEX' };
+        throw new ServerError('42P07', `relation "${statement.name}" already exists`);
+    }
+    const attnums = attnumsFor(catalog, relation.oid, statement.columns);
+    if (new Set(attnums).size !== attnums.length) {
+        throw new ServerError('42701', `column "${statement.columns[0]}" appears twice in the index definition`);
+    }
+    const predicate = statement.whereSource ?? null;
+    if (statement.unique) {
+        const parsed = statement.where ? statement.where : null;
+        const seen = new Set<string>();
+        for (const values of database.table(relation.oid).values()) {
+            if (parsed && evaluate(database, parsed, rowContext(relation, catalog, values), []) !== true) continue;
+            const key = attnums.map((attnum) => values[attnum - 1] ?? null);
+            if (key.some((value) => value === null)) continue;
+            const rendered = JSON.stringify(key.map((value) => formatValue(value, TEXT)));
+            if (seen.has(rendered)) {
+                const labels = attnums.map((attnum) => catalog.columns.find((column) => column.relid === relation.oid && column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
+                throw new ServerError(
+                    '23505',
+                    `could not create unique index "${statement.name}"`,
+                    `Key (${labels})=(${key.map((value) => formatValue(value, TEXT)).join(', ')}) is duplicated.`,
+                );
+            }
+            seen.add(rendered);
+        }
+    }
+    addIndexRecord(database, relation.oid, attnums, {
+        name: statement.name,
+        unique: statement.unique,
+        primary: false,
+        method: 'btree',
+        predicate,
+    });
+    return { kind: 'command', tag: 'CREATE INDEX' };
 }
 
-function collectUniqueConstraints(statement: CreateTableStatement): string[][] {
-    const result = statement.constraints.filter((constraint) => constraint.kind === 'unique').map((constraint) => constraint.columns);
-    for (const column of statement.columns) {
-        if (column.unique) result.push([column.name]);
-    }
-    return result;
-}
+function dropIndex(database: Database, statement: DropIndexStatement): Outcome {
 
-function addIndex(database: Database, relid: number, names: string[], primary: boolean, tableName: string, catalog: CatalogDoc): void {
-    const attnums: number[] = [];
-    for (const columnName of names) {
-        const column = catalog.columns.find((candidate) => candidate.relid === relid && candidate.name === columnName);
-        if (!column) throw new ServerError('42703', `column "${columnName}" does not exist`);
-        attnums.push(column.attnum);
+    const catalog = database.catalog;
+    const relation = catalog.relations.find((candidate) => candidate.name === statement.name && candidate.relkind === 'i');
+    if (!relation) {
+        if (statement.ifExists) return { kind: 'command', tag: 'DROP INDEX' };
+        throw new ServerError('42704', `index "${statement.name}" does not exist`);
     }
-    if (attnums.length === 0) return;
-    const indexOid = catalog.nextOid;
-    catalog.nextOid += 1;
-    const constraintOid = catalog.nextOid;
-    catalog.nextOid += 1;
-    const indexName = primary ? `${tableName}_pkey` : `${tableName}_${names.join('_')}_key`;
-    catalog.relations.push({
-        oid: indexOid,
-        name: indexName,
-        namespace: PUBLIC_NAMESPACE,
-        relkind: 'i',
-        relam: BTREE_OID,
-        owner: 10,
-        relhasindex: false,
-    });
-    catalog.indexes.push({
-        oid: indexOid,
-        name: indexName,
-        relid,
-        unique: true,
-        primary,
-        indkey: attnums,
-        constraintOid,
-    });
-    catalog.constraints.push({
-        oid: constraintOid,
-        name: indexName,
-        relid,
-        contype: primary ? 'p' : 'u',
-        indexOid,
-        conkey: attnums,
-    });
+    catalog.relations = catalog.relations.filter((candidate) => candidate.oid !== relation.oid);
+    catalog.indexes = catalog.indexes.filter((index) => index.oid !== relation.oid);
+    catalog.constraints = catalog.constraints.filter((constraint) => constraint.indexOid !== relation.oid);
     database.markCatalogDirty();
+    return { kind: 'command', tag: 'DROP INDEX' };
+}
+
+function alterTable(database: Database, statement: AlterTableStatement): Outcome {
+    const catalog = database.catalog;
+    const relation = relationByName(catalog, statement.table.name);
+    if (!relation || relation.relkind !== 'r') throw new ServerError('42P01', `relation "${statement.table.name}" does not exist`);
+    const action = statement.action;
+    if (action.kind === 'validate') {
+        const constraint = catalog.constraints.find((candidate) => candidate.relid === relation.oid && candidate.name === action.name);
+        if (!constraint) throw new ServerError('42704', `constraint "${action.name}" of relation "${relation.name}" does not exist`);
+        if (!constraint.convalidated) {
+            validateConstraint(database, relation, constraint);
+            constraint.convalidated = true;
+            database.markCatalogDirty();
+        }
+        return { kind: 'command', tag: 'ALTER TABLE' };
+    }
+    if (action.kind === 'add-check') {
+        const name = action.name ?? `${relation.name}_check`;
+        addCheckConstraint(database, relation.oid, name, action.source, action.notValid);
+        if (!action.notValid) {
+            validateCheck(database, relation, name, action.source);
+        }
+        return { kind: 'command', tag: 'ALTER TABLE' };
+    }
+    const conkey = attnumsFor(catalog, relation.oid, action.columns);
+    addForeignKey(database, relation.oid, relation.name, conkey, action.reference, action.name);
+    const name = action.name ?? `${relation.name}_${action.columns.join('_')}_fkey`;
+    validateForeignKeys(database, relation, name);
+    return { kind: 'command', tag: 'ALTER TABLE' };
 }
 
 function dropTable(database: Database, statement: DropTableStatement): Outcome {
@@ -919,11 +1314,21 @@ function dropTable(database: Database, statement: DropTableStatement): Outcome {
         throw new ServerError('42P01', `table "${statement.table.name}" does not exist`);
     }
     if (relation.relkind !== 'r') throw new ServerError('42P01', `table "${statement.table.name}" does not exist`);
+    const referencing = catalog.relations.filter((candidate) => catalog.constraints.some((constraint) => constraint.confrelid === relation.oid && constraint.contype === 'f' && constraint.relid === candidate.oid));
+    if (referencing.length > 0 && !statement.cascade) {
+        throw new ServerError(
+            '2BP01',
+            `cannot drop table "${relation.name}" because other objects depend on it`,
+            `Referenced by foreign key constraints on table(s) ${referencing.map((candidate) => `"${candidate.name}"`).join(', ')}.`,
+        );
+    }
     const indexOids = catalog.indexes.filter((index) => index.relid === relation.oid).map((index) => index.oid);
-    catalog.relations = catalog.relations.filter((candidate) => candidate.oid !== relation.oid && !indexOids.includes(candidate.oid));
+    const sequenceOids = catalog.sequences.filter((sequence) => sequence.relid === relation.oid).map((sequence) => sequence.oid);
+    catalog.relations = catalog.relations.filter((candidate) => candidate.oid !== relation.oid && !indexOids.includes(candidate.oid) && !sequenceOids.includes(candidate.oid));
     catalog.columns = catalog.columns.filter((column) => column.relid !== relation.oid);
     catalog.indexes = catalog.indexes.filter((index) => index.relid !== relation.oid);
-    catalog.constraints = catalog.constraints.filter((constraint) => constraint.relid !== relation.oid);
+    catalog.constraints = catalog.constraints.filter((constraint) => constraint.relid !== relation.oid && constraint.confrelid !== relation.oid);
+    catalog.sequences = catalog.sequences.filter((sequence) => sequence.relid !== relation.oid);
     delete catalog.nextRowId[String(relation.oid)];
     for (const key of [...database.table(relation.oid).keys()]) database.deleteRow(relation.oid, key);
     database.markCatalogDirty();
@@ -937,15 +1342,31 @@ function dropTable(database: Database, statement: DropTableStatement): Outcome {
 interface TableShape {
     oid: number;
     name: string;
-    columns: { attnum: number; name: string; type: DataType; notNull: boolean; defaultText: string | null; defaultValue: SqlValue }[];
-    uniqueIndexes: { name: string; attnums: number[] }[];
+    columns: {
+        attnum: number;
+        name: string;
+        type: DataType;
+        notNull: boolean;
+        defaultText: string | null;
+        defaultValue: SqlValue;
+        defaultKind: 'value' | 'sequence' | null;
+        sequenceOid: number | null;
+    }[];
+    uniqueIndexes: { name: string; attnums: number[]; predicate: Expr | null }[];
+    checks: { name: string; expr: Expr }[];
+    foreignKeys: {
+        name: string;
+        conkey: number[];
+        confrelid: number;
+        confkey: number[];
+        confupdtype: string;
+        confdeltype: string;
+    }[];
 }
 
-function tableShape(database: Database, ref: RelationRef): TableShape {
-    if (ref.schema !== undefined && ref.schema !== 'public') throw new ServerError('3F000', `schema "${ref.schema}" does not exist`);
-    const relation = relationByName(database.catalog, ref.name);
-    if (!relation || relation.relkind !== 'r') throw new ServerError('42P01', `relation "${ref.name}" does not exist`);
-    const columns = database.catalog.columns
+function shapeForRelation(database: Database, relation: { oid: number; name: string }): TableShape {
+    const catalog = database.catalog;
+    const columns = catalog.columns
         .filter((column) => column.relid === relation.oid)
         .sort((left, right) => left.attnum - right.attnum)
         .map((column) => ({
@@ -955,11 +1376,128 @@ function tableShape(database: Database, ref: RelationRef): TableShape {
             notNull: column.notNull,
             defaultText: column.defaultText,
             defaultValue: column.defaultValue,
+            defaultKind: column.defaultKind,
+            sequenceOid: column.sequenceOid,
         }));
-    const uniqueIndexes = database.catalog.indexes
+    const uniqueIndexes = catalog.indexes
         .filter((index) => index.relid === relation.oid && index.unique)
-        .map((index) => ({ name: index.name, attnums: index.indkey }));
-    return { oid: relation.oid, name: relation.name, columns, uniqueIndexes };
+        .map((index) => ({
+            name: index.name,
+            attnums: index.indkey,
+            predicate: index.predicate === null ? null : parseExpression(index.predicate),
+        }));
+    const checks = catalog.constraints
+        .filter((constraint) => constraint.relid === relation.oid && constraint.contype === 'c' && constraint.checkSource !== null)
+        .map((constraint) => ({ name: constraint.name, expr: parseExpression(constraint.checkSource ?? '') }));
+    const foreignKeys = catalog.constraints
+        .filter((constraint) => constraint.relid === relation.oid && constraint.contype === 'f')
+        .map((constraint) => ({
+            name: constraint.name,
+            conkey: constraint.conkey,
+            confrelid: constraint.confrelid,
+            confkey: constraint.confkey,
+            confupdtype: constraint.confupdtype,
+            confdeltype: constraint.confdeltype,
+        }));
+    return { oid: relation.oid, name: relation.name, columns, uniqueIndexes, checks, foreignKeys };
+}
+
+function shapeForOid(database: Database, oid: number): TableShape {
+    const relation = database.catalog.relations.find((candidate) => candidate.oid === oid && candidate.relkind === 'r');
+    if (!relation) throw new ServerError('42P01', `relation with OID ${oid} does not exist`);
+    return shapeForRelation(database, relation);
+}
+
+function tableShape(database: Database, ref: RelationRef): TableShape {
+    if (ref.schema !== undefined && ref.schema !== 'public') throw new ServerError('3F000', `schema "${ref.schema}" does not exist`);
+    const relation = relationByName(database.catalog, ref.name);
+    if (!relation || relation.relkind !== 'r') throw new ServerError('42P01', `relation "${ref.name}" does not exist`);
+    return shapeForRelation(database, relation);
+}
+
+function rowContext(shape: { oid: number; name: string }, catalog: CatalogDoc, values: SqlValue[]): Context {
+    const columns: Binding[] = catalog.columns
+        .filter((column) => column.relid === shape.oid)
+        .sort((left, right) => left.attnum - right.attnum)
+        .map((column) => ({ alias: shape.name, name: column.name, type: typeByOid(column.typeOid, column.typmod) }));
+    return { columns, row: values, outer: undefined };
+}
+
+function resolveSequence(database: Database, value: SqlValue): { oid: number; name: string } {
+    const catalog = database.catalog;
+    let sequence: { oid: number; name: string } | undefined;
+    if (typeof value === 'number') {
+        sequence = catalog.sequences.find((candidate) => candidate.oid === value);
+    }
+    else if (typeof value === 'string') {
+        const trimmed = value.trim();
+        const name = trimmed.includes('.') ? trimmed.slice(trimmed.lastIndexOf('.') + 1) : trimmed;
+        sequence = catalog.sequences.find((candidate) => candidate.name === name);
+    }
+    if (!sequence) {
+        throw new ServerError('42P01', `relation "${String(value ?? '')}" does not exist`);
+    }
+    return sequence;
+}
+
+function nextval(database: Database, value: SqlValue): number {
+    const sequence = resolveSequence(database, value);
+    return database.nextSequence(sequence.oid);
+}
+
+/** Evaluates a column default, advancing a sequence when the column is serial. */
+function columnDefault(database: Database, column: { defaultKind: 'value' | 'sequence' | null; sequenceOid: number | null; defaultValue: SqlValue }): SqlValue {
+    if (column.defaultKind === 'sequence' && column.sequenceOid !== null) {
+        return database.nextSequence(column.sequenceOid);
+    }
+    return column.defaultValue;
+}
+
+function renderRow(values: SqlValue[], shape: TableShape): string {
+    return values
+        .map((value, index) => {
+            const column = shape.columns[index];
+            if (value === null) return 'null';
+            return column ? formatValue(value, column.type) : String(value);
+        })
+        .join(', ');
+}
+
+function enforceChecks(database: Database, shape: TableShape, values: SqlValue[]): void {
+    for (const check of shape.checks) {
+        if (evaluate(database, check.expr, rowContext(shape, database.catalog, values), []) !== true) {
+            throw new ServerError(
+                '23514',
+                `new row for relation "${shape.name}" violates check constraint "${check.name}"`,
+                `Failing row contains (${renderRow(values, shape)}).`,
+            );
+        }
+    }
+}
+
+function parentHasKey(database: Database, fk: TableShape['foreignKeys'][number], key: SqlValue[]): boolean {
+    for (const values of database.table(fk.confrelid).values()) {
+        const existing = fk.confkey.map((attnum) => values[attnum - 1] ?? null);
+        if (existing.some((value) => value === null)) continue;
+        if (existing.every((value, position) => compareValues(value, key[position] ?? null) === 0)) return true;
+    }
+    return false;
+}
+
+function enforceForeignKeys(database: Database, shape: TableShape, values: SqlValue[]): void {
+    for (const fk of shape.foreignKeys) {
+        const key = fk.conkey.map((attnum) => values[attnum - 1] ?? null);
+        if (key.some((value) => value === null)) continue;
+        if (parentHasKey(database, fk, key)) continue;
+        const parent = database.catalog.relations.find((candidate) => candidate.oid === fk.confrelid);
+        const labels = fk.conkey.map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
+        const rendered = key.map((value) => (value === null ? 'null' : formatValue(value, TEXT))).join(', ');
+        throw new ServerError(
+            '23503',
+            `insert or update on table "${shape.name}" violates foreign key constraint "${fk.name}"`,
+            `Key (${labels})=(${rendered}) is not present in table "${parent?.name ?? fk.confrelid}".`,
+        );
+    }
 }
 
 function insertRows(database: Database, statement: InsertStatement, params: SqlValue[]): Outcome {
@@ -978,23 +1516,79 @@ function insertRows(database: Database, statement: InsertStatement, params: SqlV
             if (source.length > targetColumns.length) throw new ServerError('42601', 'INSERT has more expressions than target columns');
             if (source.length < targetColumns.length) throw new ServerError('42601', 'INSERT has more target columns than expressions');
         }
-        const values = shape.columns.map((column) => column.defaultValue ?? null);
+        const values: SqlValue[] = new Array(shape.columns.length).fill(null);
+        const provided = new Set<number>();
         source.forEach((expr, index) => {
             const column = targetColumns[index];
             if (!column) return;
-            const raw = expr.kind === 'default' ? column.defaultValue ?? null : evaluate(database, expr, emptyContext(), params);
+            provided.add(column.attnum);
+            const raw = expr.kind === 'default' ? columnDefault(database, column) : evaluate(database, expr, emptyContext(), params);
             values[column.attnum - 1] = coerce(raw, column.type);
         });
+        for (const column of shape.columns) {
+            if (!provided.has(column.attnum)) values[column.attnum - 1] = columnDefault(database, column);
+        }
         for (const column of shape.columns) {
             if (column.notNull && (values[column.attnum - 1] ?? null) === null) {
                 throw new ServerError('23502', `null value in column "${column.name}" of relation "${shape.name}" violates not-null constraint`);
             }
         }
+        enforceChecks(database, shape, values);
+        enforceForeignKeys(database, shape, values);
         const key = database.insertRow(shape.oid, values);
         inserted.push({ key, values });
         checkUnique(database, shape, values, new Set([key]));
     }
     return returningOutcome(database, statement.returning, shape, inserted, params, `INSERT 0 ${inserted.length}`);
+}
+
+function validateRowShape(database: Database, shape: TableShape, values: SqlValue[]): void {
+    for (const column of shape.columns) {
+        if (column.notNull && (values[column.attnum - 1] ?? null) === null) {
+            throw new ServerError('23502', `null value in column "${column.name}" of relation "${shape.name}" violates not-null constraint`);
+        }
+    }
+    enforceChecks(database, shape, values);
+    enforceForeignKeys(database, shape, values);
+}
+
+/** Applies `ON DELETE` actions when a referenced row goes away. */
+function removeRow(database: Database, shape: TableShape, key: string, values: SqlValue[], seen: Set<string>): void {
+    const marker = `${shape.oid}:${key}`;
+    if (seen.has(marker)) return;
+    seen.add(marker);
+    const catalog = database.catalog;
+    for (const constraint of catalog.constraints) {
+        if (constraint.contype !== 'f' || constraint.confrelid !== shape.oid) continue;
+        const child = shapeForOid(database, constraint.relid);
+        const parentKey = constraint.confkey.map((attnum) => values[attnum - 1] ?? null);
+        const matches = [...database.table(child.oid).entries()].filter(([, childValues]) =>
+            constraint.conkey.every((attnum, position) => compareValues(childValues[attnum - 1] ?? null, parentKey[position] ?? null) === 0),
+        );
+        if (matches.length === 0) continue;
+        if (constraint.confdeltype === 'c') {
+            for (const [childKey, childValues] of matches) removeRow(database, child, childKey, childValues, seen);
+            continue;
+        }
+        if (constraint.confdeltype === 'n') {
+            for (const [childKey, childValues] of matches) {
+                const next = [...childValues];
+                for (const attnum of constraint.conkey) next[attnum - 1] = null;
+                validateRowShape(database, child, next);
+                database.updateRow(child.oid, childKey, next);
+                checkUnique(database, child, next, new Set([childKey]));
+            }
+            continue;
+        }
+        const labels = constraint.confkey.map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
+        const rendered = parentKey.map((value) => (value === null ? 'null' : formatValue(value, TEXT))).join(', ');
+        throw new ServerError(
+            '23503',
+            `update or delete on table "${shape.name}" violates foreign key constraint "${constraint.name}" on table "${child.name}"`,
+            `Key (${labels})=(${rendered}) is still referenced from table "${child.name}".`,
+        );
+    }
+    database.deleteRow(shape.oid, key);
 }
 
 function updateRows(database: Database, statement: UpdateStatement, params: SqlValue[]): Outcome {
@@ -1016,16 +1610,64 @@ function updateRows(database: Database, statement: UpdateStatement, params: SqlV
             const column = shape.columns.find((candidate) => candidate.name === assignment.column)!;
             next[column.attnum - 1] = coerce(evaluate(database, assignment.value, context, params), column.type);
         }
-        for (const column of shape.columns) {
-            if (column.notNull && (next[column.attnum - 1] ?? null) === null) {
-                throw new ServerError('23502', `null value in column "${column.name}" of relation "${shape.name}" violates not-null constraint`);
-            }
-        }
+        validateRowShape(database, shape, next);
         updated.push({ key, values: next });
     }
     for (const row of updated) database.updateRow(shape.oid, row.key, row.values);
+    propagateParentUpdates(database, shape, updated, rows);
     for (const row of updated) checkUnique(database, shape, row.values, new Set([row.key]));
     return returningOutcome(database, statement.returning, shape, updated, params, `UPDATE ${updated.length}`);
+}
+
+/** Applies `ON UPDATE` actions for foreign keys that point at this table. */
+function propagateParentUpdates(
+    database: Database,
+    shape: TableShape,
+    updated: { key: string; values: SqlValue[] }[],
+    original: Map<string, SqlValue[]>,
+): void {
+    const catalog = database.catalog;
+    for (const constraint of catalog.constraints) {
+        if (constraint.contype !== 'f' || constraint.confrelid !== shape.oid) continue;
+        const child = shapeForOid(database, constraint.relid);
+        for (const row of updated) {
+            const before = original.get(row.key);
+            if (!before) continue;
+            const oldKey = constraint.confkey.map((attnum) => before[attnum - 1] ?? null);
+            const newKey = constraint.confkey.map((attnum) => row.values[attnum - 1] ?? null);
+            if (oldKey.every((value, position) => compareValues(value, newKey[position] ?? null) === 0)) continue;
+            const matches = [...database.table(child.oid).entries()].filter(([, childValues]) =>
+                constraint.conkey.every((attnum, position) => compareValues(childValues[attnum - 1] ?? null, oldKey[position] ?? null) === 0),
+            );
+            for (const [childKey, childValues] of matches) {
+                if (constraint.confupdtype === 'c') {
+                    const next = [...childValues];
+                    constraint.conkey.forEach((attnum, position) => {
+                        next[attnum - 1] = newKey[position] ?? null;
+                    });
+                    validateRowShape(database, child, next);
+                    database.updateRow(child.oid, childKey, next);
+                    checkUnique(database, child, next, new Set([childKey]));
+                    continue;
+                }
+                if (constraint.confupdtype === 'n') {
+                    const next = [...childValues];
+                    for (const attnum of constraint.conkey) next[attnum - 1] = null;
+                    validateRowShape(database, child, next);
+                    database.updateRow(child.oid, childKey, next);
+                    checkUnique(database, child, next, new Set([childKey]));
+                    continue;
+                }
+                const labels = constraint.confkey.map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
+                const rendered = oldKey.map((value) => (value === null ? 'null' : formatValue(value, TEXT))).join(', ');
+                throw new ServerError(
+                    '23503',
+                    `update or delete on table "${shape.name}" violates foreign key constraint "${constraint.name}" on table "${child.name}"`,
+                    `Key (${labels})=(${rendered}) is still referenced from table "${child.name}".`,
+                );
+            }
+        }
+    }
 }
 
 function deleteRows(database: Database, statement: DeleteStatement, params: SqlValue[]): Outcome {
@@ -1039,8 +1681,49 @@ function deleteRows(database: Database, statement: DeleteStatement, params: SqlV
         if (statement.where && evaluate(database, statement.where, context, params) !== true) continue;
         removed.push({ key, values });
     }
-    for (const row of removed) database.deleteRow(shape.oid, row.key);
+    const seen = new Set<string>();
+    for (const row of removed) removeRow(database, shape, row.key, row.values, seen);
     return returningOutcome(database, statement.returning, shape, removed, params, `DELETE ${removed.length}`);
+}
+
+/** Scans the relation and reports the first row that violates a check. */
+function validateCheck(database: Database, relation: { oid: number; name: string }, name: string, source: string): void {
+    const expr = parseExpression(source);
+    for (const values of database.table(relation.oid).values()) {
+        if (evaluate(database, expr, rowContext(relation, database.catalog, values), []) !== true) {
+            throw new ServerError(
+                '23514',
+                `check constraint "${name}" of relation "${relation.name}" is violated by some row`,
+            );
+        }
+    }
+}
+
+/** Scans the relation and reports the first row that violates a foreign key. */
+function validateForeignKeys(database: Database, relation: { oid: number; name: string }, name: string): void {
+    const constraint = database.catalog.constraints.find((candidate) => candidate.relid === relation.oid && candidate.contype === 'f' && candidate.name === name);
+    if (!constraint) return;
+    const shape = shapeForRelation(database, relation);
+    const fk = shape.foreignKeys.find((candidate) => candidate.name === name);
+    if (!fk) return;
+    for (const values of database.table(relation.oid).values()) {
+        const key = fk.conkey.map((attnum) => values[attnum - 1] ?? null);
+        if (key.some((value) => value === null)) continue;
+        if (parentHasKey(database, fk, key)) continue;
+        const parent = database.catalog.relations.find((candidate) => candidate.oid === fk.confrelid);
+        const labels = fk.conkey.map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
+        const rendered = key.map((value) => (value === null ? 'null' : formatValue(value, TEXT))).join(', ');
+        throw new ServerError(
+            '23503',
+            `insert or update on table "${relation.name}" violates foreign key constraint "${name}"`,
+            `Key (${labels})=(${rendered}) is not present in table "${parent?.name ?? fk.confrelid}".`,
+        );
+    }
+}
+
+function validateConstraint(database: Database, relation: { oid: number; name: string }, constraint: { name: string; contype: string; checkSource: string | null }): void {
+    if (constraint.contype === 'c') validateCheck(database, relation, constraint.name, constraint.checkSource ?? '');
+    else if (constraint.contype === 'f') validateForeignKeys(database, relation, constraint.name);
 }
 
 function returningOutcome(
@@ -1069,6 +1752,7 @@ function returningOutcome(
 function checkUnique(database: Database, shape: TableShape, values: SqlValue[], skipKeys: Set<string>): void {
     const rows = database.table(shape.oid);
     for (const index of shape.uniqueIndexes) {
+        if (index.predicate && evaluate(database, index.predicate, rowContext(shape, database.catalog, values), []) !== true) continue;
         const candidate = index.attnums.map((attnum) => values[attnum - 1] ?? null);
         if (candidate.some((value) => value === null)) continue;
         for (const [key, other] of rows) {

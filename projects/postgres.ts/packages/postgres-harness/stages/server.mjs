@@ -222,6 +222,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const trust = await startPostgresServer({});
     const password = await startPostgresServer({ auth: { password: 'batch1-secret' } });
     const batch2 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch2-')) });
+    const batch3 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch3-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -536,6 +537,14 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             }
         });
 
+        // Batch 3 fixtures: numeric/check/serial/foreign keys and indexes.
+        const setup = fs.readFileSync(path.join(harnessDir, 'fixtures', 'b3-setup.sql'), 'utf8');
+        await withClient(batch3, async (client) => {
+            for (const statement of setup.split(';').map((part) => part.trim()).filter((part) => part.length > 0)) {
+                await client.query(statement);
+            }
+        });
+
         const psql = process.env.PSQL_BIN;
         if (psql) {
             const runOn = (server, sql, password = '') =>
@@ -597,17 +606,193 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 assert(result.stdout === expected, `psql \\d t differs from the real fixture:\n${result.stdout}`);
                 lines.push(`  \\d t matches pg16 fixture (${expected.length} bytes)`);
             });
+
+            const describeB3 = (name, sql, fixture) =>
+                check(name, async () => {
+                    const result = await runOn(batch3, sql);
+                    assert(result.status === 0, `psql exited ${result.status}: ${result.stderr}`);
+                    const expected = fs.readFileSync(path.join(harnessDir, 'fixtures', fixture), 'utf8');
+                    assert(result.stdout === expected, `psql ${sql} differs from the real fixture:\n${result.stdout}`);
+                    lines.push(`  ${sql} matches pg16 fixture (${expected.length} bytes)`);
+                });
+
+            await describeB3('psql/b3-dt', '\\dt', 'psql-b3-dt.txt');
+            await describeB3('psql/b3-d-num', '\\d b3_num', 'psql-b3-d-num.txt');
+            await describeB3('psql/b3-d-ck', '\\d b3_ck', 'psql-b3-d-ck.txt');
+            await describeB3('psql/b3-d-cascade', '\\d b3_cascade', 'psql-b3-d-cascade.txt');
+            await describeB3('psql/b3-d-p', '\\d b3_p', 'psql-b3-d-p.txt');
         }
+
+        const capture = (promise) => promise.then(() => null, (error) => error);
+
+        await check('b3/numeric', async () => {
+            await withClient(batch3, async (client) => {
+                const rows = await client.query('SELECT id, amount, qty FROM b3_num ORDER BY id');
+                assert(
+                    JSON.stringify(rows.rows) === '[{"id":1,"amount":"1.50","qty":"2"},{"id":2,"amount":"-0.01","qty":"1000"}]',
+                    `numeric rows are ${JSON.stringify(rows.rows)}`,
+                );
+                const overflow = await capture(client.query('INSERT INTO b3_num (amount) VALUES (99999999.995)'));
+                assert(overflow?.code === '22003', `overflow code is ${overflow?.code}`);
+                assert(
+                    overflow.detail === 'A field with precision 10, scale 2 must round to an absolute value less than 10^8.',
+                    `overflow detail is ${overflow.detail}`,
+                );
+            });
+        });
+
+        await check('b3/check', async () => {
+            await withClient(batch3, async (client) => {
+                const columnCheck = await capture(client.query('INSERT INTO b3_ck VALUES (2, -1, 0)'));
+                assert(columnCheck?.code === '23514' && /b3_ck_v_check/.test(columnCheck.message), `column check is ${columnCheck?.message}`);
+                assert(columnCheck.detail === 'Failing row contains (2, -1, 0).', `column check detail is ${columnCheck.detail}`);
+                const notValid = await capture(client.query('INSERT INTO b3_ck VALUES (3, 150, 10)'));
+                assert(notValid?.code === '23514' && /ck_nv/.test(notValid.message), `NOT VALID check is ${notValid?.message}`);
+                const tableCheck = await capture(client.query('INSERT INTO b3_ck VALUES (4, 5, 6)'));
+                assert(tableCheck?.code === '23514' && /ck_w/.test(tableCheck.message), `table check is ${tableCheck?.message}`);
+                const validated = await client.query('ALTER TABLE b3_ck VALIDATE CONSTRAINT ck_nv');
+                assert(validated.command === 'ALTER', `validate returned ${validated.command}`);
+            });
+        });
+
+        await check('b3/serial', async () => {
+            await withClient(batch3, async (client) => {
+                const sequence = await client.query("SELECT nextval('b3_num_id_seq') AS next, lastval() AS last, currval('b3_num_id_seq') AS curr");
+                assert(JSON.stringify(sequence.rows) === '[{"next":"3","last":"3","curr":"3"}]', `sequence rows are ${JSON.stringify(sequence.rows)}`);
+                const inserted = await client.query('INSERT INTO b3_num (amount) VALUES (7.00) RETURNING id');
+                assert(JSON.stringify(inserted.rows) === '[{"id":4}]', `serial insert is ${JSON.stringify(inserted.rows)}`);
+            });
+        });
+
+        await check('b3/serial-burn', async () => {
+            await withClient(batch3, async (client) => {
+                const duplicate = await capture(client.query('INSERT INTO b3_num (amount, qty) VALUES (9.99, 2)'));
+                assert(duplicate?.code === '23505', `duplicate code is ${duplicate?.code}`);
+                assert(duplicate.detail === 'Key (qty)=(2) already exists.', `duplicate detail is ${duplicate.detail}`);
+            });
+            await withClient(batch3, async (client) => {
+                const rows = await client.query('INSERT INTO b3_num (amount, qty) VALUES (10.00, NULL), (11.00, NULL) RETURNING id');
+                assert(JSON.stringify(rows.rows) === '[{"id":6},{"id":7}]', `a failed insert must burn its sequence value, got ${JSON.stringify(rows.rows)}`);
+            });
+        });
+
+        await check('b3/foreign-keys', async () => {
+            await withClient(batch3, async (client) => {
+                const child = await capture(client.query('INSERT INTO b3_cascade VALUES (10, 99)'));
+                assert(child?.code === '23503' && /b3_cascade_pid_fkey/.test(child.message), `child FK is ${child?.message}`);
+                assert(child.detail === 'Key (pid)=(99) is not present in table "b3_p".', `child FK detail is ${child.detail}`);
+                await client.query('INSERT INTO b3_cascade VALUES (10, 1), (11, 2)');
+                await client.query('INSERT INTO b3_setnull VALUES (20, 1)');
+                await client.query('INSERT INTO b3_restrict VALUES (30, 1)');
+                const parent = await capture(client.query('DELETE FROM b3_p WHERE id = 1'));
+                assert(parent?.code === '23503' && /b3_restrict/.test(parent.message), `parent FK is ${parent?.message}`);
+                await client.query('DELETE FROM b3_restrict WHERE id = 30');
+                await client.query('DELETE FROM b3_p WHERE id = 1');
+                const cascaded = await client.query('SELECT id, pid FROM b3_cascade ORDER BY id');
+                assert(JSON.stringify(cascaded.rows) === '[{"id":11,"pid":2}]', `cascade rows are ${JSON.stringify(cascaded.rows)}`);
+                const nulled = await client.query('SELECT id, pid FROM b3_setnull');
+                assert(JSON.stringify(nulled.rows) === '[{"id":20,"pid":null}]', `set-null rows are ${JSON.stringify(nulled.rows)}`);
+            });
+        });
+
+        await check('b3/transactions', async () => {
+            await withClient(batch3, async (client) => {
+                await client.query('BEGIN');
+                await client.query('CREATE TABLE b3_tx (id int)');
+                await client.query('ROLLBACK');
+                const gone = await capture(client.query('SELECT * FROM b3_tx'));
+                assert(gone?.code === '42P01', `rolled back DDL still visible: ${gone?.code}`);
+                await client.query('BEGIN');
+                await client.query('SAVEPOINT s1');
+                await client.query('INSERT INTO b3_ck VALUES (8, 1, 0)');
+                await client.query('SAVEPOINT s2');
+                await client.query('INSERT INTO b3_ck VALUES (9, 2, 1)');
+                await client.query('ROLLBACK TO s2');
+                await client.query('INSERT INTO b3_ck VALUES (10, 3, 1)');
+                await client.query('RELEASE s2');
+                await client.query('COMMIT');
+                const kept = await client.query('SELECT id FROM b3_ck ORDER BY id');
+                assert(JSON.stringify(kept.rows) === '[{"id":1},{"id":8},{"id":10}]', `savepoint rows are ${JSON.stringify(kept.rows)}`);
+                await client.query('BEGIN');
+                const failed = await capture(client.query('SELECT * FROM b3_missing'));
+                assert(failed?.code === '42P01', `missing relation code is ${failed?.code}`);
+                const aborted = await capture(client.query('SELECT 1'));
+                assert(aborted?.code === '25P02', `aborted transaction code is ${aborted?.code}`);
+                await client.query('ROLLBACK');
+                await client.query('BEGIN');
+                const missing = await capture(client.query('ROLLBACK TO absent'));
+                assert(missing?.code === '3B001', `missing savepoint code is ${missing?.code}`);
+                await client.query('ROLLBACK');
+            });
+            if (process.env.PSQL_BIN) {
+                const warning = await new Promise((resolve, reject) => {
+                    const child = spawn(process.env.PSQL_BIN, ['-h', batch3.host, '-p', String(batch3.port), '-U', 'postgres', '-d', 'postgres', '-c', 'COMMIT'], {
+                        env: { ...process.env, LANG: 'C', LC_ALL: 'C', LC_MESSAGES: 'C' },
+                        stdio: ['ignore', 'pipe', 'pipe'],
+                    });
+                    let stderr = '';
+                    child.stderr.on('data', (chunk) => {
+                        stderr += chunk;
+                    });
+                    child.once('error', reject);
+                    child.once('close', () => resolve(stderr));
+                });
+                assert(warning.includes('WARNING:  there is no transaction in progress'), `COMMIT warning is ${warning}`);
+            }
+        });
+
+        await check('b3/indexes', async () => {
+            await withClient(batch3, async (client) => {
+                const dropped = await client.query('DROP INDEX b3_num_partial');
+                assert(dropped.command === 'DROP', `drop index returned ${dropped.command}`);
+                const gone = await client.query("SELECT relname FROM pg_class WHERE relname = 'b3_num_partial'");
+                assert(gone.rowCount === 0, `index catalog row survived the drop: ${JSON.stringify(gone.rows)}`);
+            });
+        });
+
+        await check('lock/concurrent-startup', async () => {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-lock-'));
+            const first = await startPostgresServer({ dataDir: dir });
+            const pidFile = path.join(dir, 'postmaster.pid');
+            try {
+                assert(fs.existsSync(pidFile), 'postmaster.pid must live in the data directory');
+                assert(fs.readFileSync(pidFile, 'utf8').trim().length > 0, 'postmaster.pid must record the lock holder');
+                const second = await capture(startPostgresServer({ dataDir: dir }));
+                assert(second !== null && /already exists/.test(second.message), `second startup is ${second?.message}`);
+            } finally {
+                await first.close();
+            }
+            assert(!fs.existsSync(pidFile), 'a clean shutdown removes postmaster.pid');
+        });
+
+        await check('lock/abnormal-exit', async () => {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-crash-'));
+            const bin = path.join(repositoryRoot, 'projects', 'postgres.ts', 'packages', 'postgres', 'bin', 'postgres-server.mjs');
+            const child = spawn(process.execPath, [bin, '--port', '0', '--data-dir', dir], { stdio: 'ignore' });
+            const pidFile = path.join(dir, 'postmaster.pid');
+            const deadline = Date.now() + 10_000;
+            while (!fs.existsSync(pidFile) && Date.now() < deadline) await new Promise((rest) => setTimeout(rest, 50));
+            assert(fs.existsSync(pidFile), 'a starting server writes postmaster.pid');
+            const holder = fs.readFileSync(pidFile, 'utf8').trim().split(/\s+/)[0];
+            assert(holder === String(child.pid), `postmaster.pid records ${holder}, child is ${child.pid}`);
+            const exited = new Promise((resolve) => child.once('exit', resolve));
+            child.kill('SIGKILL');
+            await exited;
+            assert(fs.existsSync(pidFile), 'a crashed server leaves postmaster.pid behind');
+            const restart = await capture(startPostgresServer({ dataDir: dir }));
+            assert(restart !== null && /already exists/.test(restart.message), `restart on a stale lock is ${restart?.message}`);
+        });
 
         return {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 20,
+            floor: 38,
         };
     } finally {
         await trust.close();
         await password.close();
         await batch2.close();
+        await batch3.close();
     }
 }
