@@ -1,0 +1,19 @@
+COPY 2
+   phase    | n 
+------------+---
+ after-copy | 5
+(1 row)
+
+COPY 1
+       phase       | n 
+-------------------+---
+ after-server-copy | 6
+(1 row)
+
+COPY 2
+ id |     name     |   note   
+----+--------------+----------
+ 12 | quoted,comma | say "hi"
+ 13 | empty        | NA
+(2 rows)
+

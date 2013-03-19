@@ -1,0 +1,2 @@
+psql:b5-copy-bad.sql:6: ERROR:  invalid input syntax for type integer: "xx"
+CONTEXT:  COPY b5_copy, line 3, column id: "xx"

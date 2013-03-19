@@ -1,0 +1,3 @@
+psql:b5-prepare.sql:8: ERROR:  prepared statement "p1" already exists
+psql:b5-prepare.sql:11: ERROR:  prepared statement "p9" does not exist
+psql:b5-prepare.sql:13: ERROR:  prepared statement "p1" does not exist

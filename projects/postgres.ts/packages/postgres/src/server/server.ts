@@ -8,10 +8,11 @@ import { loadNative, type ServerStore } from '../native.ts';
 import { ServerError } from './errors.ts';
 import { storageFor } from './store.ts';
 import { createSessionRuntime, Database, type SessionRuntime, type Storage } from './sql/database.ts';
-import type { TransactionStatement } from './sql/parser.ts';
+import { copyColumnCount, copyIn, copyOut } from './sql/copy.ts';
+import type { CopyStatement, CursorDirection, CursorStatement, PrepareStatement, Statement, TransactionStatement } from './sql/parser.ts';
+import { constantValue, parseStatement } from './sql/parser.ts';
 import { describeSelect, runStatement, type Field, type Outcome } from './sql/engine.ts';
-import { parseStatement } from './sql/parser.ts';
-import { TEXT, formatValue, typeLength, typeOid, type SqlValue } from './sql/types.ts';
+import { TEXT, formatValue, parseLiteral, typeLength, typeOid, type SqlValue, type DataType } from './sql/types.ts';
 import {
     authenticationCleartextPassword,
     authenticationOk,
@@ -19,12 +20,17 @@ import {
     bindComplete,
     closeComplete,
     commandComplete,
+    copyData,
+    copyDone,
+    copyInResponse,
+    copyOutResponse,
     cstring,
     dataRow,
     emptyQueryResponse,
     errorResponse,
     noData,
     noticeResponse,
+    notificationResponse,
     parameterDescription,
     parameterStatus,
     parseComplete,
@@ -152,26 +158,27 @@ export function splitStatements(sql: string): string[] {
     return statements.map((statement) => statement.trim()).filter((statement) => statement.length > 0);
 }
 
-/** Runs one statement: session GUCs first, then the SQL engine. */
-function runSql(state: SessionState, database: Database, sql: string, parameters: SqlValue[]): Outcome {
-    const statement = sql.trim();
+/** An engine result plus the streamed `COPY ... TO STDOUT` payload. */
+type ServerOutcome = Outcome | { kind: 'copy-out'; data: string; rows: number; columns: number };
 
-    const set = /^(?:set|set\s+session|set\s+local)\s+([a-z_][a-z0-9_.]*)\s*(?:=|to)\s*([\s\S]+)$/i.exec(statement);
-    if (set && set[1] !== undefined && set[2] !== undefined) {
-        const name = set[1].toLowerCase();
-        state.parameters.set(name, unquote(set[2]));
-        return { kind: 'command', tag: 'SET' };
-    }
+/** Sessions share one hub so `NOTIFY` reaches connections that `LISTEN`. */
+interface NotificationHub {
+    sessions: Set<Session>;
+}
 
-    const show = /^show\s+([a-z_][a-z0-9_.]*)$/i.exec(statement);
-    if (show && show[1] !== undefined) {
-        const name = show[1].toLowerCase();
-        const value = state.parameters.get(name);
-        if (value === undefined) throw new ServerError('42704', `unrecognized configuration parameter "${name}"`);
-        return { kind: 'rows', fields: [{ name, type: TEXT }], rows: [[value]], tag: 'SHOW' };
-    }
+interface CursorState {
+    fields: Field[];
+    rows: SqlValue[][];
+    /** `-1` before the first row, `rows.length` after the last row. */
+    index: number;
+    scroll: boolean;
+    hold: boolean;
+    inTransaction: boolean;
+}
 
-    return runStatement(database, parseStatement(statement), parameters);
+interface SqlPrepared {
+    statement: Statement;
+    types: DataType[];
 }
 
 /**
@@ -202,13 +209,31 @@ class Session {
     private readonly runtime: SessionRuntime = createSessionRuntime();
     /** Set while an explicit `BEGIN` transaction is open, across messages. */
     private transaction: { database: Database; savepoints: { name: string; state: Database }[]; aborted: boolean } | null = null;
+    private readonly hub: NotificationHub;
+    private readonly channels = new Set<string>();
+    /** `NOTIFY` payloads accumulated until the next commit. */
+    private pending: { channel: string; payload: string }[] = [];
+    private readonly cursors = new Map<string, CursorState>();
+    private readonly sqlPrepared = new Map<string, SqlPrepared>();
+    private copyState:
+        | {
+              statement: CopyStatement;
+              database: Database;
+              snapshot: Database;
+              statements: string[];
+              nextIndex: number;
+              chunks: Buffer[];
+          }
+        | null = null;
 
-    constructor(socket: net.Socket, options: PostgresServerOptions, storage: Storage) {
+    constructor(socket: net.Socket, options: PostgresServerOptions, storage: Storage, hub: NotificationHub) {
         this.socket = socket;
         this.user = options.user ?? 'postgres';
         this.database = options.database ?? 'postgres';
         this.auth = options.auth ?? 'trust';
         this.storage = storage;
+        this.hub = hub;
+        hub.sessions.add(this);
     }
 
     start(): void {
@@ -217,10 +242,12 @@ class Session {
             this.pump();
         });
         this.socket.on('error', () => this.destroy());
+        this.socket.on('close', () => this.hub.sessions.delete(this));
     }
 
     destroy(): void {
         this.closing = true;
+        this.hub.sessions.delete(this);
         this.socket.destroy();
     }
 
@@ -367,6 +394,25 @@ class Session {
 
         if (this.extendedFailed && tag !== 'S' && tag !== 'X') return;
 
+        if (this.copyState !== null) {
+            switch (tag) {
+                case 'd':
+                    this.copyState.chunks.push(payload);
+                    return;
+                case 'c':
+                    this.finishCopyIn(true, '');
+                    return;
+                case 'f':
+                    this.finishCopyIn(false, cstring(payload, 0).value);
+                    return;
+                case 'X':
+                    this.destroy();
+                    return;
+                default:
+                    this.fail('08P01', `unexpected frontend message type ${tag.charCodeAt(0)} during COPY`);
+            }
+        }
+
         switch (tag) {
             case 'Q':
                 this.handleSimpleQuery(payload);
@@ -412,18 +458,26 @@ class Session {
             this.socket.write(readyForQuery(this.transactionStatus()));
             return;
         }
+        this.runSimpleBatch(statements, 0, [], null);
+    }
 
-        const outcomes: Outcome[] = [];
-        let implicit: Database | null = null;
+    /**
+     * Runs the remaining statements of one simple-query message.
+     *
+     * A `COPY ... FROM STDIN` pauses the loop: its outcome is streamed now, the
+     * rest waits until `CopyDone`/`CopyFail` resumes the batch.
+     */
+    private runSimpleBatch(statements: string[], startIndex: number, outcomes: ServerOutcome[], implicitStart: Database | null): void {
+        const state = this.state!;
+        let implicit = implicitStart;
         try {
-            for (const statement of statements) {
-                // Only transaction control needs a parsed statement here; other
-                // statements go through `runSql`, which also owns `SET`/`SHOW`.
+            for (let index = startIndex; index < statements.length; index += 1) {
+                const statement = statements[index]!;
                 if (/^(?:begin|start|commit|end|rollback|abort|savepoint|release)\b/i.test(statement)) {
                     const parsed = parseStatement(statement) as TransactionStatement;
-                    // `BEGIN` finishes any implicit work that came before it.
                     if (parsed.command === 'begin' && implicit !== null) {
                         implicit.commit();
+                        this.flushNotifications();
                         implicit = null;
                     }
                     outcomes.push(this.runTransaction(parsed));
@@ -432,31 +486,43 @@ class Session {
                 if (this.transaction?.aborted) {
                     throw new ServerError('25P02', 'current transaction is aborted, commands ignored until end of transaction block');
                 }
-                if (this.transaction !== null) {
-                    const database = this.transaction.database;
-                    const before = database.clone();
-                    try {
-                        outcomes.push(runSql(state, database, statement, []));
-                    } catch (error) {
-                        database.restore(before);
-                        throw error;
-                    }
+                const direct = this.sessionCommand(state, statement);
+                if (direct !== null) {
+                    outcomes.push(direct);
+                    continue;
                 }
-                else {
-                    implicit ??= Database.open(this.storage, this.runtime);
-                    const before = implicit.clone();
-                    try {
-                        outcomes.push(runSql(state, implicit, statement, []));
-                    } catch (error) {
-                        implicit.restore(before);
-                        throw error;
+                const database = this.transaction !== null ? this.transaction.database : (implicit ??= Database.open(this.storage, this.runtime));
+                const before = database.clone();
+                let parsed: Statement | null = null;
+                try {
+                    parsed = parseStatement(statement);
+                    if (parsed.kind === 'copy' && parsed.direction === 'from') {
+                        const columns = copyColumnCount(database, parsed);
+                        for (const outcome of outcomes) this.emitOutcome(outcome);
+                        this.copyState = {
+                            statement: parsed,
+                            database,
+                            snapshot: before,
+                            statements,
+                            nextIndex: index + 1,
+                            chunks: [],
+                        };
+                        this.socket.write(copyInResponse(columns));
+                        return;
                     }
+                    outcomes.push(this.runParsed(state, database, parsed, []));
+                } catch (error) {
+                    database.restore(before);
+                    throw error;
                 }
             }
-            if (implicit !== null) implicit.commit();
+            if (implicit !== null) {
+                implicit.commit();
+                this.flushNotifications();
+            }
         } catch (error) {
-            // Statements that already ran are reported, the batch is discarded.
             for (const outcome of outcomes) this.emitOutcome(outcome);
+            this.pending.length = 0;
             if (this.transaction !== null) this.transaction.aborted = true;
             this.sendError(error);
             this.socket.write(readyForQuery(this.transactionStatus()));
@@ -464,6 +530,31 @@ class Session {
         }
         for (const outcome of outcomes) this.emitOutcome(outcome);
         this.socket.write(readyForQuery(this.transactionStatus()));
+    }
+
+    /** Ends an interactive COPY: inserts the buffered rows or reports failure. */
+    private finishCopyIn(success: boolean, message: string): void {
+        const copy = this.copyState!;
+        this.copyState = null;
+        try {
+            let count = 0;
+            if (success) {
+                count = copyIn(copy.database, copy.statement, Buffer.concat(copy.chunks).toString('utf8'));
+                if (this.transaction === null) {
+                    copy.database.commit();
+                    this.flushNotifications();
+                }
+            }
+            else throw new ServerError('57014', `COPY from stdin failed: ${message}`);
+            this.socket.write(commandComplete(`COPY ${count}`));
+            this.runSimpleBatch(copy.statements, copy.nextIndex, [], this.transaction === null ? copy.database : null);
+        } catch (error) {
+            copy.database.restore(copy.snapshot);
+            this.pending.length = 0;
+            if (this.transaction !== null) this.transaction.aborted = true;
+            this.sendError(error);
+            this.socket.write(readyForQuery(this.transactionStatus()));
+        }
     }
 
     /** Status byte for `ReadyForQuery`: idle, in a transaction, or aborted. */
@@ -496,6 +587,8 @@ class Session {
                 }
                 if (this.transaction.aborted) {
                     this.transaction = null;
+                    this.closeCursorsInTransaction(true);
+                    this.pending.length = 0;
                     return { kind: 'command', tag: 'ROLLBACK' };
                 }
                 try {
@@ -503,6 +596,8 @@ class Session {
                 } finally {
                     this.transaction = null;
                 }
+                this.closeCursorsInTransaction(false);
+                this.flushNotifications();
                 return { kind: 'command', tag: 'COMMIT' };
             case 'rollback':
                 if (this.transaction === null) {
@@ -510,6 +605,8 @@ class Session {
                     return { kind: 'command', tag: 'ROLLBACK' };
                 }
                 this.transaction = null;
+                this.closeCursorsInTransaction(true);
+                this.pending.length = 0;
                 return { kind: 'command', tag: 'ROLLBACK' };
             case 'savepoint': {
                 const name = statement.name ?? '';
@@ -559,8 +656,157 @@ class Session {
         return -1;
     }
 
+    /** `COMMIT` keeps only holdable cursors, `ROLLBACK` drops those the transaction opened. */
+    private closeCursorsInTransaction(rollback: boolean): void {
+        for (const [name, cursor] of this.cursors) {
+            if (rollback ? cursor.inTransaction : !cursor.hold) this.cursors.delete(name);
+        }
+    }
+
+    /** Handles `SET`/`SHOW` without the SQL parser; `null` means "parse normally". */
+    private sessionCommand(state: SessionState, sql: string): ServerOutcome | null {
+        const statement = sql.trim();
+        const set = /^(?:set|set\s+session|set\s+local)\s+([a-z_][a-z0-9_.]*)\s*(?:=|to)\s*([\s\S]+)$/i.exec(statement);
+        if (set && set[1] !== undefined && set[2] !== undefined) {
+            const name = set[1].toLowerCase();
+            state.parameters.set(name, unquote(set[2]));
+            return { kind: 'command', tag: 'SET' };
+        }
+        const show = /^show\s+([a-z_][a-z0-9_.]*)$/i.exec(statement);
+        if (show && show[1] !== undefined) {
+            const name = show[1].toLowerCase();
+            const value = state.parameters.get(name);
+            if (value === undefined) throw new ServerError('42704', `unrecognized configuration parameter "${name}"`);
+            return { kind: 'rows', fields: [{ name, type: TEXT }], rows: [[value]], tag: 'SHOW' };
+        }
+        return null;
+    }
+
+    /** Runs one statement: session GUCs, then session-owned SQL, then the engine. */
+    private runParsed(state: SessionState, database: Database, statement: Statement, parameters: SqlValue[]): ServerOutcome {
+        switch (statement.kind) {
+            case 'copy': {
+                if (statement.direction === 'from') {
+                    throw new ServerError('0A000', 'feature not supported', 'COPY FROM STDIN is only available through the simple query protocol');
+                }
+                const result = copyOut(database, statement);
+                return { kind: 'copy-out', data: result.data, rows: result.rows, columns: result.columns };
+            }
+            case 'cursor':
+                return this.runCursor(database, statement);
+            case 'prepare':
+                return this.runPrepare(statement);
+            case 'execute': {
+                const prepared = this.sqlPrepared.get(statement.name);
+                if (!prepared) throw new ServerError('26000', `prepared statement "${statement.name}" does not exist`);
+                const args = statement.args.map((arg, index) => {
+                    const value = constantValue(arg);
+                    const type = prepared.types[index];
+                    if (type === undefined || value === null) return value;
+                    return parseLiteral(formatValue(value, TEXT) ?? '', type);
+                });
+                return this.runParsed(state, database, prepared.statement, args);
+            }
+            case 'deallocate': {
+                if (statement.all) {
+                    this.sqlPrepared.clear();
+                    return { kind: 'command', tag: 'DEALLOCATE ALL' };
+                }
+                const name = statement.name ?? '';
+                if (!this.sqlPrepared.has(name)) throw new ServerError('26000', `prepared statement "${name}" does not exist`);
+                this.sqlPrepared.delete(name);
+                return { kind: 'command', tag: 'DEALLOCATE' };
+            }
+            case 'listen':
+                this.channels.add(statement.channel);
+                return { kind: 'command', tag: 'LISTEN' };
+            case 'unlisten':
+                if (statement.all) this.channels.clear();
+                else this.channels.delete(statement.channel);
+                return { kind: 'command', tag: 'UNLISTEN' };
+            case 'notify': {
+                const payload = statement.payload ?? '';
+                if (Buffer.byteLength(payload, 'utf8') >= 8000) {
+                    throw new ServerError('22023', 'payload string too long');
+                }
+                this.pending.push({ channel: statement.channel, payload });
+                return { kind: 'command', tag: 'NOTIFY' };
+            }
+            default:
+                return runStatement(database, statement, parameters);
+        }
+    }
+
+    private runPrepare(statement: PrepareStatement): ServerOutcome {
+        if (this.sqlPrepared.has(statement.name)) {
+            throw new ServerError('42P05', `prepared statement "${statement.name}" already exists`);
+        }
+        const inner = statement.types.length === 0 ? statement.statement : rewriteParamTypes(statement.statement, statement.types);
+        this.sqlPrepared.set(statement.name, { statement: inner, types: statement.types });
+        return { kind: 'command', tag: 'PREPARE' };
+    }
+
+    /** Runs `DECLARE`/`FETCH`/`MOVE`/`CLOSE` against the materialized cursor set. */
+    private runCursor(database: Database, statement: CursorStatement): ServerOutcome {
+        if (statement.action === 'declare') {
+            if (!statement.hold && this.transaction === null) {
+                throw new ServerError('25P01', 'DECLARE CURSOR can only be used in transaction blocks');
+            }
+            if (this.cursors.has(statement.name)) throw new ServerError('42P03', `cursor "${statement.name}" already exists`);
+            const select = statement.select;
+            if (select === null || select === undefined) throw new ServerError('42601', 'DECLARE CURSOR requires a query');
+            const outcome = runStatement(database, select, []);
+            if (outcome.kind !== 'rows') throw new ServerError('XX000', 'cursor query did not produce rows');
+            this.cursors.set(statement.name, {
+                fields: outcome.fields,
+                rows: outcome.rows,
+                index: -1,
+                scroll: statement.scroll !== 'no-scroll',
+                hold: statement.hold,
+                inTransaction: this.transaction !== null,
+            });
+            return { kind: 'command', tag: 'DECLARE CURSOR' };
+        }
+        if (statement.action === 'close') {
+            if (statement.all) {
+                this.cursors.clear();
+                return { kind: 'command', tag: 'CLOSE CURSOR ALL' };
+            }
+            if (!this.cursors.has(statement.name)) throw new ServerError('34000', `cursor "${statement.name}" does not exist`);
+            this.cursors.delete(statement.name);
+            return { kind: 'command', tag: 'CLOSE CURSOR' };
+        }
+        const cursor = this.cursors.get(statement.name);
+        if (!cursor) throw new ServerError('34000', `cursor "${statement.name}" does not exist`);
+        const direction = statement.direction ?? { kind: 'forward', count: 1 };
+        if (!cursor.scroll && isBackward(direction)) {
+            throw new ServerError(
+                '55000',
+                'cursor can only scan forward',
+                undefined,
+                undefined,
+                'Declare it with SCROLL option to enable backward scan.',
+            );
+        }
+        const moved = moveCursor(cursor, direction);
+        if (statement.action === 'move') return { kind: 'command', tag: `MOVE ${moved.moved}` };
+        return { kind: 'rows', fields: cursor.fields, rows: moved.rows, tag: `FETCH ${moved.rows.length}` };
+    }
+
+    /** Sends every queued `NOTIFY` to the sessions listening at commit time. */
+    private flushNotifications(): void {
+        if (this.pending.length === 0) return;
+        const items = this.pending;
+        this.pending = [];
+        for (const item of items) {
+            for (const session of this.hub.sessions) {
+                if (session.channels.has(item.channel)) session.socket.write(notificationResponse(this.pid, item.channel, item.payload));
+            }
+        }
+    }
+
     /** Runs one extended-protocol statement, committing outside a transaction. */
-    private executeStatement(sql: string, parameters: SqlValue[]): Outcome {
+    private executeStatement(sql: string, parameters: SqlValue[]): ServerOutcome {
         const state = this.state;
         if (!state) throw new ServerError('08006', 'session is not authenticated');
         const trimmed = sql.trim();
@@ -570,11 +816,13 @@ class Session {
         if (this.transaction?.aborted) {
             throw new ServerError('25P02', 'current transaction is aborted, commands ignored until end of transaction block');
         }
+        const direct = this.sessionCommand(state, trimmed);
+        if (direct !== null) return direct;
         if (this.transaction !== null) {
             const database = this.transaction.database;
             const before = database.clone();
             try {
-                return runSql(state, database, sql, parameters);
+                return this.runParsed(state, database, parseStatement(trimmed), parameters);
             } catch (error) {
                 database.restore(before);
                 throw error;
@@ -583,8 +831,9 @@ class Session {
         const database = Database.open(this.storage, this.runtime);
         const before = database.clone();
         try {
-            const outcome = runSql(state, database, sql, parameters);
+            const outcome = this.runParsed(state, database, parseStatement(trimmed), parameters);
             database.commit();
+            this.flushNotifications();
             return outcome;
         } catch (error) {
             database.restore(before);
@@ -721,7 +970,14 @@ class Session {
         this.socket.write(readyForQuery(this.transactionStatus()));
     }
 
-    private emitOutcome(outcome: Outcome, described = false): void {
+    private emitOutcome(outcome: ServerOutcome, described = false): void {
+        if (outcome.kind === 'copy-out') {
+            this.socket.write(copyOutResponse(outcome.columns));
+            if (outcome.data.length > 0) this.socket.write(copyData(Buffer.from(outcome.data, 'utf8')));
+            this.socket.write(copyDone());
+            this.socket.write(commandComplete(`COPY ${outcome.rows}`));
+            return;
+        }
         if (outcome.kind === 'command') {
             this.socket.write(commandComplete(outcome.tag));
             return;
@@ -739,7 +995,9 @@ class Session {
                       code: error.code,
                       message: error.message,
                       ...(error.detail ? { detail: error.detail } : {}),
+                      ...(error.hint ? { hint: error.hint } : {}),
                       ...(error.position !== undefined ? { position: String(error.position + 1) } : {}),
+                      ...(error.context ? { where: error.context } : {}),
                   }
                 : { severity: 'ERROR', code: 'XX000', message: error instanceof Error ? error.message : String(error) };
         this.socket.write(errorResponse(fields));
@@ -757,6 +1015,98 @@ class Session {
     }
 }
 
+function isBackward(direction: CursorDirection): boolean {
+    switch (direction.kind) {
+        case 'prior':
+        case 'backward':
+            return true;
+        case 'relative':
+            return direction.count < 0;
+        case 'absolute':
+            return direction.count <= 0;
+        default:
+            return false;
+    }
+}
+
+/** Applies one FETCH/MOVE direction to a materialized cursor. */
+function moveCursor(cursor: CursorState, direction: CursorDirection): { rows: SqlValue[][]; moved: number } {
+    const data = cursor.rows;
+    const count = data.length;
+    const current = (): SqlValue[][] => (cursor.index >= 0 && cursor.index < count ? [data[cursor.index]!] : []);
+    const forward = (take: number | 'all'): { rows: SqlValue[][]; moved: number } => {
+        if (take === 0) return { rows: current(), moved: 0 };
+        const start = cursor.index >= count ? count : cursor.index + 1;
+        const available = count - start;
+        const amount = take === 'all' ? available : Math.min(take, available);
+        if (amount <= 0) {
+            cursor.index = count;
+            return { rows: [], moved: 0 };
+        }
+        const rows = data.slice(start, start + amount);
+        cursor.index = take === 'all' || amount < take ? count : start + amount - 1;
+        return { rows, moved: amount };
+    };
+    const backward = (take: number | 'all'): { rows: SqlValue[][]; moved: number } => {
+        const start = cursor.index >= count ? count - 1 : cursor.index - 1;
+        const available = start + 1;
+        const amount = take === 'all' ? available : Math.min(take, available);
+        if (amount <= 0) {
+            cursor.index = -1;
+            return { rows: [], moved: 0 };
+        }
+        const rows: SqlValue[][] = [];
+        for (let offset = 0; offset < amount; offset += 1) rows.push(data[start - offset]!);
+        cursor.index = take === 'all' ? -1 : Math.max(-1, start - amount + 1);
+        return { rows, moved: amount };
+    };
+    switch (direction.kind) {
+        case 'next':
+            return forward(1);
+        case 'prior':
+            return backward(1);
+        case 'forward':
+            return forward(direction.count);
+        case 'backward':
+            return backward(direction.count);
+        case 'absolute': {
+            const target = direction.count > 0 ? direction.count - 1 : direction.count === 0 ? -1 : count + direction.count;
+            if (target < 0) {
+                cursor.index = -1;
+                return { rows: [], moved: 0 };
+            }
+            if (target >= count) {
+                cursor.index = count;
+                return { rows: [], moved: 0 };
+            }
+            cursor.index = target;
+            return { rows: [data[target]!], moved: 1 };
+        }
+        case 'relative':
+            if (direction.count === 0) return { rows: current(), moved: 0 };
+            return direction.count > 0 ? forward(direction.count) : backward(-direction.count);
+        default:
+            return { rows: [], moved: 0 };
+    }
+}
+
+/** Casts every `$n` placeholder to the type declared in `PREPARE name (types)`. */
+function rewriteParamTypes(statement: Statement, types: DataType[]): Statement {
+    const rewrite = (node: unknown): unknown => {
+        if (Array.isArray(node)) return node.map(rewrite);
+        if (node === null || typeof node !== 'object') return node;
+        const record = node as Record<string, unknown>;
+        if (record.kind === 'param' && typeof record.index === 'number') {
+            const type = types[record.index - 1];
+            return type ? { kind: 'cast', expr: record, type, start: record.start } : node;
+        }
+        const clone: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(record)) clone[key] = rewrite(value);
+        return clone;
+    };
+    return rewrite(statement) as Statement;
+}
+
 /** Starts a protocol-v3 server that accepts real `psql` and `pg` clients. */
 export function startPostgresServer(options: PostgresServerOptions = {}): Promise<PostgresServerHandle> {
     const dataDir = options.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-data-'));
@@ -770,10 +1120,11 @@ export function startPostgresServer(options: PostgresServerOptions = {}): Promis
 
     const sockets = new Set<net.Socket>();
     const host = options.host ?? '127.0.0.1';
+    const hub: NotificationHub = { sessions: new Set<Session>() };
     const server = net.createServer((socket) => {
         sockets.add(socket);
         socket.on('close', () => sockets.delete(socket));
-        const session = new Session(socket, options, storage);
+        const session = new Session(socket, options, storage, hub);
         session.start();
     });
 

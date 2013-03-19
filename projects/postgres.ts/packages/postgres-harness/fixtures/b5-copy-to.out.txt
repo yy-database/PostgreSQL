@@ -1,0 +1,27 @@
+1	ann	x
+2	bob	\N
+3	cid	a\tb
+id,name,note
+1,ann,x
+2,bob,NA
+3,cid,a	b
+id|name|note
+1|ann|x
+2|bob|
+3|cid|a	b
+id,v
+1,""
+2,
+3, plain 
+4,"a,b"
+5,"a""b"
+6,"line1
+line2"
+1	
+2	\N
+3	 plain 
+4	a,b
+5	a"b
+6	line1\nline2
+1	ann
+2	bob

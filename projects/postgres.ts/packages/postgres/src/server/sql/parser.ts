@@ -374,6 +374,77 @@ export interface TransactionStatement {
     name: string | undefined;
 }
 
+/** Options accepted by `COPY ... FROM STDIN` / `COPY ... TO STDOUT`. */
+export interface CopyOptions {
+    format: 'text' | 'csv';
+    header: boolean;
+    delimiter: string | undefined;
+    nullString: string | undefined;
+    quote: string | undefined;
+    escape: string | undefined;
+}
+
+export interface CopyStatement {
+    kind: 'copy';
+    direction: 'from' | 'to';
+    /** Set for `COPY table ...`; absent when the source is a query. */
+    table: RelationRef | undefined;
+    columns: string[] | undefined;
+    select: SelectStatement | undefined;
+    options: CopyOptions;
+}
+
+export type CursorDirection =
+    | { kind: 'next' }
+    | { kind: 'prior' }
+    | { kind: 'forward'; count: number | 'all' }
+    | { kind: 'backward'; count: number | 'all' }
+    | { kind: 'absolute'; count: number }
+    | { kind: 'relative'; count: number };
+
+export interface CursorStatement {
+    kind: 'cursor';
+    action: 'declare' | 'fetch' | 'move' | 'close';
+    /** Empty for `CLOSE ALL`. */
+    name: string;
+    all: boolean;
+    scroll: 'scroll' | 'no-scroll' | undefined;
+    hold: boolean;
+    direction: CursorDirection | undefined;
+    select: SelectStatement | undefined;
+}
+
+export interface PrepareStatement {
+    kind: 'prepare';
+    name: string;
+    types: DataType[];
+    statement: Statement;
+}
+
+export interface ExecuteStatement {
+    kind: 'execute';
+    name: string;
+    args: Expr[];
+}
+
+export interface DeallocateStatement {
+    kind: 'deallocate';
+    name: string | undefined;
+    all: boolean;
+}
+
+export interface ListenStatement {
+    kind: 'listen' | 'unlisten';
+    channel: string;
+    all: boolean;
+}
+
+export interface NotifyStatement {
+    kind: 'notify';
+    channel: string;
+    payload: string | undefined;
+}
+
 export type Statement =
     | SelectStatement
     | InsertStatement
@@ -384,7 +455,14 @@ export type Statement =
     | CreateIndexStatement
     | DropIndexStatement
     | AlterTableStatement
-    | TransactionStatement;
+    | TransactionStatement
+    | CopyStatement
+    | CursorStatement
+    | PrepareStatement
+    | ExecuteStatement
+    | DeallocateStatement
+    | ListenStatement
+    | NotifyStatement;
 
 type TokenKind = 'ident' | 'qident' | 'number' | 'string' | 'param' | 'op' | 'punct' | 'eof';
 
@@ -719,7 +797,371 @@ class Parser {
             this.accept('SAVEPOINT');
             return { kind: 'transaction', command: 'release', name: this.identifier() };
         }
+        if (token.upper === 'COPY') return this.parseCopy();
+        if (token.upper === 'DECLARE') return this.parseDeclare();
+        if (token.upper === 'FETCH' || token.upper === 'MOVE') return this.parseFetchMove(token.upper.toLowerCase() as 'fetch' | 'move');
+        if (token.upper === 'CLOSE') return this.parseClose();
+        if (token.upper === 'PREPARE') return this.parsePrepare();
+        if (token.upper === 'EXECUTE') return this.parseExecute();
+        if (token.upper === 'DEALLOCATE') return this.parseDeallocate();
+        if (token.upper === 'LISTEN') return this.parseListen();
+        if (token.upper === 'UNLISTEN') return this.parseUnlisten();
+        if (token.upper === 'NOTIFY') return this.parseNotify();
         throw new ServerError('0A000', 'feature not supported', `statement is not implemented: ${token.upper || 'end of input'}`);
+    }
+
+    private signedInteger(): number {
+        let sign = 1;
+        if (this.at('-')) {
+            this.next();
+            sign = -1;
+        }
+        else if (this.at('+')) this.next();
+        const token = this.peek();
+        if (token.kind !== 'number' || !/^\d+$/.test(token.value)) throw syntax('syntax error: expected an integer', token);
+        this.next();
+        return sign * Number(token.value);
+    }
+
+    private parseCopy(): CopyStatement {
+        this.expect('COPY');
+        const options: CopyOptions = {
+            format: 'text',
+            header: false,
+            delimiter: undefined,
+            nullString: undefined,
+            quote: undefined,
+            escape: undefined,
+        };
+        let table: RelationRef | undefined;
+        let columns: string[] | undefined;
+        let select: SelectStatement | undefined;
+        let direction: 'from' | 'to';
+        if (this.at('(')) {
+            this.next();
+            select = this.parseSelect();
+            this.expect(')');
+            this.expect('TO');
+            this.expect('STDOUT');
+            direction = 'to';
+        }
+        else {
+            table = this.parseRelationRef();
+            if (this.at('(')) {
+                this.next();
+                columns = [];
+                do {
+                    columns.push(this.identifier());
+                } while (this.accept(','));
+                this.expect(')');
+            }
+            if (this.at('FROM')) {
+                this.next();
+                this.expect('STDIN');
+                direction = 'from';
+            }
+            else if (this.at('TO')) {
+                this.next();
+                this.expect('STDOUT');
+                direction = 'to';
+            }
+            else throw syntax('syntax error: expected "FROM" or "TO"', this.peek());
+        }
+        this.parseCopyOptions(options, direction);
+        return { kind: 'copy', direction, table, columns, select, options };
+    }
+
+    private parseCopyOptions(options: CopyOptions, direction: 'from' | 'to'): void {
+        if (this.accept('WITH')) {
+            if (this.at('(')) {
+                this.next();
+                this.parseCopyOptionList(options);
+                this.expect(')');
+                return;
+            }
+            this.parseCopyLegacyOptions(options);
+            return;
+        }
+        if (this.at('(')) {
+            this.next();
+            this.parseCopyOptionList(options);
+            this.expect(')');
+            return;
+        }
+        if (['CSV', 'HEADER', 'DELIMITER', 'NULL', 'QUOTE', 'ESCAPE', 'ENCODING', 'FORCE'].some((word) => this.at(word))) {
+            this.parseCopyLegacyOptions(options);
+        }
+    }
+
+    private parseCopyLegacyOptions(options: CopyOptions): void {
+        while (!this.at('eof')) {
+            if (this.at('BINARY')) throw new ServerError('0A000', 'feature not supported', 'binary COPY is not implemented');
+            if (this.accept('CSV')) {
+                options.format = 'csv';
+                continue;
+            }
+            if (this.accept('TEXT')) {
+                options.format = 'text';
+                continue;
+            }
+            if (this.accept('HEADER')) {
+                options.header = this.accept('TRUE') ? true : (this.accept('FALSE') ? false : true);
+                continue;
+            }
+            if (this.accept('DELIMITER')) {
+                options.delimiter = this.stringValue();
+                continue;
+            }
+            if (this.accept('NULL')) {
+                options.nullString = this.stringValue();
+                continue;
+            }
+            if (this.accept('QUOTE')) {
+                options.quote = this.stringValue();
+                continue;
+            }
+            if (this.accept('ESCAPE')) {
+                options.escape = this.stringValue();
+                continue;
+            }
+            if (this.accept('ENCODING')) {
+                this.stringValue();
+                continue;
+            }
+            if (this.accept('FORCE')) {
+                this.expect('QUOTE');
+                if (this.at('*') || this.at('(')) this.skipParenthesisedList();
+                continue;
+            }
+            break;
+        }
+    }
+
+    private parseCopyOptionList(options: CopyOptions): void {
+        do {
+            const token = this.peek();
+            const name = token.upper;
+            this.next();
+            switch (name) {
+                case 'FORMAT': {
+                    const format = this.peek().upper;
+                    this.next();
+                    if (format === 'CSV') options.format = 'csv';
+                    else if (format === 'TEXT') options.format = 'text';
+                    else if (format === 'BINARY') throw new ServerError('0A000', 'feature not supported', 'binary COPY is not implemented');
+                    else throw syntax('syntax error: expected "text" or "csv"', this.peek());
+                    break;
+                }
+                case 'HEADER': {
+                    if (this.at(',')) options.header = true;
+                    else if (this.accept('TRUE')) options.header = true;
+                    else if (this.accept('FALSE')) options.header = false;
+                    else if (this.accept('MATCH')) options.header = true;
+                    else options.header = true;
+                    break;
+                }
+                case 'DELIMITER':
+                    options.delimiter = this.stringValue();
+                    break;
+                case 'NULL':
+                    options.nullString = this.stringValue();
+                    break;
+                case 'QUOTE':
+                    options.quote = this.stringValue();
+                    break;
+                case 'ESCAPE':
+                    options.escape = this.stringValue();
+                    break;
+                case 'ENCODING':
+                    this.stringValue();
+                    break;
+                case 'FORCE_QUOTE':
+                case 'FORCE_NOT_NULL':
+                case 'FORCE_NULL':
+                    this.skipParenthesisedList();
+                    break;
+                default:
+                    throw new ServerError('42601', `option "${name.toLowerCase()}" not recognized`, undefined, token.start);
+            }
+        } while (this.accept(','));
+    }
+
+    private skipParenthesisedList(): void {
+        if (this.accept('*')) return;
+        if (!this.at('(')) return;
+        let depth = 0;
+        do {
+            if (this.at('(')) depth += 1;
+            if (this.at(')')) depth -= 1;
+            this.next();
+        } while (!this.at('eof') && depth > 0);
+    }
+
+    private stringValue(): string {
+        const token = this.peek();
+        if (token.kind !== 'string') throw syntax('syntax error: expected a string constant', token);
+        this.next();
+        return token.value;
+    }
+
+    private parseDeclare(): CursorStatement {
+        this.expect('DECLARE');
+        const name = this.identifier();
+        let scroll: 'scroll' | 'no-scroll' | undefined;
+        let hold = false;
+        for (;;) {
+            if (this.accept('BINARY')) continue;
+            if (this.accept('INSENSITIVE')) continue;
+            if (this.accept('SCROLL')) {
+                scroll = 'scroll';
+                continue;
+            }
+            if (this.at('NO') && this.peek(1).upper === 'SCROLL') {
+                this.next();
+                this.next();
+                scroll = 'no-scroll';
+                continue;
+            }
+            break;
+        }
+        this.expect('CURSOR');
+        if (this.at('WITH') && this.peek(1).upper === 'HOLD') {
+            this.next();
+            this.next();
+            hold = true;
+        }
+        else if (this.at('WITHOUT') && this.peek(1).upper === 'HOLD') {
+            this.next();
+            this.next();
+        }
+        this.expect('FOR');
+        const select = this.parseSelect();
+        return { kind: 'cursor', action: 'declare', name, all: false, scroll, hold, direction: undefined, select };
+    }
+
+    private parseFetchMove(action: 'fetch' | 'move'): CursorStatement {
+        this.next();
+        const token = this.peek();
+        let direction: CursorDirection = { kind: 'forward', count: 1 };
+        switch (token.upper) {
+            case 'NEXT':
+                this.next();
+                direction = { kind: 'next' };
+                break;
+            case 'PRIOR':
+                this.next();
+                direction = { kind: 'prior' };
+                break;
+            case 'FIRST':
+                this.next();
+                direction = { kind: 'absolute', count: 1 };
+                break;
+            case 'LAST':
+                this.next();
+                direction = { kind: 'absolute', count: -1 };
+                break;
+            case 'ABSOLUTE':
+                this.next();
+                direction = { kind: 'absolute', count: this.signedInteger() };
+                break;
+            case 'RELATIVE':
+                this.next();
+                direction = { kind: 'relative', count: this.signedInteger() };
+                break;
+            case 'ALL':
+                this.next();
+                direction = { kind: 'forward', count: 'all' };
+                break;
+            case 'FORWARD':
+            case 'BACKWARD': {
+                this.next();
+                const forward = token.upper === 'FORWARD';
+                let count: number | 'all' = 1;
+                if (this.accept('ALL')) count = 'all';
+                else if (this.peek().kind === 'number' || this.at('-') || this.at('+')) count = this.signedInteger();
+                direction = forward ? { kind: 'forward', count } : { kind: 'backward', count };
+                break;
+            }
+            default:
+                if (token.kind === 'number' || this.at('-') || this.at('+')) {
+                    direction = { kind: 'forward', count: this.signedInteger() };
+                }
+        }
+        this.accept('FROM');
+        this.accept('IN');
+        const name = this.identifier();
+        return { kind: 'cursor', action, name, all: false, scroll: undefined, hold: false, direction, select: undefined };
+    }
+
+    private parseClose(): CursorStatement {
+        this.expect('CLOSE');
+        if (this.accept('ALL')) {
+            return { kind: 'cursor', action: 'close', name: '', all: true, scroll: undefined, hold: false, direction: undefined, select: undefined };
+        }
+        return {
+            kind: 'cursor',
+            action: 'close',
+            name: this.identifier(),
+            all: false,
+            scroll: undefined,
+            hold: false,
+            direction: undefined,
+            select: undefined,
+        };
+    }
+
+    private parsePrepare(): PrepareStatement {
+        this.expect('PREPARE');
+        const name = this.identifier();
+        const types: DataType[] = [];
+        if (this.accept('(')) {
+            if (!this.at(')')) {
+                do {
+                    types.push(this.parseTypeName());
+                } while (this.accept(','));
+            }
+            this.expect(')');
+        }
+        this.expect('AS');
+        const statement = this.parseStatement();
+        return { kind: 'prepare', name, types, statement };
+    }
+
+    private parseExecute(): ExecuteStatement {
+        this.expect('EXECUTE');
+        const name = this.identifier();
+        const args: Expr[] = [];
+        if (this.accept('(')) {
+            if (!this.at(')')) args.push(...this.parseExprList());
+            this.expect(')');
+        }
+        return { kind: 'execute', name, args };
+    }
+
+    private parseDeallocate(): DeallocateStatement {
+        this.expect('DEALLOCATE');
+        this.accept('PREPARE');
+        if (this.accept('ALL')) return { kind: 'deallocate', name: undefined, all: true };
+        return { kind: 'deallocate', name: this.identifier(), all: false };
+    }
+
+    private parseListen(): Statement {
+        this.expect('LISTEN');
+        return { kind: 'listen', channel: this.identifier(), all: false };
+    }
+
+    private parseUnlisten(): Statement {
+        this.expect('UNLISTEN');
+        if (this.accept('*')) return { kind: 'unlisten', channel: '', all: true };
+        return { kind: 'unlisten', channel: this.identifier(), all: false };
+    }
+
+    private parseNotify(): NotifyStatement {
+        this.expect('NOTIFY');
+        const channel = this.identifier();
+        let payload: string | undefined;
+        if (this.accept(',')) payload = this.stringValue();
+        return { kind: 'notify', channel, payload };
     }
 
     peek(offset = 0): Token {
@@ -1802,4 +2244,25 @@ export function parseExpression(sql: string): Expr {
     const trailing = parser.peek();
     if (trailing.kind !== 'eof') throw syntax('syntax error', trailing);
     return expr;
+}
+
+/** Folds a constant expression, as allowed in an `EXECUTE` argument list. */
+export function constantValue(expr: Expr): SqlValue {
+    switch (expr.kind) {
+        case 'literal':
+            return expr.value;
+        case 'unary': {
+            const value = constantValue(expr.expr);
+            if (typeof value === 'number') {
+                if (expr.op === '-') return -value;
+                if (expr.op === '+') return value;
+            }
+            break;
+        }
+        case 'cast':
+            return constantValue(expr.expr);
+        default:
+            break;
+    }
+    throw new ServerError('42601', 'EXECUTE parameters must be constants');
 }

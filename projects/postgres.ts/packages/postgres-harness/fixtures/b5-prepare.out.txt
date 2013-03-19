@@ -1,0 +1,35 @@
+PREPARE
+ id |  v  
+----+-----
+  2 | two
+(1 row)
+
+ id |  v  
+----+-----
+  2 | two
+(1 row)
+
+PREPARE
+ n  | s 
+----+---
+ 42 | x
+(1 row)
+
+PREPARE
+ doubled 
+---------
+      42
+(1 row)
+
+PREPARE
+DEALLOCATE
+DEALLOCATE
+PREPARE
+INSERT 0 1
+   v   
+-------
+ fifty
+(1 row)
+
+DEALLOCATE ALL
+DEALLOCATE ALL

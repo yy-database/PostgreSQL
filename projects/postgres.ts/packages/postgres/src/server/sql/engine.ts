@@ -129,6 +129,8 @@ function emptyTagName(statement: Statement): string {
             return 'ALTER TABLE';
         case 'transaction':
             return 'TRANSACTION';
+        default:
+            return statement.kind.toUpperCase();
     }
 }
 

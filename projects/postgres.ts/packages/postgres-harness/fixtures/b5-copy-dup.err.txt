@@ -1,0 +1,3 @@
+psql:b5-copy-dup.sql:5: ERROR:  duplicate key value violates unique constraint "b5_copy_pkey"
+DETAIL:  Key (id)=(3) already exists.
+CONTEXT:  COPY b5_copy, line 2

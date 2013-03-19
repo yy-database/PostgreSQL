@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 import pg from 'pg';
+import copyStreams from 'pg-copy-streams';
 
 import { mustRun } from './process.mjs';
 import { startPostgresServer } from '../../postgres/dist/server/server.js';
@@ -224,6 +225,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batch2 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch2-')) });
     const batch3 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch3-')) });
     const batch4 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch4-')) });
+    const batch5 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch5-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -1131,11 +1133,221 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         });
 
+        // Batch 5: COPY, cursors, SQL-level PREPARE and LISTEN/NOTIFY.
+        const setupB5 = fs.readFileSync(path.join(harnessDir, 'fixtures', 'b5-setup.sql'), 'utf8');
+        await withClient(batch5, async (client) => {
+            for (const statement of setupB5.split(';').map((part) => part.trim()).filter((part) => part.length > 0)) {
+                await client.query(statement);
+            }
+        });
+
+        const copyFromText = (client, sql, text) =>
+            new Promise((resolve) => {
+                const stream = client.query(copyStreams.from(sql));
+                let settled = false;
+                const done = (error) => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(error ?? null);
+                };
+                stream.on('error', done);
+                stream.on('finish', () => done(null));
+                stream.end(text);
+            });
+
+        const copyToText = (client, sql) =>
+            new Promise((resolve, reject) => {
+                const stream = client.query(copyStreams.to(sql));
+                const chunks = [];
+                stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+                stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+                stream.on('error', reject);
+            });
+
+        const waitFor = async (predicate, timeout = 3000) => {
+            const deadline = Date.now() + timeout;
+            while (Date.now() < deadline) {
+                if (predicate()) return true;
+                await new Promise((rest) => setTimeout(rest, 25));
+            }
+            return predicate();
+        };
+
+        await check('b5/copy-streams', async () => {
+            await withClient(batch5, async (client) => {
+                await client.query('CREATE TABLE b5_stream (id int PRIMARY KEY, v text)');
+                const inserted = await copyFromText(client, 'COPY b5_stream FROM STDIN WITH (FORMAT csv)', '1,alpha\n2,"beta,gamma"\n3,\n');
+                assert(inserted === null, `COPY FROM failed: ${inserted?.message}`);
+                const csv = await copyToText(client, 'COPY b5_stream TO STDOUT WITH (FORMAT csv)');
+                assert(csv === '1,alpha\n2,"beta,gamma"\n3,\n', `COPY TO csv is ${JSON.stringify(csv)}`);
+                const text = await copyToText(client, 'COPY b5_stream TO STDOUT');
+                assert(text === '1\talpha\n2\tbeta,gamma\n3\t\\N\n', `COPY TO text is ${JSON.stringify(text)}`);
+                const failed = await copyFromText(client, 'COPY b5_stream FROM STDIN', '4\tok\n5\tok\nxx\tbad\n');
+                assert(failed && failed.code === '22P02', `COPY failure is ${failed?.code}`);
+                const count = await client.query('SELECT count(*) AS n FROM b5_stream');
+                assert(String(count.rows[0].n) === '3', `rows after failed COPY: ${count.rows[0].n}`);
+            });
+        });
+
+        await check('b5/cursors', async () => {
+            await withClient(batch5, async (client) => {
+                await client.query('CREATE TABLE b5_pgcur (id int, v text)');
+                await client.query("INSERT INTO b5_pgcur VALUES (1,'one'),(2,'two'),(3,'three')");
+                const outside = await capture(client.query('DECLARE lone CURSOR FOR SELECT id FROM b5_pgcur'));
+                assert(outside?.code === '25P01', `DECLARE outside a transaction: ${outside?.code}`);
+                const outsideHold = await capture(client.query('DECLARE early CURSOR WITH HOLD FOR SELECT id FROM b5_pgcur ORDER BY id'));
+                assert(outsideHold === null, `WITH HOLD outside a transaction: ${outsideHold?.code}`);
+                await client.query('CLOSE early');
+                await client.query('BEGIN');
+                await client.query('DECLARE c SCROLL CURSOR FOR SELECT id FROM b5_pgcur ORDER BY id');
+                const first = await client.query('FETCH 2 FROM c');
+                assert(JSON.stringify(first.rows) === '[{"id":1},{"id":2}]', `FETCH 2 is ${JSON.stringify(first.rows)}`);
+                assert(first.rowCount === 2, `FETCH 2 row count is ${first.rowCount}`);
+                const all = await client.query('FETCH ALL FROM c');
+                assert(JSON.stringify(all.rows) === '[{"id":3}]', `FETCH ALL is ${JSON.stringify(all.rows)}`);
+                const prior = await client.query('FETCH PRIOR FROM c');
+                assert(JSON.stringify(prior.rows) === '[{"id":3}]', `FETCH PRIOR is ${JSON.stringify(prior.rows)}`);
+                const moved = await client.query('MOVE BACKWARD 2 IN c');
+                assert(moved.rowCount === 2, `MOVE BACKWARD 2 row count is ${moved.rowCount}`);
+                await client.query('CLOSE c');
+                await client.query('COMMIT');
+                const closed = await capture(client.query('FETCH 1 FROM c'));
+                assert(closed?.code === '34000', `FETCH after CLOSE: ${closed?.code}`);
+                await client.query('BEGIN');
+                await client.query('DECLARE dup CURSOR FOR SELECT 1');
+                const duplicate = await capture(client.query('DECLARE dup CURSOR FOR SELECT 1'));
+                assert(duplicate?.code === '42P03', `duplicate DECLARE: ${duplicate?.code}`);
+                await client.query('ROLLBACK');
+                await client.query('BEGIN');
+                await client.query('DECLARE fwd NO SCROLL CURSOR FOR SELECT id FROM b5_pgcur ORDER BY id');
+                await client.query('FETCH 2 FROM fwd');
+                const backward = await capture(client.query('FETCH PRIOR FROM fwd'));
+                assert(backward?.code === '55000', `NO SCROLL backward: ${backward?.code}`);
+                assert(backward?.hint === 'Declare it with SCROLL option to enable backward scan.', `hint is ${backward?.hint}`);
+                await client.query('ROLLBACK');
+                const held = await capture(client.query('FETCH 1 FROM fwd'));
+                assert(held?.code === '34000', `cursor survived ROLLBACK: ${held?.code}`);
+                await client.query('DECLARE hold CURSOR WITH HOLD FOR SELECT id FROM b5_pgcur ORDER BY id');
+                await client.query('FETCH 2 FROM hold');
+                await client.query('COMMIT');
+                const afterCommit = await client.query('FETCH ALL FROM hold');
+                assert(JSON.stringify(afterCommit.rows) === '[{"id":3}]', `WITH HOLD after COMMIT is ${JSON.stringify(afterCommit.rows)}`);
+                await client.query('CLOSE hold');
+            });
+        });
+
+        await check('b5/prepare', async () => {
+            await withClient(batch5, async (client) => {
+                await client.query('CREATE TABLE b5_pgprep (id int, v text)');
+                await client.query("INSERT INTO b5_pgprep VALUES (1,'one'),(2,'two')");
+                await client.query('PREPARE p1 AS SELECT id, v FROM b5_pgprep WHERE id = $1');
+                const hit = await client.query("EXECUTE p1('2')");
+                assert(JSON.stringify(hit.rows) === '[{"id":2,"v":"two"}]', `EXECUTE p1 is ${JSON.stringify(hit.rows)}`);
+                const duplicate = await capture(client.query('PREPARE p1 AS SELECT 1'));
+                assert(duplicate?.code === '42P05', `duplicate PREPARE: ${duplicate?.code}`);
+                const missing = await capture(client.query('EXECUTE nope(1)'));
+                assert(missing?.code === '26000', `missing EXECUTE: ${missing?.code}`);
+                await client.query('PREPARE typed (int) AS SELECT $1 AS n');
+                const typed = await client.query("EXECUTE typed('7')");
+                assert(typed.rows[0].n === 7, `typed EXECUTE returned ${JSON.stringify(typed.rows[0])}`);
+                const removed = await capture(client.query('DEALLOCATE nope'));
+                assert(removed?.code === '26000', `missing DEALLOCATE: ${removed?.code}`);
+                await client.query('DEALLOCATE ALL');
+                const gone = await capture(client.query('EXECUTE p1(1)'));
+                assert(gone?.code === '26000', `EXECUTE after DEALLOCATE ALL: ${gone?.code}`);
+            });
+        });
+
+        await check('b5/notify', async () => {
+            await withClient(batch5, async (listener) => {
+                await withClient(batch5, async (sender) => {
+                    const received = [];
+                    const selfReceived = [];
+                    listener.on('notification', (message) => received.push(message));
+                    sender.on('notification', (message) => selfReceived.push(message));
+                    await listener.query('LISTEN chan_l');
+                    await sender.query("NOTIFY chan_l, 'auto'");
+                    assert(await waitFor(() => received.length === 1), 'cross-connection NOTIFY was not delivered');
+                    assert(received[0].channel === 'chan_l' && received[0].payload === 'auto', `notification is ${JSON.stringify(received[0])}`);
+                    assert(typeof received[0].processId === 'number', `notification pid is ${received[0].processId}`);
+                    received.length = 0;
+                    await sender.query('BEGIN');
+                    await sender.query("NOTIFY chan_l, 'deferred'");
+                    await new Promise((rest) => setTimeout(rest, 200));
+                    assert(received.length === 0, 'NOTIFY inside a transaction was delivered before COMMIT');
+                    await sender.query('COMMIT');
+                    assert(await waitFor(() => received.length === 1), 'deferred NOTIFY was not delivered at COMMIT');
+                    received.length = 0;
+                    await sender.query('BEGIN');
+                    await sender.query("NOTIFY chan_l, 'rolled'");
+                    await sender.query('ROLLBACK');
+                    await new Promise((rest) => setTimeout(rest, 200));
+                    assert(received.length === 0, 'NOTIFY on a rolled-back transaction was delivered');
+                    received.length = 0;
+                    await sender.query('LISTEN chan_l');
+                    await sender.query("NOTIFY chan_l, 'self'");
+                    assert(await waitFor(() => selfReceived.length === 1), 'self NOTIFY was not delivered');
+                    received.length = 0;
+                    selfReceived.length = 0;
+                    await sender.query('UNLISTEN chan_l');
+                    await sender.query("NOTIFY chan_l, 'gone'");
+                    await new Promise((rest) => setTimeout(rest, 200));
+                    assert(selfReceived.length === 0, 'UNLISTEN still delivered to the sender');
+                    assert(received.length === 1 && received[0].payload === 'gone', 'UNLISTEN removed the receiver');
+                    const tooLong = await capture(sender.query(`NOTIFY chan_l, '${'x'.repeat(8000)}'`));
+                    assert(tooLong?.code === '22023' && tooLong.message === 'payload string too long', `long payload is ${tooLong?.code}`);
+                });
+            });
+        });
+
+        if (process.env.PSQL_BIN) {
+            const runFixture = (server, file) =>
+                new Promise((resolve, reject) => {
+                    const child = spawn(
+                        psql,
+                        ['-h', server.host, '-p', String(server.port), '-U', 'postgres', '-d', 'postgres', '-f', file],
+                        {
+                            cwd: path.join(harnessDir, 'fixtures'),
+                            env: { ...process.env, LANG: 'C', LC_ALL: 'C', LC_MESSAGES: 'C', PGCLIENTENCODING: 'UTF8' },
+                            stdio: ['ignore', 'pipe', 'pipe'],
+                        },
+                    );
+                    const stdout = [];
+                    const stderr = [];
+                    child.stdout.on('data', (chunk) => stdout.push(chunk));
+                    child.stderr.on('data', (chunk) => stderr.push(chunk));
+                    child.once('error', reject);
+                    child.once('close', (status) => resolve({ stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), status: status ?? 1 }));
+                });
+            const checkFixture = async (name, prefix, script) => {
+                await check(name, async () => {
+                    const result = await runFixture(batch5, script);
+                    const expectedOut = fs.readFileSync(path.join(harnessDir, 'fixtures', `${prefix}.out.txt`));
+                    const expectedErr = fs.readFileSync(path.join(harnessDir, 'fixtures', `${prefix}.err.txt`));
+                    assert(result.status === 0, `${script} exited with ${result.status}: ${result.stderr.toString('utf8')}`);
+                    assert(
+                        Buffer.compare(result.stdout, expectedOut) === 0,
+                        `${script} stdout differs: ${JSON.stringify(result.stdout.toString('utf8').slice(0, 200))}`,
+                    );
+                    assert(
+                        Buffer.compare(result.stderr, expectedErr) === 0,
+                        `${script} stderr differs: ${JSON.stringify(result.stderr.toString('utf8').slice(0, 200))}`,
+                    );
+                });
+            };
+            await checkFixture('psql/b5-copy-to', 'b5-copy-to', 'b5-copy-to.sql');
+            await checkFixture('psql/b5-copy-from', 'b5-copy-from', 'b5-copy-from.sql');
+            await checkFixture('psql/b5-copy-dup', 'b5-copy-dup', 'b5-copy-dup.sql');
+            await checkFixture('psql/b5-copy-bad', 'b5-copy-bad', 'b5-copy-bad.sql');
+            await checkFixture('psql/b5-cursors', 'b5-cursors', 'b5-cursors.sql');
+            await checkFixture('psql/b5-prepare', 'b5-prepare', 'b5-prepare.sql');
+        }
+
         return {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 53,
+            floor: 63,
         };
     } finally {
         await trust.close();
@@ -1143,5 +1355,6 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batch2.close();
         await batch3.close();
         await batch4.close();
+        await batch5.close();
     }
 }

@@ -33,6 +33,8 @@ export interface MessageFields {
     detail?: string;
     hint?: string;
     position?: string;
+    /** `W` field, printed by psql as `CONTEXT:  ...`. */
+    where?: string;
     file?: string;
     line?: string;
     routine?: string;
@@ -124,6 +126,33 @@ export function noData(): Buffer {
     return frame('n');
 }
 
+/** `CopyInResponse`: format byte, column count and per-column formats. */
+export function copyInResponse(columns: number): Buffer {
+    const formats = [Buffer.from([0]), int16(columns)];
+    for (let index = 0; index < columns; index += 1) formats.push(int16(0));
+    return frame('G', Buffer.concat(formats));
+}
+
+/** `CopyOutResponse`, same shape as the inbound counterpart. */
+export function copyOutResponse(columns: number): Buffer {
+    const formats = [Buffer.from([0]), int16(columns)];
+    for (let index = 0; index < columns; index += 1) formats.push(int16(0));
+    return frame('H', Buffer.concat(formats));
+}
+
+export function copyData(payload: Buffer): Buffer {
+    return frame('d', payload);
+}
+
+export function copyDone(): Buffer {
+    return frame('c');
+}
+
+/** `NotificationResponse`: sender pid followed by channel and payload. */
+export function notificationResponse(pid: number, channel: string, payload: string): Buffer {
+    return frame('A', Buffer.concat([int32(pid), Buffer.from(channel), Buffer.from([0]), Buffer.from(payload), Buffer.from([0])]));
+}
+
 export function parameterDescription(typeOids: number[]): Buffer {
     const parts = [int16(typeOids.length)];
     for (const oid of typeOids) parts.push(int32(oid));
@@ -144,6 +173,7 @@ export function messageFieldsResponse(tag: string, fields: MessageFields): Buffe
     if (fields.detail !== undefined) parts.push(field('D', fields.detail));
     if (fields.hint !== undefined) parts.push(field('H', fields.hint));
     if (fields.position !== undefined) parts.push(field('P', fields.position));
+    if (fields.where !== undefined) parts.push(field('W', fields.where));
     if (fields.file !== undefined) parts.push(field('F', fields.file));
     if (fields.line !== undefined) parts.push(field('L', fields.line));
     if (fields.routine !== undefined) parts.push(field('R', fields.routine));
