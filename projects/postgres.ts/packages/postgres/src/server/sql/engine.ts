@@ -26,17 +26,20 @@ import {
     type CastExpr,
     type ColumnDef,
     type ColumnExpr,
+    type CommonTableExpression,
     type CreateIndexStatement,
     type CreateTableStatement,
     type DeleteStatement,
     type DropIndexStatement,
     type DropTableStatement,
     type Expr,
+    type FrameBound,
     type FromItem,
     type FunctionExpr,
     type InExpr,
     type InsertStatement,
     type IsNullExpr,
+    type LiteralExpr,
     type OrderItem,
     type ParamExpr,
     type ReferenceClause,
@@ -48,6 +51,8 @@ import {
     type AlterTableStatement,
     type UnaryExpr,
     type UpdateStatement,
+    type WindowFrame,
+    type WindowSpec,
     parseExpression,
 } from './parser.ts';
 import {
@@ -90,6 +95,11 @@ interface Context {
     columns: Binding[];
     row: SqlValue[];
     outer: Context | undefined;
+    /** Rows in the current aggregate group, absent outside a grouped query. */
+    group?: Context[];
+    /** Precomputed window-function values, indexed by output row. */
+    windowValues?: Map<FunctionExpr, SqlValue[]>;
+    windowIndex?: number;
 }
 
 interface Scope {
@@ -169,54 +179,228 @@ interface SelectResult {
 interface Entry {
     values: SqlValue[];
     keys: SqlValue[];
+    context?: Context;
 }
 
-function executeSelect(database: Database, select: SelectStatement, params: SqlValue[], outer: Context | undefined): SelectResult {
-    const orderBy = select.orderBy;
-    const core = select.core;
-    let fields: Field[] = [];
-    const entries: Entry[] = [];
-    const appendCore = (current: typeof core, withKeys: boolean): void => {
-        const { fields: coreFields, entries: coreEntries } = executeCore(database, current, params, outer, withKeys ? orderBy : []);
-        fields = coreFields;
-        entries.push(...coreEntries);
-    };
+/** Innermost scope first; `WITH` shadows relations for the query it precedes. */
+const cteScopes: Map<string, RowSet>[] = [];
 
-    appendCore(core, orderBy.length > 0 && select.unions.length === 0);
-    let dedupe = core.distinct;
-    for (const union of select.unions) {
-        const { fields: unionFields, entries: unionEntries } = executeCore(database, union.core, params, outer, []);
-        fields = unionFields;
-        entries.push(...unionEntries);
-        if (union.op === 'union' && !union.all) dedupe = true;
+function executeSelect(database: Database, select: SelectStatement, params: SqlValue[], outer: Context | undefined): SelectResult {
+    if (select.with) {
+        const scope = new Map<string, RowSet>();
+        cteScopes.push(scope);
+        try {
+            for (const cte of select.with.ctes) {
+                if (select.with.recursive && referencesRelation(cte.select, cte.name)) {
+                    evaluateRecursiveCte(database, cte, params, outer, scope);
+                }
+                else {
+                    const result = executeSelect(database, cte.select, params, outer);
+                    const names = cte.columns ?? result.fields.map((field, index) => field.name || `column${index + 1}`);
+                    scope.set(cte.name.toLowerCase(), {
+                        columns: names.map((name, index) => ({ alias: cte.name, name, type: result.fields[index]?.type ?? TEXT })),
+                        rows: result.rows,
+                    });
+                }
+            }
+            return executeSelectBody(database, select, params, outer);
+        }
+        finally {
+            cteScopes.pop();
+        }
     }
-    if (dedupe) {
-        const seen = new Set<string>();
-        for (let index = entries.length - 1; index >= 0; index -= 1) {
-            const entry = entries[index];
-            if (!entry) continue;
-            const key = JSON.stringify(entry.values);
-            if (seen.has(key)) entries.splice(index, 1);
-            else seen.add(key);
+    return executeSelectBody(database, select, params, outer);
+}
+
+function executeSelectBody(database: Database, select: SelectStatement, params: SqlValue[], outer: Context | undefined): SelectResult {
+    const orderBy = select.orderBy;
+    const ops = select.unions;
+    const results: { fields: Field[]; entries: Entry[] }[] = [
+        executeCore(database, select.core, params, outer, ops.length === 0 ? orderBy : []),
+    ];
+    if (ops.length === 0) return finishSelect(database, results[0]!, select, params);
+    for (const op of ops) results.push(executeCore(database, op.core, params, outer, []));
+
+    const width = results[0]!.fields.length;
+    for (const result of results) {
+        if (result.fields.length !== width) {
+            throw new ServerError('42601', 'each UNION query must have the same number of columns');
         }
     }
 
-    if (select.unions.length === 0) {
-        if (orderBy.length > 0) entries.sort((left, right) => compareEntries(left, right, orderBy));
+    // INTERSECT binds tighter than UNION and EXCEPT, so fold the intersect runs
+    // first and then combine the resulting terms left to right.
+    let term = results[0]!;
+    const terms: { fields: Field[]; entries: Entry[] }[] = [];
+    const seps: { op: 'union' | 'except'; all: boolean }[] = [];
+    for (let index = 0; index < ops.length; index += 1) {
+        const op = ops[index]!;
+        const right = results[index + 1]!;
+        if (op.op === 'intersect') {
+            term = { fields: term.fields, entries: setCombine('intersect', term.entries, right.entries, op.all) };
+            continue;
+        }
+        terms.push(term);
+        seps.push({ op: op.op, all: op.all });
+        term = right;
     }
-    else if (orderBy.length > 0) {
-        const keyed = entries.map((entry) => ({ values: entry.values, keys: orderBy.map((item) => outputKey(item, entry.values, fields)) }));
-        keyed.sort((left, right) => compareEntries(left, right, orderBy));
-        entries.splice(0, entries.length, ...keyed);
+    terms.push(term);
+    let combined = terms[0]!;
+    for (let index = 0; index < seps.length; index += 1) {
+        const sep = seps[index]!;
+        const right = terms[index + 1]!;
+        combined = { fields: combined.fields, entries: setCombine(sep.op, combined.entries, right.entries, sep.all) };
     }
+    return finishSelect(database, combined, select, params);
+}
 
+function finishSelect(database: Database, result: { fields: Field[]; entries: Entry[] }, select: SelectStatement, params: SqlValue[]): SelectResult {
+    const entries = result.entries;
+    if (select.orderBy.length > 0) {
+        if (select.unions.length === 0) entries.sort((left, right) => compareEntries(left, right, select.orderBy));
+        else {
+            const keyed = entries.map((entry) => ({
+                values: entry.values,
+                keys: select.orderBy.map((item) => outputKey(item, entry.values, result.fields)),
+                context: entry.context,
+            }));
+            keyed.sort((left, right) => compareEntries(left, right, select.orderBy));
+            entries.splice(0, entries.length, ...keyed);
+        }
+    }
     const offset = select.offset === undefined ? 0 : Number(evaluate(database, select.offset, emptyContext(), params));
     const limit = select.limit === undefined ? Number.POSITIVE_INFINITY : Number(evaluate(database, select.limit, emptyContext(), params));
     const rows = entries
         .slice(Number.isFinite(offset) ? offset : 0, Number.isFinite(limit) && Number.isFinite(offset) ? offset + limit : undefined)
         .map((entry) => entry.values);
-    return { fields, rows };
+    return { fields: result.fields, rows };
 }
+
+/** Set-operation evaluation. `all` keeps duplicate multiplicity. */
+function setCombine(op: 'union' | 'intersect' | 'except', left: Entry[], right: Entry[], all: boolean): Entry[] {
+    const keyOf = (entry: Entry): string => JSON.stringify(entry.values);
+    if (op === 'union') {
+        if (all) return [...left, ...right];
+        const seen = new Set<string>();
+        const result: Entry[] = [];
+        for (const entry of [...left, ...right]) {
+            const key = keyOf(entry);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            result.push(entry);
+        }
+        return result;
+    }
+    const rightKeys = new Set(right.map(keyOf));
+    if (op === 'intersect') {
+        if (all) {
+            const counts = new Map<string, number>();
+            for (const entry of right) counts.set(keyOf(entry), (counts.get(keyOf(entry)) ?? 0) + 1);
+            const result: Entry[] = [];
+            for (const entry of left) {
+                const key = keyOf(entry);
+                const remaining = counts.get(key) ?? 0;
+                if (remaining === 0) continue;
+                counts.set(key, remaining - 1);
+                result.push(entry);
+            }
+            return result;
+        }
+        const seen = new Set<string>();
+        const result: Entry[] = [];
+        for (const entry of left) {
+            const key = keyOf(entry);
+            if (!rightKeys.has(key) || seen.has(key)) continue;
+            seen.add(key);
+            result.push(entry);
+        }
+        return result;
+    }
+    if (all) {
+        const counts = new Map<string, number>();
+        for (const entry of right) counts.set(keyOf(entry), (counts.get(keyOf(entry)) ?? 0) + 1);
+        const result: Entry[] = [];
+        for (const entry of left) {
+            const key = keyOf(entry);
+            const remaining = counts.get(key) ?? 0;
+            if (remaining === 0) {
+                result.push(entry);
+                continue;
+            }
+            counts.set(key, remaining - 1);
+        }
+        return result;
+    }
+    const seen = new Set<string>();
+    const result: Entry[] = [];
+    for (const entry of left) {
+        const key = keyOf(entry);
+        if (rightKeys.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        result.push(entry);
+    }
+    return result;
+}
+
+
+/** True when the query's FROM tree mentions `name`; drives recursive CTE detection. */
+function referencesRelation(select: SelectStatement, name: string): boolean {
+    const wanted = name.toLowerCase();
+    const coreReferences = (core: SelectStatement['core']): boolean => core.from.some((item) => fromItemReferences(item, wanted));
+    if (coreReferences(select.core)) return true;
+    return select.unions.some((union) => coreReferences(union.core));
+}
+
+function fromItemReferences(item: FromItem, name: string): boolean {
+    if (item.kind === 'relation') return item.args === undefined && item.name.toLowerCase() === name;
+    if (item.kind === 'subquery') return referencesRelation(item.select, name);
+    return fromItemReferences(item.left, name) || fromItemReferences(item.right, name);
+}
+
+/**
+ * Runs `WITH RECURSIVE`: evaluate the anchor, then keep re-running the
+ * recursive terms against the accumulated rows until nothing new appears.
+ */
+function evaluateRecursiveCte(
+    database: Database,
+    cte: CommonTableExpression,
+    params: SqlValue[],
+    outer: Context | undefined,
+    scope: Map<string, RowSet>,
+): void {
+    const ops = cte.select.unions;
+    if (ops.length === 0) {
+        throw new ServerError('42601', 'recursive query "' + cte.name + '" must have a UNION or UNION ALL clause');
+    }
+    const anchor = executeCore(database, cte.select.core, params, outer, []);
+    const names = cte.columns ?? anchor.fields.map((field, index) => field.name || `column${index + 1}`);
+    let rows = anchor.entries.map((entry) => entry.values);
+    scope.set(cte.name.toLowerCase(), {
+        columns: names.map((name, index) => ({ alias: cte.name, name, type: anchor.fields[index]?.type ?? TEXT })),
+        rows,
+    });
+    const seen = new Set(rows.map((row) => JSON.stringify(row)));
+    let iterations = 0;
+    while (iterations < 1000) {
+        iterations += 1;
+        let added = 0;
+        for (const op of ops) {
+            const result = executeCore(database, op.core, params, outer, []);
+            const fresh: SqlValue[][] = [];
+            for (const entry of result.entries) {
+                const key = JSON.stringify(entry.values);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                fresh.push(entry.values);
+            }
+            rows = [...rows, ...fresh];
+            added += fresh.length;
+            scope.get(cte.name.toLowerCase())!.rows = rows;
+        }
+        if (added === 0) return;
+    }
+}
+
 
 /** Sort key for a set-operation result: ordinals and output aliases only. */
 function outputKey(item: OrderItem, values: SqlValue[], fields: Field[]): SqlValue {
@@ -272,26 +456,186 @@ function executeCore(
     }
     const from = buildFrom(database, core.from, params, outer);
     const targets = expandTargets(database, core.targets, from.columns);
-    const fields: Field[] = targets.map((target) => ({
-        name: targetName(target),
-        type: fieldType(database, target.expr, { columns: from.columns, outer: outer ? { columns: outer.columns, outer: undefined } : undefined }, params),
-    }));
+    const scope: Scope = { columns: from.columns, outer: outer ? { columns: outer.columns, outer: undefined } : undefined };
+    const fields: Field[] = targets.map((target) => ({ name: targetName(target), type: fieldType(database, target.expr, scope, params) }));
 
-    const entries: Entry[] = [];
+    // WHERE runs per input row; grouping and windows need the surviving rows.
+    const rows: Context[] = [];
     for (const row of from.rows) {
         const context: Context = { columns: from.columns, row, outer };
         if (core.where) {
             const keep = evaluate(database, core.where, context, params);
             if (keep !== true) continue;
         }
-        if (core.groupBy.length > 0 || core.having) {
-            throw new ServerError('0A000', 'feature not supported', 'GROUP BY and HAVING are not implemented');
+        rows.push(context);
+    }
+
+    const grouped = core.groupBy.length > 0
+        || core.having !== undefined
+        || targets.some((target) => containsAggregate(target.expr))
+        || orderBy.some((item) => containsAggregate(item.expr));
+    let contexts: Context[];
+    if (grouped) {
+        contexts = [];
+        for (const group of groupRows(database, core.groupBy, rows, params)) {
+            const groupContext: Context = { columns: from.columns, row: group[0]?.row ?? [], outer, group };
+            if (core.having !== undefined && evaluate(database, core.having, groupContext, params) !== true) continue;
+            contexts.push(groupContext);
         }
-        const values = targets.map((target) => evaluate(database, target.expr, context, params));
-        const keys = orderBy.map((item) => orderKey(database, item, context, values, fields, params));
-        entries.push({ values, keys });
+    }
+    else {
+        contexts = rows;
+    }
+
+    const windows = collectWindows([...targets.map((target) => target.expr), ...orderBy.map((item) => item.expr)]);
+    const windowValues = new Map<FunctionExpr, SqlValue[]>();
+    if (windows.length > 0) computeWindows(database, windows, contexts, params, windowValues);
+
+    const entries: Entry[] = [];
+    contexts.forEach((context, index) => {
+        const evalContext: Context = windows.length > 0 ? { ...context, windowValues, windowIndex: index } : context;
+        const values = targets.map((target) => evaluate(database, target.expr, evalContext, params));
+        const keys = orderBy.map((item) => orderKey(database, item, evalContext, values, fields, params));
+        entries.push({ values, keys, context: evalContext });
+    });
+    if (core.distinct) {
+        const seen = new Set<string>();
+        const kept: Entry[] = [];
+        for (const entry of entries) {
+            const key = JSON.stringify(entry.values);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            kept.push(entry);
+        }
+        entries.splice(0, entries.length, ...kept);
     }
     return { fields, entries };
+}
+
+const AGGREGATE_NAMES = new Set(['count', 'sum', 'avg', 'min', 'max', 'string_agg', 'array_agg', 'bool_and', 'bool_or', 'every']);
+
+function isAggregate(node: Expr): boolean {
+    return node.kind === 'function' && (node as FunctionExpr).over === undefined && AGGREGATE_NAMES.has((node as FunctionExpr).name.toLowerCase());
+}
+
+function containsAggregate(node: Expr | undefined): boolean {
+    if (node === undefined) return false;
+    if (isAggregate(node)) return true;
+    let found = false;
+    walkExpr(node, (child) => {
+        if (isAggregate(child)) found = true;
+    });
+    return found;
+}
+
+/** Visits every expression node, including subquery bodies left alone. */
+function walkExpr(node: Expr, visit: (node: Expr) => void): void {
+    visit(node);
+    switch (node.kind) {
+        case 'cast':
+        case 'unary':
+        case 'collate':
+        case 'subscript':
+            walkExpr((node as { expr: Expr }).expr, visit);
+            break;
+        case 'binary':
+            walkExpr((node as BinaryExpr).left, visit);
+            walkExpr((node as BinaryExpr).right, visit);
+            break;
+        case 'any':
+            walkExpr((node as AnyExpr).left, visit);
+            walkExpr((node as AnyExpr).array, visit);
+            break;
+        case 'case': {
+            const node2 = node as CaseExpr;
+            if (node2.operand) walkExpr(node2.operand, visit);
+            for (const branch of node2.whens) {
+                walkExpr(branch.when, visit);
+                walkExpr(branch.then, visit);
+            }
+            if (node2.otherwise) walkExpr(node2.otherwise, visit);
+            break;
+        }
+        case 'in': {
+            const node2 = node as InExpr;
+            walkExpr(node2.expr, visit);
+            for (const item of node2.list) walkExpr(item, visit);
+            break;
+        }
+        case 'isnull':
+            walkExpr((node as IsNullExpr).expr, visit);
+            break;
+        case 'array':
+            for (const element of (node as ArrayExpr).elements ?? []) walkExpr(element, visit);
+            break;
+        case 'function': {
+            const node2 = node as FunctionExpr;
+            for (const argument of node2.args) walkExpr(argument, visit);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+function collectWindows(roots: Expr[]): FunctionExpr[] {
+    const result: FunctionExpr[] = [];
+    const seen = new Set<FunctionExpr>();
+    const walk = (node: Expr): void => {
+        if (node.kind === 'function' && (node as FunctionExpr).over !== undefined && !seen.has(node as FunctionExpr)) {
+            seen.add(node as FunctionExpr);
+            result.push(node as FunctionExpr);
+        }
+        let children: Expr[] = [];
+        switch (node.kind) {
+            case 'cast':
+            case 'unary':
+            case 'collate':
+            case 'subscript':
+                children = [(node as { expr: Expr }).expr];
+                break;
+            case 'binary':
+                children = [(node as BinaryExpr).left, (node as BinaryExpr).right];
+                break;
+            case 'any':
+                children = [(node as AnyExpr).left, (node as AnyExpr).array];
+                break;
+            case 'case': {
+                const node2 = node as CaseExpr;
+                children = [node2.operand, node2.otherwise, ...node2.whens.flatMap((branch) => [branch.when, branch.then])].filter((child): child is Expr => child !== undefined);
+                break;
+            }
+            case 'in':
+                children = [(node as InExpr).expr, ...(node as InExpr).list];
+                break;
+            case 'isnull':
+                children = [(node as IsNullExpr).expr];
+                break;
+            case 'array':
+                children = (node as ArrayExpr).elements ?? [];
+                break;
+            case 'function':
+                children = (node as FunctionExpr).args;
+                break;
+            default:
+                break;
+        }
+        for (const child of children) walk(child);
+    };
+    for (const root of roots) walk(root);
+    return result;
+}
+
+function groupRows(database: Database, groupBy: Expr[], rows: Context[], params: SqlValue[]): Context[][] {
+    if (groupBy.length === 0) return [rows];
+    const buckets = new Map<string, Context[]>();
+    for (const row of rows) {
+        const key = JSON.stringify(groupBy.map((expr) => evaluate(database, expr, row, params)));
+        const bucket = buckets.get(key);
+        if (bucket) bucket.push(row);
+        else buckets.set(key, [row]);
+    }
+    return [...buckets.values()];
 }
 
 function orderKey(database: Database, item: OrderItem, context: Context, values: SqlValue[], fields: Field[], params: SqlValue[]): SqlValue {
@@ -336,23 +680,25 @@ function targetName(target: Target): string {
 function fieldType(database: Database, expr: Expr, scope: Scope | undefined, params: SqlValue[]): DataType {
     switch (expr.kind) {
         case 'literal': {
-            const value = (expr as { value: SqlValue }).value;
+            const literal = expr as LiteralExpr;
+            const value = literal.value;
             if (typeof value === 'boolean') return BOOL;
-            if (typeof value === 'number') return Number.isInteger(value) ? INT4 : typeOf('float8');
+            if (typeof value === 'number') return Number.isInteger(value) ? INT4 : typeOf('numeric');
+            if (literal.numeric === true) return typeOf('numeric');
             return TEXT;
         }
         case 'param':
             return TEXT;
         case 'column': {
             const column = expr as ColumnExpr;
-            const binding = findBinding(scope, column.qualifier, column.name);
-            if (!binding) throw new ServerError('42703', `column "${column.name}" does not exist`);
+            const binding = findBinding(scope, column.qualifier, column.name, column.start);
+            if (!binding) throw new ServerError('42703', `column "${column.name}" does not exist`, undefined, column.start);
             return binding.type;
         }
         case 'cast':
             return (expr as CastExpr).type;
         case 'function':
-            return functionType((expr as FunctionExpr).name);
+            return functionFieldType(database, expr as FunctionExpr, scope, params);
         case 'binary': {
             const binary = expr as BinaryExpr;
             if (['and', 'or', '=', '<>', '<', '>', '<=', '>=', '~', '!~', '~*', '!~*'].includes(binary.op)) return BOOL;
@@ -382,6 +728,25 @@ function fieldType(database: Database, expr: Expr, scope: Scope | undefined, par
         default:
             return TEXT;
     }
+}
+
+function functionFieldType(database: Database, expr: FunctionExpr, scope: Scope | undefined, params: SqlValue[]): DataType {
+    const name = expr.name.toLowerCase();
+    if (name === 'row_number' || name === 'rank' || name === 'dense_rank' || name === 'count') return typeOf('int8');
+    if (name === 'sum' || name === 'avg') {
+        const argument = expr.args[0];
+        const argumentType = argument === undefined ? undefined : fieldType(database, argument, scope, params);
+        if (argumentType !== undefined && (argumentType.key === 'float4' || argumentType.key === 'float8')) {
+            return argumentType.key === 'float4' ? typeOf('float4') : typeOf('float8');
+        }
+        if (name === 'avg') return typeOf('numeric');
+        return argumentType?.key === 'numeric' ? typeOf('numeric') : typeOf('int8');
+    }
+    if (name === 'min' || name === 'max' || name === 'lag' || name === 'lead' || name === 'coalesce' || name === 'nullif') {
+        const argument = expr.args[0];
+        return argument === undefined ? TEXT : fieldType(database, argument, scope, params);
+    }
+    return functionType(name);
 }
 
 function functionType(name: string): DataType {
@@ -416,9 +781,11 @@ function staticSelectType(select: SelectStatement): DataType | undefined {
 function staticExprType(expr: Expr): DataType | undefined {
     switch (expr.kind) {
         case 'literal': {
-            const value = (expr as { value: SqlValue }).value;
+            const literal = expr as LiteralExpr;
+            const value = literal.value;
             if (typeof value === 'boolean') return BOOL;
-            if (typeof value === 'number') return Number.isInteger(value) ? INT4 : typeOf('float8');
+            if (typeof value === 'number') return Number.isInteger(value) ? INT4 : typeOf('numeric');
+            if (literal.numeric === true) return typeOf('numeric');
             return TEXT;
         }
         case 'cast':
@@ -436,11 +803,11 @@ function staticExprType(expr: Expr): DataType | undefined {
     }
 }
 
-function findBinding(scope: Scope | undefined, qualifier: string | undefined, name: string): Binding | undefined {
+function findBinding(scope: Scope | undefined, qualifier: string | undefined, name: string, start?: number): Binding | undefined {
     let current = scope;
     while (current) {
         const candidates = current.columns.filter((column) => column.name === name && (qualifier === undefined || column.alias === qualifier));
-        if (candidates.length > 1) throw new ServerError('42702', `column reference "${name}" is ambiguous`);
+        if (candidates.length > 1) throw new ServerError('42702', `column reference "${name}" is ambiguous`, undefined, start);
         const found = candidates[0];
         if (found) return found;
         if (qualifier !== undefined && current.columns.some((column) => column.alias === qualifier)) return undefined;
@@ -498,32 +865,137 @@ function buildItem(database: Database, item: FromItem, params: SqlValue[], outer
     if (item.kind === 'subquery') {
         const result = executeSelect(database, item.select, params, outer);
         const alias = item.alias ?? '';
+        const names = item.columns ?? result.fields.map((field) => field.name);
+        if (item.columns !== undefined && item.columns.length !== result.fields.length) {
+            throw new ServerError('42P10', `table "${alias}" has ${result.fields.length} columns available but ${item.columns.length} columns specified`);
+        }
         return {
-            columns: result.fields.map((field) => ({ alias, name: field.name, type: field.type })),
+            columns: result.fields.map((field, index) => ({ alias, name: names[index] ?? field.name, type: field.type })),
             rows: result.rows,
         };
     }
     const left = buildItem(database, item.left, params, outer);
     const right = buildItem(database, item.right, params, outer);
     if (item.joinType === 'cross') return crossJoin(left, right);
+    if (item.using !== undefined && item.using.length > 0) return usingJoin(database, item, left, right, params, outer);
+    return onJoin(database, item, left, right, params, outer);
+}
+
+function onJoin(
+    database: Database,
+    item: Extract<FromItem, { kind: 'join' }>,
+    left: RowSet,
+    right: RowSet,
+    params: SqlValue[],
+    outer: Context | undefined,
+): RowSet {
     const columns = [...left.columns, ...right.columns];
     const rows: SqlValue[][] = [];
-    for (const leftRow of left.rows) {
-        let matched = false;
-        for (const rightRow of right.rows) {
+    const leftMatched = new Array<boolean>(left.rows.length).fill(false);
+    const rightMatched = new Array<boolean>(right.rows.length).fill(false);
+    for (let leftIndex = 0; leftIndex < left.rows.length; leftIndex += 1) {
+        const leftRow = left.rows[leftIndex]!;
+        for (let rightIndex = 0; rightIndex < right.rows.length; rightIndex += 1) {
+            const rightRow = right.rows[rightIndex]!;
             const row = [...leftRow, ...rightRow];
             const context: Context = { columns, row, outer };
             const keep = item.on === undefined ? true : evaluate(database, item.on, context, params);
-            if (keep === true) {
-                rows.push(row);
-                matched = true;
-            }
-        }
-        if (!matched && item.joinType === 'left') {
-            const nulls = right.columns.map(() => null);
-            rows.push([...leftRow, ...nulls]);
+            if (keep !== true) continue;
+            rows.push(row);
+            leftMatched[leftIndex] = true;
+            rightMatched[rightIndex] = true;
         }
     }
+    const rightNulls = right.columns.map(() => null);
+    const leftNulls = left.columns.map(() => null);
+    if (item.joinType === 'left' || item.joinType === 'full') {
+        for (let index = 0; index < left.rows.length; index += 1) {
+            if (!leftMatched[index]) rows.push([...left.rows[index]!, ...rightNulls]);
+        }
+    }
+    if (item.joinType === 'right' || item.joinType === 'full') {
+        for (let index = 0; index < right.rows.length; index += 1) {
+            if (!rightMatched[index]) rows.push([...leftNulls, ...right.rows[index]!]);
+        }
+    }
+    return { columns, rows };
+}
+
+/** `JOIN ... USING (...)`: merged join columns appear once, then both remainders. */
+function usingJoin(
+    database: Database,
+    item: Extract<FromItem, { kind: 'join' }>,
+    left: RowSet,
+    right: RowSet,
+    params: SqlValue[],
+    outer: Context | undefined,
+): RowSet {
+    const names = item.using ?? [];
+    const leftIndexes = names.map((name) => left.columns.findIndex((column) => column.name === name));
+    const rightIndexes = names.map((name) => right.columns.findIndex((column) => column.name === name));
+    for (let index = 0; index < names.length; index += 1) {
+        if (leftIndexes[index] === -1) throw new ServerError('42703', `column "${names[index]}" does not exist`);
+        if (rightIndexes[index] === -1) throw new ServerError('42703', `column "${names[index]}" does not exist`);
+    }
+    const leftRest = left.columns.map((_, index) => index).filter((index) => !leftIndexes.includes(index));
+    const rightRest = right.columns.map((_, index) => index).filter((index) => !rightIndexes.includes(index));
+    const columns: Binding[] = [
+        ...leftIndexes.map((index) => left.columns[index]!),
+        ...leftRest.map((index) => left.columns[index]!),
+        ...rightRest.map((index) => right.columns[index]!),
+    ];
+    const rows: SqlValue[][] = [];
+    const leftMatched = new Array<boolean>(left.rows.length).fill(false);
+    const rightMatched = new Array<boolean>(right.rows.length).fill(false);
+    for (let leftIndex = 0; leftIndex < left.rows.length; leftIndex += 1) {
+        const leftRow = left.rows[leftIndex]!;
+        for (let rightIndex = 0; rightIndex < right.rows.length; rightIndex += 1) {
+            const rightRow = right.rows[rightIndex]!;
+            let matched = true;
+            for (let position = 0; position < names.length; position += 1) {
+                const a = leftRow[leftIndexes[position]!] ?? null;
+                const b = rightRow[rightIndexes[position]!] ?? null;
+                if (a === null || b === null || compareValues(a, b) !== 0) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (!matched) continue;
+            rows.push([
+                ...leftIndexes.map((index) => leftRow[index] ?? null),
+                ...leftRest.map((index) => leftRow[index] ?? null),
+                ...rightRest.map((index) => rightRow[index] ?? null),
+            ]);
+            leftMatched[leftIndex] = true;
+            rightMatched[rightIndex] = true;
+        }
+    }
+    const leftNulls = leftRest.map(() => null);
+    if (item.joinType === 'left' || item.joinType === 'full') {
+        for (let index = 0; index < left.rows.length; index += 1) {
+            if (leftMatched[index]) continue;
+            const leftRow = left.rows[index]!;
+            rows.push([
+                ...leftIndexes.map((position) => leftRow[position] ?? null),
+                ...leftRest.map((rest) => leftRow[rest] ?? null),
+                ...rightRest.map(() => null),
+            ]);
+        }
+    }
+    if (item.joinType === 'right' || item.joinType === 'full') {
+        for (let index = 0; index < right.rows.length; index += 1) {
+            if (rightMatched[index]) continue;
+            const rightRow = right.rows[index]!;
+            rows.push([
+                ...rightIndexes.map((position) => rightRow[position] ?? null),
+                ...leftNulls,
+                ...rightRest.map((rest) => rightRow[rest] ?? null),
+            ]);
+        }
+    }
+    void database;
+    void params;
+    void outer;
     return { columns, rows };
 }
 
@@ -536,6 +1008,13 @@ function crossJoin(left: RowSet, right: RowSet): RowSet {
 
 function buildRelation(database: Database, ref: RelationRef, params: SqlValue[], context?: Context): RowSet {
     const alias = ref.alias ?? ref.name;
+    if (ref.args === undefined) {
+        for (let index = cteScopes.length - 1; index >= 0; index -= 1) {
+            const cte = cteScopes[index]!.get(ref.name.toLowerCase());
+            if (cte === undefined) continue;
+            return { columns: cte.columns.map((column) => ({ alias, name: column.name, type: column.type })), rows: cte.rows };
+        }
+    }
     if (ref.args !== undefined) {
         const lowered = ref.name.toLowerCase();
         if (lowered === 'pg_partition_ancestors') {
@@ -544,7 +1023,7 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
             const values: SqlValue[] = ref.ordinality === true ? [argument, 1] : [argument];
             return { columns, rows: argument === null ? [] : [values] };
         }
-        throw new ServerError('42883', `function ${ref.name}(${ref.args.length} arguments) does not exist`);
+        throw new ServerError('42883', `function ${ref.name}(${ref.args.length} arguments) does not exist`, undefined, ref.start);
     }
     const system = ref.schema === 'pg_catalog' ? systemColumns(ref.name) : ref.schema === undefined ? systemColumns(ref.name) : undefined;
     if (system) {
@@ -554,9 +1033,9 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
             rows: table?.rows ?? [],
         };
     }
-    if (ref.schema !== undefined && ref.schema !== 'public') throw new ServerError('3F000', `schema "${ref.schema}" does not exist`);
+    if (ref.schema !== undefined && ref.schema !== 'public') throw new ServerError('3F000', `schema "${ref.schema}" does not exist`, undefined, ref.start);
     const relation = relationByName(database.catalog, ref.name);
-    if (!relation) throw new ServerError('42P01', `relation "${ref.name}" does not exist`);
+    if (!relation) throw new ServerError('42P01', `relation "${ref.name}" does not exist`, undefined, ref.start);
     const columns: ColumnMeta[] = database.catalog.columns
         .filter((column) => column.relid === relation.oid)
         .sort((left, right) => left.attnum - right.attnum)
@@ -580,7 +1059,7 @@ function evaluate(database: Database, expr: Expr, context: Context, params: SqlV
         }
         case 'column': {
             const column = expr as ColumnExpr;
-            return lookup(database, context, column.qualifier, column.name, params);
+            return lookup(database, context, column.qualifier, column.name, params, column.start);
         }
         case 'cast':
             return evaluateCast(database, expr as CastExpr, context, params);
@@ -646,7 +1125,7 @@ function evaluate(database: Database, expr: Expr, context: Context, params: SqlV
         case 'array':
             return evaluateArray(database, expr as ArrayExpr, context, params);
         case 'function':
-            return evaluateFunction(database, expr as FunctionExpr, context, params);
+            return evaluateCall(database, expr as FunctionExpr, context, params);
         case 'default':
             return null;
         case 'star':
@@ -655,25 +1134,31 @@ function evaluate(database: Database, expr: Expr, context: Context, params: SqlV
     }
 }
 
-function lookup(database: Database, context: Context, qualifier: string | undefined, name: string, params: SqlValue[]): SqlValue {
+function lookup(database: Database, context: Context, qualifier: string | undefined, name: string, params: SqlValue[], start?: number): SqlValue {
     let current: Context | undefined = context;
     while (current) {
-        const binding = findBinding({ columns: current.columns, outer: undefined }, qualifier, name);
+        const binding = findBinding({ columns: current.columns, outer: undefined }, qualifier, name, start);
         if (binding) {
             const index = current.columns.indexOf(binding);
             return current.row[index] ?? null;
         }
         if (qualifier !== undefined && current.columns.some((column) => column.alias === qualifier)) {
-            throw new ServerError('42703', `column ${qualifier}.${name} does not exist`);
+            throw new ServerError('42703', `column ${qualifier}.${name} does not exist`, undefined, start);
         }
         current = current.outer;
     }
-    throw new ServerError('42703', `column "${name}" does not exist`);
+    throw new ServerError('42703', `column "${name}" does not exist`, undefined, start);
 }
 
 function evaluateCast(database: Database, expr: CastExpr, context: Context, params: SqlValue[]): SqlValue {
     const value = evaluate(database, expr.expr, context, params);
-    return castValue(value, expr.type, { relationName: (oid) => relationDisplayName(database.catalog, oid) });
+    try {
+        return castValue(value, expr.type, { relationName: (oid) => relationDisplayName(database.catalog, oid) });
+    }
+    catch (error) {
+        if (error instanceof ServerError && error.position === undefined) error.position = expr.expr.start;
+        throw error;
+    }
 }
 
 function relationDisplayName(catalog: CatalogDoc, oid: number): string | null {
@@ -800,8 +1285,19 @@ function splitArray(value: SqlValue): SqlValue[] {
 
 function evaluateFunction(database: Database, expr: FunctionExpr, context: Context, params: SqlValue[]): SqlValue {
     const name = expr.name.toLowerCase();
-    if (['count', 'sum', 'avg', 'min', 'max', 'string_agg', 'array_agg'].includes(name)) {
-        throw new ServerError('0A000', 'feature not supported', 'aggregate functions are not implemented');
+    if (name === 'coalesce') {
+        for (const argument of expr.args) {
+            const value = evaluate(database, argument, context, params);
+            if (value !== null) return value;
+        }
+        return null;
+    }
+    if (name === 'nullif') {
+        const left = evaluate(database, expr.args[0] ?? { kind: 'literal', value: null, text: 'NULL' }, context, params);
+        const right = evaluate(database, expr.args[1] ?? { kind: 'literal', value: null, text: 'NULL' }, context, params);
+        if (left === null) return null;
+        if (right !== null && compareValues(left, right) === 0) return null;
+        return left;
     }
     const args = expr.args.map((argument) => evaluate(database, argument, context, params));
     switch (name) {
@@ -848,10 +1344,21 @@ function evaluateFunction(database: Database, expr: FunctionExpr, context: Conte
             // Partition hierarchy is flat here, so a relation is its own ancestor.
             return args[0] ?? null;
         case 'array_to_string': {
+            if ((args[0] ?? null) === null) return null;
             const array = splitArray(args[0] ?? null);
             const separator = formatValue(args[1] ?? ',', TEXT) ?? ',';
             return array.map((item) => String(item)).join(separator);
         }
+        case 'pg_encoding_to_char':
+            return pgEncodingToChar(args[0] ?? null);
+        case 'pg_function_is_visible':
+            return true;
+        case 'pg_get_function_result':
+        case 'pg_get_function_arguments':
+        case 'pg_get_functiondef':
+            return null;
+        case 'pg_get_function_identity_arguments':
+            return '';
         case 'array_upper': {
             const array = splitArray(args[0] ?? null);
             return array.length === 0 ? null : array.length;
@@ -864,7 +1371,287 @@ function evaluateFunction(database: Database, expr: FunctionExpr, context: Conte
             return values.join(' ');
         }
         default:
-            throw new ServerError('42883', `function ${expr.name}(${args.length} arguments) does not exist`);
+            throw new ServerError('42883', `function ${expr.name}(${args.length} arguments) does not exist`, undefined, expr.start);
+    }
+}
+
+function pgEncodingToChar(value: SqlValue): SqlValue {
+    const encoding = Number(value);
+    if (!Number.isFinite(encoding)) return null;
+    const names: Record<number, string> = { 0: 'SQL_ASCII', 6: 'UTF8', 8: 'LATIN1' };
+    return names[encoding] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Aggregates and windows
+// ---------------------------------------------------------------------------
+
+function evaluateCall(database: Database, expr: FunctionExpr, context: Context, params: SqlValue[]): SqlValue {
+    if (expr.over !== undefined) {
+        const values = context.windowValues?.get(expr);
+        if (values === undefined || context.windowIndex === undefined) {
+            throw new ServerError('0A000', 'feature not supported', 'window functions are only supported in a query target or ORDER BY');
+        }
+        return values[context.windowIndex] ?? null;
+    }
+    if (AGGREGATE_NAMES.has(expr.name.toLowerCase())) return evaluateAggregate(database, expr, context, params);
+    return evaluateFunction(database, expr, context, params);
+}
+
+function evaluateAggregate(database: Database, expr: FunctionExpr, context: Context, params: SqlValue[]): SqlValue {
+    const group = context.group;
+    if (group === undefined) {
+        throw new ServerError('0A000', 'feature not supported', 'aggregate functions are only supported in grouped queries');
+    }
+    const name = expr.name.toLowerCase();
+    if (expr.star) {
+        if (name !== 'count') throw new ServerError('42809', `aggregate ${expr.name}(*) does not accept a star`);
+        return group.length;
+    }
+    const values = group.map((row) => evaluate(database, expr.args[0]!, row, params));
+    return aggregateValue(name, values, expr.distinct === true, expr.name);
+}
+
+function aggregateValue(name: string, raw: SqlValue[], distinct: boolean, displayName: string): SqlValue {
+    let values = raw;
+    if (distinct) {
+        const seen = new Set<string>();
+        values = [];
+        for (const value of raw) {
+            const key = JSON.stringify(value);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            values.push(value);
+        }
+    }
+    switch (name) {
+        case 'count':
+            return values.filter((value) => value !== null).length;
+        case 'sum': {
+            const numbers = values.filter((value): value is Exclude<SqlValue, null> => value !== null);
+            if (numbers.length === 0) return null;
+            return decimalSum(numbers);
+        }
+        case 'avg': {
+            const numbers = values.filter((value): value is Exclude<SqlValue, null> => value !== null);
+            if (numbers.length === 0) return null;
+            return decimalAverage(numbers);
+        }
+        case 'min':
+        case 'max': {
+            let best: SqlValue = null;
+            for (const value of values) {
+                if (value === null) continue;
+                if (best === null) {
+                    best = value;
+                    continue;
+                }
+                const compared = compareValues(value, best);
+                if (name === 'min' ? compared < 0 : compared > 0) best = value;
+            }
+            return best;
+        }
+        default:
+            throw new ServerError('0A000', 'feature not supported', `aggregate ${displayName} is not implemented`);
+    }
+}
+
+interface Decimal {
+    negative: boolean;
+    magnitude: bigint;
+    scale: number;
+}
+
+function decimalParse(value: SqlValue): Decimal {
+    let text = typeof value === 'number' ? String(value) : String(value);
+    if (/[eE]/.test(text)) {
+        const number = Number(value);
+        text = number.toFixed(20).replace(/0+$/, '').replace(/\.$/, '');
+    }
+    const match = /^([+-])?(\d*)(?:\.(\d+))?$/.exec(text);
+    if (!match) throw new ServerError('22P02', `invalid input syntax for type numeric: "${text}"`);
+    const fraction = match[3] ?? '';
+    return { negative: match[1] === '-', magnitude: BigInt(`${match[2] || '0'}${fraction}`), scale: fraction.length };
+}
+
+function renderDecimal(negative: boolean, magnitude: bigint, scale: number): string {
+    const digits = magnitude.toString();
+    if (scale === 0) return `${magnitude === 0n ? '' : negative ? '-' : ''}${digits}`;
+    const padded = digits.padStart(scale + 1, '0');
+    const split = padded.length - scale;
+    return `${magnitude === 0n ? '' : negative ? '-' : ''}${padded.slice(0, split)}.${padded.slice(split)}`;
+}
+
+function decimalSum(values: Exclude<SqlValue, null>[]): string {
+    const decimals = values.map(decimalParse);
+    const scale = Math.max(...decimals.map((decimal) => decimal.scale));
+    let total = 0n;
+    for (const decimal of decimals) {
+        const scaled = decimal.magnitude * 10n ** BigInt(scale - decimal.scale);
+        total += decimal.negative ? -scaled : scaled;
+    }
+    return renderDecimal(total < 0n, total < 0n ? -total : total, scale);
+}
+
+function decimalAverage(values: Exclude<SqlValue, null>[]): string {
+    const decimals = values.map(decimalParse);
+    const scale = Math.max(...decimals.map((decimal) => decimal.scale));
+    let total = 0n;
+    for (const decimal of decimals) {
+        const scaled = decimal.magnitude * 10n ** BigInt(scale - decimal.scale);
+        total += decimal.negative ? -scaled : scaled;
+    }
+    // PostgreSQL renders `avg` with 16 fractional digits for integer and
+    // numeric input. `total` is scaled by 10^scale, so divide it out too.
+    let numerator = total * 10n ** 16n;
+    const denominator = BigInt(values.length) * 10n ** BigInt(scale);
+    let quotient = numerator / denominator;
+    const remainder = numerator % denominator;
+    if (remainder !== 0n) {
+        const absolute = remainder < 0n ? -remainder : remainder;
+        if (absolute * 2n >= denominator) quotient += numerator < 0n ? -1n : 1n;
+    }
+    numerator = quotient;
+    return renderDecimal(numerator < 0n, numerator < 0n ? -numerator : numerator, 16);
+}
+
+function compareWindowKeys(left: SqlValue[], right: SqlValue[], orderBy: OrderItem[]): number {
+    for (let index = 0; index < orderBy.length; index += 1) {
+        const item = orderBy[index]!;
+        const compared = compareWithNulls(left[index] ?? null, right[index] ?? null, item);
+        if (compared !== 0) return compared;
+    }
+    return 0;
+}
+
+function defaultWindowFrame(spec: WindowSpec): WindowFrame {
+    if (spec.orderBy.length > 0) {
+        return { mode: 'range', start: { type: 'unbounded-preceding' }, end: { type: 'current-row' } };
+    }
+    return { mode: 'range', start: { type: 'unbounded-preceding' }, end: { type: 'unbounded-following' } };
+}
+
+function computeWindows(
+    database: Database,
+    nodes: FunctionExpr[],
+    contexts: Context[],
+    params: SqlValue[],
+    target: Map<FunctionExpr, SqlValue[]>,
+): void {
+    for (const node of nodes) {
+        const spec = node.over!;
+        const values: SqlValue[] = Array.from({ length: contexts.length }, () => null);
+        const partitions = new Map<string, number[]>();
+        contexts.forEach((context, index) => {
+            const key = JSON.stringify(spec.partitionBy.map((expr) => evaluate(database, expr, context, params)));
+            const bucket = partitions.get(key);
+            if (bucket) bucket.push(index);
+            else partitions.set(key, [index]);
+        });
+        for (const indices of partitions.values()) {
+            const items = indices.map((index) => ({
+                index,
+                keys: spec.orderBy.map((item) => evaluate(database, item.expr, contexts[index]!, params)),
+            }));
+            if (spec.orderBy.length > 0) items.sort((left, right) => compareWindowKeys(left.keys, right.keys, spec.orderBy));
+            const count = items.length;
+            const peerStart = new Array<number>(count).fill(0);
+            const peerEnd = new Array<number>(count).fill(0);
+            let cursor = 0;
+            while (cursor < count) {
+                let end = cursor;
+                while (end + 1 < count && compareWindowKeys(items[cursor]!.keys, items[end + 1]!.keys, spec.orderBy) === 0) end += 1;
+                for (let index = cursor; index <= end; index += 1) {
+                    peerStart[index] = cursor;
+                    peerEnd[index] = end;
+                }
+                cursor = end + 1;
+            }
+            const denseRank = new Array<number>(count).fill(0);
+            let group = 0;
+            for (let index = 0; index < count; index += 1) {
+                if (index > 0 && compareWindowKeys(items[index - 1]!.keys, items[index]!.keys, spec.orderBy) !== 0) group += 1;
+                denseRank[index] = group + 1;
+            }
+
+            for (let position = 0; position < count; position += 1) {
+                const item = items[position]!;
+                values[item.index] = windowValue(database, node, spec, contexts, items, position, peerStart, peerEnd, denseRank, params);
+            }
+        }
+        target.set(node, values);
+    }
+}
+
+function windowValue(
+    database: Database,
+    node: FunctionExpr,
+    spec: WindowSpec,
+    contexts: Context[],
+    items: { index: number; keys: SqlValue[] }[],
+    position: number,
+    peerStart: number[],
+    peerEnd: number[],
+    denseRank: number[],
+    params: SqlValue[],
+): SqlValue {
+    const name = node.name.toLowerCase();
+    if (name === 'row_number') return position + 1;
+    if (name === 'rank') return peerStart[position]! + 1;
+    if (name === 'dense_rank') return denseRank[position]!;
+    if (name === 'lag' || name === 'lead') {
+        const current = contexts[items[position]!.index]!;
+        const offset = node.args[1] === undefined ? 1 : Number(evaluate(database, node.args[1], current, params));
+        const targetPosition = name === 'lag' ? position - offset : position + offset;
+        if (targetPosition < 0 || targetPosition >= items.length) {
+            return node.args[2] === undefined ? null : evaluate(database, node.args[2], current, params);
+        }
+        const targetContext = contexts[items[targetPosition]!.index]!;
+        return evaluate(database, node.args[0]!, targetContext, params);
+    }
+    const frame = spec.frame ?? defaultWindowFrame(spec);
+    const hasOrder = spec.orderBy.length > 0;
+    const start = frameBoundPosition(frame.start, true, position, items.length, peerStart, peerEnd, hasOrder, frame, database, contexts[items[position]!.index]!, params);
+    const end = frameBoundPosition(frame.end, false, position, items.length, peerStart, peerEnd, hasOrder, frame, database, contexts[items[position]!.index]!, params);
+    if (name === 'count' && node.star) return Math.max(0, end - start + 1);
+    const collected: SqlValue[] = [];
+    for (let index = start; index <= end; index += 1) {
+        collected.push(evaluate(database, node.args[0]!, contexts[items[index]!.index]!, params));
+    }
+    return aggregateValue(name, collected, node.distinct === true, node.name);
+}
+
+function frameBoundPosition(
+    bound: FrameBound,
+    isStart: boolean,
+    position: number,
+    count: number,
+    peerStart: number[],
+    peerEnd: number[],
+    hasOrder: boolean,
+    frame: WindowFrame,
+    database: Database,
+    context: Context,
+    params: SqlValue[],
+): number {
+    switch (bound.type) {
+        case 'unbounded-preceding':
+            return 0;
+        case 'unbounded-following':
+            return count - 1;
+        case 'current-row':
+            if (frame.mode === 'range' && hasOrder) return isStart ? peerStart[position]! : peerEnd[position]!;
+            return position;
+        case 'preceding': {
+            if (frame.mode === 'range') throw new ServerError('0A000', 'feature not supported', 'RANGE frames with an offset are not implemented');
+            const offset = Number(evaluate(database, bound.offset!, context, params));
+            return Math.max(0, position - offset);
+        }
+        case 'following': {
+            if (frame.mode === 'range') throw new ServerError('0A000', 'feature not supported', 'RANGE frames with an offset are not implemented');
+            const offset = Number(evaluate(database, bound.offset!, context, params));
+            return Math.min(count - 1, position + offset);
+        }
     }
 }
 

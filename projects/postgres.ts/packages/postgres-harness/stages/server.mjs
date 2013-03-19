@@ -223,6 +223,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const password = await startPostgresServer({ auth: { password: 'batch1-secret' } });
     const batch2 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch2-')) });
     const batch3 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch3-')) });
+    const batch4 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch4-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -545,6 +546,14 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             }
         });
 
+        // Batch 4 fixtures: joins, grouping, subqueries, set operations and windows.
+        const setupB4 = fs.readFileSync(path.join(harnessDir, 'fixtures', 'b4-setup.sql'), 'utf8');
+        await withClient(batch4, async (client) => {
+            for (const statement of setupB4.split(';').map((part) => part.trim()).filter((part) => part.length > 0)) {
+                await client.query(statement);
+            }
+        });
+
         const psql = process.env.PSQL_BIN;
         if (psql) {
             const runOn = (server, sql, password = '') =>
@@ -566,6 +575,24 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                     child.once('close', (status) => resolve({ stdout, stderr, status: status ?? 1 }));
                 });
             const run = (sql, password = '') => runOn(trust, sql, password);
+            const runFileOn = (server, file) =>
+                new Promise((resolve, reject) => {
+                    const child = spawn(
+                        psql,
+                        ['-h', server.host, '-p', String(server.port), '-U', 'postgres', '-d', 'postgres', '-f', file],
+                        { env: { ...process.env, LANG: 'C', LC_ALL: 'C', LC_MESSAGES: 'C' }, stdio: ['ignore', 'pipe', 'pipe'] },
+                    );
+                    let stdout = '';
+                    let stderr = '';
+                    child.stdout.on('data', (chunk) => {
+                        stdout += chunk;
+                    });
+                    child.stderr.on('data', (chunk) => {
+                        stderr += chunk;
+                    });
+                    child.once('error', reject);
+                    child.once('close', (status) => resolve({ stdout, stderr, status: status ?? 1 }));
+                });
 
             await check('psql/select-1', async () => {
                 const result = await run('SELECT 1');
@@ -621,6 +648,50 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             await describeB3('psql/b3-d-ck', '\\d b3_ck', 'psql-b3-d-ck.txt');
             await describeB3('psql/b3-d-cascade', '\\d b3_cascade', 'psql-b3-d-cascade.txt');
             await describeB3('psql/b3-d-p', '\\d b3_p', 'psql-b3-d-p.txt');
+
+            // Batch 4: byte-exact comparison against psql 16.9 with `Buffer.compare`.
+            const sameBytes = (name, fixture, runBody, label) =>
+                check(name, async () => {
+                    const result = await runBody();
+                    assert(result.status === 0, `psql exited ${result.status}: ${result.stderr}`);
+                    const expected = fs.readFileSync(path.join(harnessDir, 'fixtures', fixture));
+                    const actual = Buffer.from(result.stdout, 'utf8');
+                    assert(
+                        Buffer.compare(actual, expected) === 0,
+                        `${label} differs from the pg16 fixture:\n${result.stdout}`,
+                    );
+                    lines.push(`  ${label} matches pg16 fixture (${expected.length} bytes)`);
+                });
+            const sameErrorBytes = (name, fixture, sql, label) =>
+                check(name, async () => {
+                    const result = await runOn(batch4, sql);
+                    assert(result.status === 1, `psql exited ${result.status} for ${sql}`);
+                    const expected = fs.readFileSync(path.join(harnessDir, 'fixtures', fixture));
+                    const actual = Buffer.from(result.stderr, 'utf8');
+                    assert(
+                        Buffer.compare(actual, expected) === 0,
+                        `${label} differs from the pg16 fixture:\n${result.stderr}`,
+                    );
+                    lines.push(`  ${label} matches pg16 fixture (${expected.length} bytes)`);
+                });
+
+            await sameBytes('psql/b4-dn', 'psql-b4-dn.txt', () => runOn(batch4, '\\dn'), '\\dn');
+            await sameBytes('psql/b4-du', 'psql-b4-du.txt', () => runOn(batch4, '\\du'), '\\du');
+            await sameBytes('psql/b4-df', 'psql-b4-df.txt', () => runOn(batch4, '\\df'), '\\df');
+            await sameBytes('psql/b4-dp', 'psql-b4-dp.txt', () => runOn(batch4, '\\dp'), '\\dp');
+            await sameBytes(
+                'psql/b4-queries',
+                'psql-b4-queries.txt',
+                () => runFileOn(batch4, path.join(harnessDir, 'fixtures', 'b4-queries.sql')),
+                '-f b4-queries.sql',
+            );
+            await sameErrorBytes('psql/b4-error-cast', 'psql-b4-error-cast.txt', "SELECT 'oops'::int", "SELECT 'oops'::int");
+            await sameErrorBytes(
+                'psql/b4-error-relation',
+                'psql-b4-error-relation.txt',
+                'SELECT * FROM missing_table',
+                'SELECT * FROM missing_table',
+            );
         }
 
         const capture = (promise) => promise.then(() => null, (error) => error);
@@ -783,16 +854,294 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             assert(restart !== null && /already exists/.test(restart.message), `restart on a stale lock is ${restart?.message}`);
         });
 
+        // Batch 4: query breadth, all checked through the `pg` driver.
+        await check('b4/joins', async () => {
+            await withClient(batch4, async (client) => {
+                const inner = await client.query(
+                    'SELECT e.name AS emp, d.name AS dept FROM b4_emp e JOIN b4_dept d ON e.dept = d.id ORDER BY e.id',
+                );
+                assert(
+                    JSON.stringify(inner.rows) ===
+                        JSON.stringify([
+                            { emp: 'ann', dept: 'sales' },
+                            { emp: 'bob', dept: 'sales' },
+                            { emp: 'cid', dept: 'eng' },
+                            { emp: 'dan', dept: 'eng' },
+                        ]),
+                    `INNER JOIN is ${JSON.stringify(inner.rows)}`,
+                );
+                const left = await client.query(
+                    'SELECT e.name AS emp, d.name AS dept FROM b4_emp e LEFT JOIN b4_dept d ON e.dept = d.id ORDER BY e.id',
+                );
+                assert(
+                    JSON.stringify(left.rows) ===
+                        JSON.stringify([
+                            { emp: 'ann', dept: 'sales' },
+                            { emp: 'bob', dept: 'sales' },
+                            { emp: 'cid', dept: 'eng' },
+                            { emp: 'dan', dept: 'eng' },
+                            { emp: 'eve', dept: null },
+                        ]),
+                    `LEFT JOIN is ${JSON.stringify(left.rows)}`,
+                );
+                const right = await client.query(
+                    'SELECT e.name AS emp, d.name AS dept FROM b4_emp e RIGHT JOIN b4_dept d ON e.dept = d.id ORDER BY d.id, e.id',
+                );
+                assert(
+                    JSON.stringify(right.rows) ===
+                        JSON.stringify([
+                            { emp: 'ann', dept: 'sales' },
+                            { emp: 'bob', dept: 'sales' },
+                            { emp: 'cid', dept: 'eng' },
+                            { emp: 'dan', dept: 'eng' },
+                            { emp: null, dept: 'hr' },
+                        ]),
+                    `RIGHT JOIN is ${JSON.stringify(right.rows)}`,
+                );
+                const full = await client.query(
+                    'SELECT e.name AS emp, d.name AS dept FROM b4_emp e FULL JOIN b4_dept d ON e.dept = d.id ORDER BY e.id NULLS LAST, d.id',
+                );
+                assert(
+                    JSON.stringify(full.rows) ===
+                        JSON.stringify([
+                            { emp: 'ann', dept: 'sales' },
+                            { emp: 'bob', dept: 'sales' },
+                            { emp: 'cid', dept: 'eng' },
+                            { emp: 'dan', dept: 'eng' },
+                            { emp: 'eve', dept: null },
+                            { emp: null, dept: 'hr' },
+                        ]),
+                    `FULL JOIN is ${JSON.stringify(full.rows)}`,
+                );
+                const using = await client.query(
+                    'SELECT id, e.name AS emp, d.name AS dept FROM b4_emp e JOIN b4_dept d USING (id) ORDER BY id',
+                );
+                assert(
+                    JSON.stringify(using.rows) ===
+                        JSON.stringify([
+                            { id: 1, emp: 'ann', dept: 'sales' },
+                            { id: 2, emp: 'bob', dept: 'eng' },
+                            { id: 3, emp: 'cid', dept: 'hr' },
+                        ]),
+                    `JOIN USING is ${JSON.stringify(using.rows)}`,
+                );
+            });
+        });
+
+        await check('b4/aggregates', async () => {
+            await withClient(batch4, async (client) => {
+                const counts = await client.query(
+                    'SELECT dept, count(*) AS c_all, count(mgr) AS c_mgr FROM b4_emp GROUP BY dept ORDER BY dept NULLS LAST',
+                );
+                assert(
+                    JSON.stringify(counts.rows) ===
+                        JSON.stringify([
+                            { dept: 1, c_all: '2', c_mgr: '1' },
+                            { dept: 2, c_all: '2', c_mgr: '2' },
+                            { dept: null, c_all: '1', c_mgr: '1' },
+                        ]),
+                    `grouped counts are ${JSON.stringify(counts.rows)}`,
+                );
+                const distinct = await client.query('SELECT count(DISTINCT dept) AS c FROM b4_emp');
+                assert(distinct.rows[0]?.c === '2', `count(DISTINCT dept) is ${distinct.rows[0]?.c}`);
+                const having = await client.query(
+                    'SELECT dept, sum(salary) AS total FROM b4_emp GROUP BY dept HAVING sum(salary) > 150 ORDER BY dept',
+                );
+                assert(JSON.stringify(having.rows) === '[{"dept":1,"total":"180"},{"dept":2,"total":"210"}]', `HAVING is ${JSON.stringify(having.rows)}`);
+                const average = await client.query(
+                    'SELECT dept, avg(salary) AS mean FROM b4_emp GROUP BY dept ORDER BY dept NULLS LAST',
+                );
+                assert(
+                    JSON.stringify(average.rows) ===
+                        JSON.stringify([
+                            { dept: 1, mean: '90.0000000000000000' },
+                            { dept: 2, mean: '105.0000000000000000' },
+                            { dept: null, mean: '70.0000000000000000' },
+                        ]),
+                    `avg is ${JSON.stringify(average.rows)}`,
+                );
+            });
+        });
+
+        await check('b4/subquery-cte', async () => {
+            await withClient(batch4, async (client) => {
+                const scalar = await client.query(
+                    'SELECT name FROM b4_emp WHERE salary > (SELECT avg(salary) FROM b4_emp) ORDER BY name',
+                );
+                assert(JSON.stringify(scalar.rows) === '[{"name":"ann"},{"name":"cid"}]', `scalar subquery is ${JSON.stringify(scalar.rows)}`);
+                const inList = await client.query(
+                    "SELECT name FROM b4_emp WHERE dept IN (SELECT id FROM b4_dept WHERE name = 'eng') ORDER BY name",
+                );
+                assert(JSON.stringify(inList.rows) === '[{"name":"cid"},{"name":"dan"}]', `IN subquery is ${JSON.stringify(inList.rows)}`);
+                const exists = await client.query(
+                    'SELECT d.name FROM b4_dept d WHERE EXISTS (SELECT 1 FROM b4_emp e WHERE e.dept = d.id) ORDER BY d.name',
+                );
+                assert(JSON.stringify(exists.rows) === '[{"name":"eng"},{"name":"sales"}]', `EXISTS is ${JSON.stringify(exists.rows)}`);
+                const fromSub = await client.query(
+                    'SELECT t.dept, t.total FROM (SELECT dept, sum(salary) AS total FROM b4_emp GROUP BY dept) t ORDER BY t.dept NULLS LAST',
+                );
+                assert(
+                    JSON.stringify(fromSub.rows) === '[{"dept":1,"total":"180"},{"dept":2,"total":"210"},{"dept":null,"total":"70"}]',
+                    `FROM subquery is ${JSON.stringify(fromSub.rows)}`,
+                );
+                const cte = await client.query(
+                    'WITH big AS (SELECT name, salary FROM b4_emp WHERE salary >= 90) SELECT name FROM big ORDER BY name',
+                );
+                assert(JSON.stringify(cte.rows) === '[{"name":"ann"},{"name":"cid"},{"name":"dan"}]', `CTE is ${JSON.stringify(cte.rows)}`);
+                const recursive = await client.query(
+                    'WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums ORDER BY n',
+                );
+                assert(JSON.stringify(recursive.rows) === '[{"n":1},{"n":2},{"n":3},{"n":4},{"n":5}]', `recursive CTE is ${JSON.stringify(recursive.rows)}`);
+            });
+        });
+
+        await check('b4/setops', async () => {
+            await withClient(batch4, async (client) => {
+                const union = await client.query('SELECT 1 AS x UNION SELECT 2 UNION SELECT 1 ORDER BY x');
+                assert(JSON.stringify(union.rows) === '[{"x":1},{"x":2}]', `UNION is ${JSON.stringify(union.rows)}`);
+                const unionAll = await client.query('SELECT 1 AS x UNION ALL SELECT 1 ORDER BY x');
+                assert(JSON.stringify(unionAll.rows) === '[{"x":1},{"x":1}]', `UNION ALL is ${JSON.stringify(unionAll.rows)}`);
+                const intersect = await client.query('SELECT 1 AS x INTERSECT SELECT 1 ORDER BY x');
+                assert(JSON.stringify(intersect.rows) === '[{"x":1}]', `INTERSECT is ${JSON.stringify(intersect.rows)}`);
+                const except = await client.query('SELECT 1 AS x EXCEPT SELECT 1 ORDER BY x');
+                assert(JSON.stringify(except.rows) === '[]', `EXCEPT is ${JSON.stringify(except.rows)}`);
+                const intersectAll = await client.query(
+                    'SELECT dept FROM b4_emp INTERSECT ALL SELECT dept FROM b4_emp ORDER BY dept NULLS LAST',
+                );
+                assert(
+                    JSON.stringify(intersectAll.rows) === '[{"dept":1},{"dept":1},{"dept":2},{"dept":2},{"dept":null}]',
+                    `INTERSECT ALL is ${JSON.stringify(intersectAll.rows)}`,
+                );
+                const exceptAll = await client.query(
+                    'SELECT dept FROM b4_emp EXCEPT ALL SELECT dept FROM b4_emp WHERE salary > 90 ORDER BY dept NULLS LAST',
+                );
+                assert(JSON.stringify(exceptAll.rows) === '[{"dept":1},{"dept":2},{"dept":null}]', `EXCEPT ALL is ${JSON.stringify(exceptAll.rows)}`);
+            });
+        });
+
+        await check('b4/expressions', async () => {
+            await withClient(batch4, async (client) => {
+                const bands = await client.query(
+                    "SELECT name, CASE WHEN salary >= 100 THEN 'high' WHEN salary >= 80 THEN 'mid' ELSE 'low' END AS band FROM b4_emp ORDER BY name",
+                );
+                assert(
+                    JSON.stringify(bands.rows) ===
+                        JSON.stringify([
+                            { name: 'ann', band: 'high' },
+                            { name: 'bob', band: 'mid' },
+                            { name: 'cid', band: 'high' },
+                            { name: 'dan', band: 'mid' },
+                            { name: 'eve', band: 'low' },
+                        ]),
+                    `CASE is ${JSON.stringify(bands.rows)}`,
+                );
+                const coalesce = await client.query('SELECT name, COALESCE(mgr, 0) AS boss FROM b4_emp ORDER BY name');
+                assert(
+                    JSON.stringify(coalesce.rows) ===
+                        JSON.stringify([
+                            { name: 'ann', boss: 0 },
+                            { name: 'bob', boss: 1 },
+                            { name: 'cid', boss: 1 },
+                            { name: 'dan', boss: 3 },
+                            { name: 'eve', boss: 2 },
+                        ]),
+                    `COALESCE is ${JSON.stringify(coalesce.rows)}`,
+                );
+                const nullif = await client.query('SELECT NULLIF(salary, 100) AS s FROM b4_emp ORDER BY id');
+                assert(
+                    JSON.stringify(nullif.rows) === '[{"s":null},{"s":80},{"s":120},{"s":90},{"s":70}]',
+                    `NULLIF is ${JSON.stringify(nullif.rows)}`,
+                );
+                const cast = await client.query("SELECT CAST('42' AS int) + 1 AS answer");
+                assert(cast.rows[0]?.answer === 43, `CAST is ${cast.rows[0]?.answer}`);
+            });
+        });
+
+        await check('b4/windows', async () => {
+            await withClient(batch4, async (client) => {
+                const numbered = await client.query(
+                    'SELECT name, row_number() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM b4_emp ORDER BY name',
+                );
+                assert(
+                    JSON.stringify(numbered.rows) ===
+                        '[{"name":"ann","rn":"1"},{"name":"bob","rn":"2"},{"name":"cid","rn":"1"},{"name":"dan","rn":"2"},{"name":"eve","rn":"1"}]',
+                    `row_number is ${JSON.stringify(numbered.rows)}`,
+                );
+                const ranks = await client.query(
+                    'SELECT name, rank() OVER (ORDER BY salary DESC) AS r, dense_rank() OVER (ORDER BY salary DESC) AS dr FROM b4_emp ORDER BY name',
+                );
+                assert(
+                    JSON.stringify(ranks.rows) ===
+                        '[{"name":"ann","r":"2","dr":"2"},{"name":"bob","r":"4","dr":"4"},{"name":"cid","r":"1","dr":"1"},{"name":"dan","r":"3","dr":"3"},{"name":"eve","r":"5","dr":"5"}]',
+                    `rank is ${JSON.stringify(ranks.rows)}`,
+                );
+                const shifted = await client.query(
+                    'SELECT name, lag(name) OVER (ORDER BY salary) AS prev, lead(name) OVER (ORDER BY salary) AS next FROM b4_emp ORDER BY name',
+                );
+                assert(
+                    JSON.stringify(shifted.rows) ===
+                        JSON.stringify([
+                            { name: 'ann', prev: 'dan', next: 'cid' },
+                            { name: 'bob', prev: 'eve', next: 'dan' },
+                            { name: 'cid', prev: 'ann', next: null },
+                            { name: 'dan', prev: 'bob', next: 'ann' },
+                            { name: 'eve', prev: null, next: 'bob' },
+                        ]),
+                    `lag/lead is ${JSON.stringify(shifted.rows)}`,
+                );
+                const running = await client.query(
+                    'SELECT name, sum(salary) OVER (PARTITION BY dept ORDER BY salary ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM b4_emp ORDER BY name',
+                );
+                assert(
+                    JSON.stringify(running.rows) ===
+                        '[{"name":"ann","running":"180"},{"name":"bob","running":"80"},{"name":"cid","running":"210"},{"name":"dan","running":"90"},{"name":"eve","running":"70"}]',
+                    `sum over frame is ${JSON.stringify(running.rows)}`,
+                );
+                const average = await client.query(
+                    'SELECT name, avg(salary) OVER (PARTITION BY dept) AS dept_avg FROM b4_emp ORDER BY name',
+                );
+                assert(
+                    JSON.stringify(average.rows) ===
+                        '[{"name":"ann","dept_avg":"90.0000000000000000"},{"name":"bob","dept_avg":"90.0000000000000000"},{"name":"cid","dept_avg":"105.0000000000000000"},{"name":"dan","dept_avg":"105.0000000000000000"},{"name":"eve","dept_avg":"70.0000000000000000"}]',
+                    `avg over is ${JSON.stringify(average.rows)}`,
+                );
+            });
+        });
+
+        await check('catalog/meta-fixtures', async () => {
+            const fixture = JSON.parse(fs.readFileSync(path.join(harnessDir, 'fixtures', 'meta-queries.json'), 'utf8'));
+            await withClient(batch4, async (client) => {
+                for (const item of fixture.cases) {
+                    const result = await client.query(item.sql);
+                    assert(result.rowCount === item.rows, `${item.command}: ${result.rowCount} rows, expected ${item.rows}`);
+                }
+            });
+        });
+
+        await check('catalog/meta-l', async () => {
+            const fixture = JSON.parse(fs.readFileSync(path.join(harnessDir, 'fixtures', 'meta-queries.json'), 'utf8'));
+            const list = fixture.cases.find((item) => item.command === '\\l');
+            await withClient(batch4, async (client) => {
+                const result = await client.query(list.sql);
+                assert(result.rowCount === 1, `\\l returned ${result.rowCount} rows`);
+                const row = result.rows[0];
+                assert(row.Name === 'postgres' && row.Owner === 'postgres', `\\l row is ${JSON.stringify(row)}`);
+                assert(row.Encoding === 'UTF8', `\\l encoding is ${row.Encoding}`);
+                assert(row['Locale Provider'] === 'libc' && row.Collate === 'C' && row.Ctype === 'C', `\\l locale is ${JSON.stringify(row)}`);
+            });
+        });
+
         return {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 38,
+            floor: 53,
         };
     } finally {
         await trust.close();
         await password.close();
         await batch2.close();
         await batch3.close();
+        await batch4.close();
     }
 }

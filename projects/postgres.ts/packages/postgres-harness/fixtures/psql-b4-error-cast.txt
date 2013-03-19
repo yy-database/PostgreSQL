@@ -1,0 +1,3 @@
+ERROR:  invalid input syntax for type integer: "oops"
+LINE 1: SELECT 'oops'::int
+               ^

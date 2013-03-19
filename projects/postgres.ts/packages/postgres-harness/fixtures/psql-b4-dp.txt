@@ -1,0 +1,7 @@
+                              Access privileges
+ Schema |  Name   | Type  | Access privileges | Column privileges | Policies 
+--------+---------+-------+-------------------+-------------------+----------
+ public | b4_dept | table |                   |                   | 
+ public | b4_emp  | table |                   |                   | 
+(2 rows)
+

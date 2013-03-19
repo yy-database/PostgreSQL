@@ -1,0 +1,3 @@
+ERROR:  relation "missing_table" does not exist
+LINE 1: SELECT * FROM missing_table
+                      ^

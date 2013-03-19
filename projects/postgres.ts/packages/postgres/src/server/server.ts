@@ -739,6 +739,7 @@ class Session {
                       code: error.code,
                       message: error.message,
                       ...(error.detail ? { detail: error.detail } : {}),
+                      ...(error.position !== undefined ? { position: String(error.position + 1) } : {}),
                   }
                 : { severity: 'ERROR', code: 'XX000', message: error instanceof Error ? error.message : String(error) };
         this.socket.write(errorResponse(fields));

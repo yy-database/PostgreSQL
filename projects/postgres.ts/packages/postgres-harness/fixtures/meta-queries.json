@@ -1,0 +1,36 @@
+{
+    "source": "PostgreSQL 16.9 psql -E hidden queries, captured against database b4x holding b4_dept and b4_emp",
+    "cases": [
+        {
+            "name": "dn",
+            "command": "\\dn",
+            "rows": 1,
+            "sql": "SELECT n.nspname AS \"Name\",\n  pg_catalog.pg_get_userbyid(n.nspowner) AS \"Owner\"\nFROM pg_catalog.pg_namespace n\nWHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'\nORDER BY 1;"
+        },
+        {
+            "name": "du",
+            "command": "\\du",
+            "rows": 1,
+            "sql": "SELECT r.rolname, r.rolsuper, r.rolinherit,\n  r.rolcreaterole, r.rolcreatedb, r.rolcanlogin,\n  r.rolconnlimit, r.rolvaliduntil\n, r.rolreplication\n, r.rolbypassrls\nFROM pg_catalog.pg_roles r\nWHERE r.rolname !~ '^pg_'\nORDER BY 1;"
+        },
+        {
+            "name": "df",
+            "command": "\\df",
+            "rows": 0,
+            "sql": "SELECT n.nspname as \"Schema\",\n  p.proname as \"Name\",\n  pg_catalog.pg_get_function_result(p.oid) as \"Result data type\",\n  pg_catalog.pg_get_function_arguments(p.oid) as \"Argument data types\",\n CASE p.prokind\n  WHEN 'a' THEN 'agg'\n  WHEN 'w' THEN 'window'\n  WHEN 'p' THEN 'proc'\n  ELSE 'func'\n END as \"Type\"\nFROM pg_catalog.pg_proc p\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace\nWHERE pg_catalog.pg_function_is_visible(p.oid)\n      AND n.nspname <> 'pg_catalog'\n      AND n.nspname <> 'information_schema'\nORDER BY 1, 2, 4;"
+        },
+        {
+            "name": "dp",
+            "command": "\\dp",
+            "rows": 2,
+            "sql": "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' END as \"Type\",\n  pg_catalog.array_to_string(c.relacl, E'\\n') AS \"Access privileges\",\n  pg_catalog.array_to_string(ARRAY(\n    SELECT attname || E':\\n  ' || pg_catalog.array_to_string(attacl, E'\\n  ')\n    FROM pg_catalog.pg_attribute a\n    WHERE attrelid = c.oid AND NOT attisdropped AND attacl IS NOT NULL\n  ), E'\\n') AS \"Column privileges\",\n  pg_catalog.array_to_string(ARRAY(\n    SELECT polname\n    || CASE WHEN NOT polpermissive THEN\n       E' (RESTRICTIVE)'\n       ELSE '' END\n    || CASE WHEN polcmd != '*' THEN\n           E' (' || polcmd::pg_catalog.text || E'):'\n       ELSE E':'\n       END\n    || CASE WHEN polqual IS NOT NULL THEN\n           E'\\n  (u): ' || pg_catalog.pg_get_expr(polqual, polrelid)\n       ELSE E''\n       END\n    || CASE WHEN polwithcheck IS NOT NULL THEN\n           E'\\n  (c): ' || pg_catalog.pg_get_expr(polwithcheck, polrelid)\n       ELSE E''\n       END    || CASE WHEN polroles <> '{0}' THEN\n           E'\\n  to: ' || pg_catalog.array_to_string(\n               ARRAY(\n                   SELECT rolname\n                   FROM pg_catalog.pg_roles\n                   WHERE oid = ANY (polroles)\n                   ORDER BY 1\n               ), E', ')\n       ELSE E''\n       END\n    FROM pg_catalog.pg_policy pol\n    WHERE polrelid = c.oid), E'\\n')\n    AS \"Policies\"\nFROM pg_catalog.pg_class c\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\nWHERE c.relkind IN ('r','v','m','S','f','p')\n      AND n.nspname <> 'pg_catalog'\n      AND n.nspname <> 'information_schema'\n  AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 1, 2;"
+        },
+        {
+            "name": "l",
+            "command": "\\l",
+            "rows": 1,
+            "note": "The real cluster lists every database; this server models only the current one, so the row set is environment dependent.",
+            "sql": "SELECT\n  d.datname as \"Name\",\n  pg_catalog.pg_get_userbyid(d.datdba) as \"Owner\",\n  pg_catalog.pg_encoding_to_char(d.encoding) as \"Encoding\",\n  CASE d.datlocprovider WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' END AS \"Locale Provider\",\n  d.datcollate as \"Collate\",\n  d.datctype as \"Ctype\",\n  d.daticulocale as \"ICU Locale\",\n  d.daticurules as \"ICU Rules\",\n  pg_catalog.array_to_string(d.datacl, E'\\n') AS \"Access privileges\"\nFROM pg_catalog.pg_database d\nORDER BY 1;"
+        }
+    ]
+}

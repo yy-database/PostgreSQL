@@ -16,6 +16,8 @@ export const SYSTEM_NAMESPACES = [
 export const PUBLIC_NAMESPACE = 2200;
 export const PG_CATALOG_NAMESPACE = 11;
 export const POSTGRES_ROLE = 10;
+/** Role that owns the `public` schema in PostgreSQL 15 and newer. */
+export const PG_DATABASE_OWNER_ROLE = 6171;
 
 export interface UserRelation {
     oid: number;
@@ -417,6 +419,28 @@ const SYSTEM_RELATIONS: SystemRelation[] = [
         columns: columns(['inhrelid', oid], ['inhparent', oid], ['inhseqno', int4], ['inhdetachpending', bool]),
     },
     {
+        // Only the shape psql's `\df` reads; user-defined functions are not stored.
+        name: 'pg_proc',
+        oid: 1255,
+        columns: columns(['oid', oid], ['proname', name], ['pronamespace', oid], ['prokind', char]),
+    },
+    {
+        name: 'pg_database',
+        oid: 1262,
+        columns: columns(
+            ['oid', oid],
+            ['datname', name],
+            ['datdba', oid],
+            ['encoding', int4],
+            ['datlocprovider', char],
+            ['datcollate', text],
+            ['datctype', text],
+            ['daticulocale', text],
+            ['daticurules', text],
+            ['datacl', typeOf('text_array')],
+        ),
+    },
+    {
         name: 'pg_roles',
         oid: 1260,
         columns: columns(
@@ -577,7 +601,11 @@ export function catalogTables(doc: CatalogDoc): Map<string, TableData> {
     }
 
     for (const namespace of SYSTEM_NAMESPACES) {
-        push('pg_namespace', { oid: namespace.oid, nspname: namespace.name, nspowner: POSTGRES_ROLE });
+        push('pg_namespace', {
+            oid: namespace.oid,
+            nspname: namespace.name,
+            nspowner: namespace.name === 'public' ? PG_DATABASE_OWNER_ROLE : POSTGRES_ROLE,
+        });
     }
 
     const systemClassRow = (relation: SystemRelation): Record<string, SqlValue> => ({
@@ -843,6 +871,19 @@ export function catalogTables(doc: CatalogDoc): Map<string, TableData> {
         rolconnlimit: -1,
     });
 
+    push('pg_database', {
+        oid: 5,
+        datname: 'postgres',
+        datdba: POSTGRES_ROLE,
+        encoding: 6,
+        datlocprovider: 'c',
+        datcollate: 'C',
+        datctype: 'C',
+        daticulocale: null,
+        daticurules: null,
+        datacl: null,
+    });
+
     push('pg_tablespace', { oid: 1663, spcname: 'pg_default', spcowner: POSTGRES_ROLE });
     push('pg_tablespace', { oid: 1664, spcname: 'pg_global', spcowner: POSTGRES_ROLE });
 
@@ -851,7 +892,9 @@ export function catalogTables(doc: CatalogDoc): Map<string, TableData> {
 
 /** `pg_get_userbyid`. */
 export function pgGetUserById(oidValue: SqlValue): SqlValue {
-    return oidValue === POSTGRES_ROLE ? 'postgres' : null;
+    if (oidValue === POSTGRES_ROLE) return 'postgres';
+    if (oidValue === PG_DATABASE_OWNER_ROLE) return 'pg_database_owner';
+    return null;
 }
 
 /** `pg_table_is_visible`: every relation this server exposes lives in a visible schema. */

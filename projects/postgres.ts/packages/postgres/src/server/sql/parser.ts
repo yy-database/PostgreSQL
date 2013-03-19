@@ -5,6 +5,8 @@ import { arrayOf, type DataType, type SqlValue, typeFromName } from './types.ts'
 
 export interface ExprBase {
     kind: string;
+    /** Zero-based source offset of the expression, used for error positions. */
+    start?: number;
 }
 
 export interface LiteralExpr extends ExprBase {
@@ -12,6 +14,8 @@ export interface LiteralExpr extends ExprBase {
     value: SqlValue;
     /** Source spelling, used for `NULL`, booleans and untyped numerics. */
     text: string;
+    /** True for an unquoted numeric literal, whose value keeps its scale. */
+    numeric?: boolean;
 }
 
 export interface ParamExpr extends ExprBase {
@@ -25,12 +29,33 @@ export interface ColumnExpr extends ExprBase {
     name: string;
 }
 
+export interface FrameBound {
+    type: 'unbounded-preceding' | 'preceding' | 'current-row' | 'following' | 'unbounded-following';
+    offset?: Expr;
+}
+
+export interface WindowFrame {
+    mode: 'rows' | 'range';
+    start: FrameBound;
+    end: FrameBound;
+}
+
+export interface WindowSpec {
+    partitionBy: Expr[];
+    orderBy: OrderItem[];
+    frame: WindowFrame | undefined;
+}
+
 export interface FunctionExpr extends ExprBase {
     kind: 'function';
     schema: string | undefined;
     name: string;
     args: Expr[];
     star: boolean;
+    /** `count(DISTINCT x)`. */
+    distinct?: boolean;
+    /** Window specification when the call carries `OVER (...)`. */
+    over?: WindowSpec;
 }
 
 export interface CastExpr extends ExprBase {
@@ -156,6 +181,8 @@ export interface RelationRef {
     schema: string | undefined;
     name: string;
     alias: string | undefined;
+    /** Zero-based source offset of the relation reference. */
+    start?: number;
     /** Present when the reference is a set-returning function call in `FROM`. */
     args: Expr[] | undefined;
     /** `WITH ORDINALITY` adds a trailing position column. */
@@ -168,14 +195,18 @@ export interface SubqueryRef {
     kind: 'subquery';
     select: SelectStatement;
     alias: string | undefined;
+    /** `AS alias(c1, c2, ...)` renames the subquery's output columns. */
+    columns?: string[];
 }
 
 export interface JoinRef {
     kind: 'join';
     left: FromItem;
     right: FromItem;
-    joinType: 'inner' | 'left' | 'cross';
+    joinType: 'inner' | 'left' | 'right' | 'full' | 'cross';
     on: Expr | undefined;
+    /** `JOIN ... USING (a, b)`; mutually exclusive with `on`. */
+    using?: string[];
 }
 
 export type FromItem = RelationRef | SubqueryRef | JoinRef;
@@ -192,6 +223,17 @@ export interface SelectCore {
     values: Expr[][] | undefined;
 }
 
+export interface CommonTableExpression {
+    name: string;
+    columns: string[] | undefined;
+    select: SelectStatement;
+}
+
+export interface WithClause {
+    recursive: boolean;
+    ctes: CommonTableExpression[];
+}
+
 export interface SelectStatement {
     kind: 'select';
     core: SelectCore;
@@ -199,6 +241,8 @@ export interface SelectStatement {
     orderBy: OrderItem[];
     limit: Expr | undefined;
     offset: Expr | undefined;
+    /** `WITH [RECURSIVE] ...` attached to this query. */
+    with?: WithClause;
 }
 
 export interface InsertStatement {
@@ -375,6 +419,7 @@ const RESERVED = new Set([
     'CONSTRAINT',
     'CREATE',
     'CROSS',
+    'CURRENT',
     'DEFAULT',
     'DELETE',
     'DESC',
@@ -385,6 +430,7 @@ const RESERVED = new Set([
     'EXCEPT',
     'EXISTS',
     'FALSE',
+    'FOLLOWING',
     'FOREIGN',
     'FROM',
     'FULL',
@@ -412,22 +458,30 @@ const RESERVED = new Set([
     'OR',
     'ORDER',
     'OUTER',
+    'OVER',
+    'PARTITION',
+    'PRECEDING',
     'PRIMARY',
+    'RANGE',
+    'RECURSIVE',
     'REFERENCES',
     'RELEASE',
     'RESTRICT',
     'RETURNING',
     'RIGHT',
     'ROLLBACK',
+    'ROWS',
     'SAVEPOINT',
     'SELECT',
     'SET',
     'SOME',
     'START',
     'TABLE',
+    'TEXT',
     'THEN',
     'TRANSACTION',
     'TRUE',
+    'UNBOUNDED',
     'UNION',
     'UNIQUE',
     'UPDATE',
@@ -441,7 +495,13 @@ const RESERVED = new Set([
 ]);
 
 function syntax(message: string, token: Token): ServerError {
-    return new ServerError('42601', message, `near "${token.kind === 'eof' ? 'end of input' : token.value}"`);
+    const near = token.kind === 'eof' ? 'end of input' : token.value;
+    // PostgreSQL spells the generic parse failure `syntax error at [or near]`,
+    // with no DETAIL. Keep the caret position either way.
+    if (message === 'syntax error') {
+        return new ServerError('42601', `syntax error at ${token.kind === 'eof' ? 'end of input' : `or near "${near}"`}`, undefined, token.start);
+    }
+    return new ServerError('42601', message, `near "${near}"`, token.start);
 }
 
 class Lexer {
@@ -488,6 +548,9 @@ class Lexer {
     private scan(): Token {
         const start = this.offset;
         const character = this.sql[start] ?? '';
+        if ((character === 'E' || character === 'e') && this.sql[start + 1] === "'") {
+            return this.scanEscapeString(start);
+        }
         if (/[A-Za-z_]/.test(character)) {
             let end = start + 1;
             while (end < this.sql.length && /[A-Za-z0-9_$]/.test(this.sql[end] ?? '')) end += 1;
@@ -572,6 +635,43 @@ class Lexer {
         }
         throw new ServerError('42601', `unexpected character "${character}"`);
     }
+
+    /** `E'...'`: a string literal that honours backslash escapes. */
+    private scanEscapeString(start: number): Token {
+        let end = start + 2;
+        let value = '';
+        while (end < this.sql.length) {
+            const current = this.sql[end] ?? '';
+            if (current === "'") {
+                if (this.sql[end + 1] === "'") {
+                    value += "'";
+                    end += 2;
+                    continue;
+                }
+                this.offset = end + 1;
+                return { kind: 'string', value, upper: '', start };
+            }
+            if (current === '\\') {
+                const escaped = this.sql[end + 1] ?? '';
+                const mapped: Record<string, string> = {
+                    n: '\n',
+                    t: '\t',
+                    r: '\r',
+                    b: '\b',
+                    f: '\f',
+                    '\\': '\\',
+                    "'": "'",
+                    '"': '"',
+                };
+                value += mapped[escaped] ?? escaped;
+                end += 2;
+                continue;
+            }
+            value += current;
+            end += 1;
+        }
+        throw new ServerError('42601', 'unterminated string literal', undefined, start);
+    }
 }
 
 class Parser {
@@ -592,7 +692,15 @@ class Parser {
     parseStatement(): Statement {
         const token = this.peek();
         if (token.upper === 'SELECT') return this.parseSelect();
-        if (token.upper === 'WITH') throw new ServerError('0A000', 'feature not supported', 'common table expressions are not implemented');
+        if (token.upper === 'WITH') {
+            const withClause = this.parseWith();
+            if (this.at('SELECT') || this.at('VALUES')) {
+                const select = this.parseSelect();
+                select.with = withClause;
+                return select;
+            }
+            throw new ServerError('0A000', 'feature not supported', 'data-modifying statements in WITH are not implemented');
+        }
         if (token.upper === 'INSERT') return this.parseInsert();
         if (token.upper === 'UPDATE') return this.parseUpdate();
         if (token.upper === 'DELETE') return this.parseDelete();
@@ -649,6 +757,30 @@ class Parser {
             return token.kind === 'qident' ? token.value : token.value.toLowerCase();
         }
         throw syntax('syntax error: expected an identifier', token);
+    }
+
+    private parseWith(): WithClause {
+        this.expect('WITH');
+        const recursive = this.accept('RECURSIVE');
+        const ctes: CommonTableExpression[] = [];
+        do {
+            const name = this.identifier();
+            let columns: string[] | undefined;
+            if (this.at('(')) {
+                this.next();
+                columns = [];
+                do {
+                    columns.push(this.identifier());
+                } while (this.accept(','));
+                this.expect(')');
+            }
+            this.expect('AS');
+            this.expect('(');
+            const select = this.parseSelect();
+            this.expect(')');
+            ctes.push({ name, columns, select });
+        } while (this.accept(','));
+        return { recursive, ctes };
     }
 
     private parseSelect(): SelectStatement {
@@ -737,55 +869,68 @@ class Parser {
     private parseJoin(): FromItem {
         let left = this.parseFromPrimary();
         while (true) {
+            let joinType: JoinRef['joinType'] | undefined;
             if (this.at('JOIN')) {
                 this.next();
-                const right = this.parseFromPrimary();
-                const on = this.at('ON') ? (this.next(), this.parseExpr()) : undefined;
-                left = { kind: 'join', left, right, joinType: 'inner', on };
-                continue;
+                joinType = 'inner';
             }
-            if (this.at('INNER')) {
+            else if (this.at('INNER')) {
                 this.next();
                 this.expect('JOIN');
-                const right = this.parseFromPrimary();
-                const on = this.at('ON') ? (this.next(), this.parseExpr()) : undefined;
-                left = { kind: 'join', left, right, joinType: 'inner', on };
-                continue;
+                joinType = 'inner';
             }
-            if (this.at('CROSS')) {
+            else if (this.at('CROSS')) {
                 this.next();
                 this.expect('JOIN');
                 left = { kind: 'join', left, right: this.parseFromPrimary(), joinType: 'cross', on: undefined };
                 continue;
             }
-            if (this.at('LEFT')) {
-                this.next();
+            else if (this.at('LEFT') || this.at('RIGHT') || this.at('FULL')) {
+                const keyword = this.next().upper;
                 this.accept('OUTER');
                 this.expect('JOIN');
-                const right = this.parseFromPrimary();
-                const on = this.at('ON') ? (this.next(), this.parseExpr()) : undefined;
-                left = { kind: 'join', left, right, joinType: 'left', on };
+                joinType = keyword === 'LEFT' ? 'left' : keyword === 'RIGHT' ? 'right' : 'full';
+            }
+            if (joinType === undefined) return left;
+            const right = this.parseFromPrimary();
+            if (this.at('USING')) {
+                this.next();
+                this.expect('(');
+                const using: string[] = [];
+                do {
+                    using.push(this.identifier());
+                } while (this.accept(','));
+                this.expect(')');
+                left = { kind: 'join', left, right, joinType, on: undefined, using };
                 continue;
             }
-            if (this.at('RIGHT') || this.at('FULL')) throw new ServerError('0A000', 'feature not supported', 'right and full joins are not implemented');
-            return left;
+            const on = this.at('ON') ? (this.next(), this.parseExpr()) : undefined;
+            if (on === undefined && joinType !== 'inner') throw syntax('syntax error: expected "ON" or "USING"', this.peek());
+            left = { kind: 'join', left, right, joinType, on };
         }
     }
 
     private parseFromPrimary(): FromItem {
         if (this.at('(')) {
             this.next();
-            if (this.at('SELECT')) {
+            if (this.at('SELECT') || this.at('VALUES')) {
+                return this.parseFromSubquery(this.parseSelect());
+            }
+            if (this.at('WITH')) {
+                const withClause = this.parseWith();
+                if (!this.at('SELECT') && !this.at('VALUES')) {
+                    throw new ServerError('0A000', 'feature not supported', 'data-modifying statements in WITH are not implemented');
+                }
                 const select = this.parseSelect();
-                this.expect(')');
-                const alias = this.parseAlias();
-                return { kind: 'subquery', select, alias };
+                select.with = withClause;
+                return this.parseFromSubquery(select);
             }
             const nested = this.parseFrom()[0];
             this.expect(')');
             if (!nested) throw syntax('syntax error: empty join item', this.peek());
             return nested;
         }
+        const startToken = this.peek();
         const names = this.parseNamePath();
         if (this.at('(')) {
             // A set-returning function in FROM: parsed, but only executed when
@@ -820,12 +965,28 @@ class Parser {
                 this.expect(')');
             }
             const schema = names.length > 1 ? names[names.length - 2] : undefined;
-            return { kind: 'relation', schema, name: names[names.length - 1] ?? '', alias, args, ordinality, columnAliases };
+            return { kind: 'relation', schema, name: names[names.length - 1] ?? '', alias, start: startToken.start, args, ordinality, columnAliases };
         }
         const alias = this.parseAlias();
         const schema = names.length > 1 ? names[names.length - 2] : undefined;
         const name = names[names.length - 1] ?? '';
-        return { kind: 'relation', schema, name, alias, args: undefined };
+        return { kind: 'relation', schema, name, alias, start: startToken.start, args: undefined };
+    }
+
+    /** Consumes `) [AS] alias [(c1, c2, ...)]` for a parenthesised subquery. */
+    private parseFromSubquery(select: SelectStatement): SubqueryRef {
+        this.expect(')');
+        const alias = this.parseAlias();
+        let columns: string[] | undefined;
+        if (alias !== undefined && this.at('(')) {
+            this.next();
+            columns = [];
+            do {
+                columns.push(this.identifier());
+            } while (this.accept(','));
+            this.expect(')');
+        }
+        return { kind: 'subquery', select, alias, columns };
     }
 
     private parseAlias(): string | undefined {
@@ -1063,27 +1224,36 @@ class Parser {
         const token = this.peek();
         if (token.kind === 'number') {
             this.next();
-            return { kind: 'literal', value: Number(token.value), text: token.value } satisfies LiteralExpr;
+            const integral = /^[0-9]+$/.test(token.value);
+            // Decimal literals keep their source spelling so `1.50` prints as
+            // `1.50`, matching PostgreSQL's untyped numeric constants.
+            return {
+                kind: 'literal',
+                value: integral ? Number(token.value) : token.value,
+                text: token.value,
+                numeric: true,
+                start: token.start,
+            } satisfies LiteralExpr;
         }
         if (token.kind === 'string') {
             this.next();
-            return { kind: 'literal', value: token.value, text: token.value } satisfies LiteralExpr;
+            return { kind: 'literal', value: token.value, text: token.value, start: token.start } satisfies LiteralExpr;
         }
         if (token.kind === 'param') {
             this.next();
-            return { kind: 'param', index: Number(token.value) } satisfies ParamExpr;
+            return { kind: 'param', index: Number(token.value), start: token.start } satisfies ParamExpr;
         }
         if (token.upper === 'NULL') {
             this.next();
-            return { kind: 'literal', value: null, text: 'NULL' } satisfies LiteralExpr;
+            return { kind: 'literal', value: null, text: 'NULL', start: token.start } satisfies LiteralExpr;
         }
         if (token.upper === 'DEFAULT') {
             this.next();
-            return { kind: 'default' };
+            return { kind: 'default', start: token.start };
         }
         if (token.upper === 'TRUE' || token.upper === 'FALSE') {
             this.next();
-            return { kind: 'literal', value: token.upper === 'TRUE', text: token.upper } satisfies LiteralExpr;
+            return { kind: 'literal', value: token.upper === 'TRUE', text: token.upper, start: token.start } satisfies LiteralExpr;
         }
         if (token.upper === 'CASE') return this.parseCase();
         if (token.upper === 'CAST') {
@@ -1117,8 +1287,18 @@ class Parser {
         }
         if (token.kind === 'punct' && token.value === '(') {
             this.next();
-            if (this.at('SELECT')) {
+            if (this.at('SELECT') || this.at('VALUES')) {
                 const select = this.parseSelect();
+                this.expect(')');
+                return { kind: 'subquery', select } satisfies SubqueryExpr;
+            }
+            if (this.at('WITH')) {
+                const withClause = this.parseWith();
+                if (!this.at('SELECT') && !this.at('VALUES')) {
+                    throw new ServerError('0A000', 'feature not supported', 'data-modifying statements in WITH are not implemented');
+                }
+                const select = this.parseSelect();
+                select.with = withClause;
                 this.expect(')');
                 return { kind: 'subquery', select } satisfies SubqueryExpr;
             }
@@ -1140,7 +1320,9 @@ class Parser {
             if (this.at('(')) {
                 this.next();
                 let star = false;
+                let distinct = false;
                 let args: Expr[] = [];
+                if (this.accept('DISTINCT')) distinct = true;
                 if (this.at('*')) {
                     this.next();
                     star = true;
@@ -1150,15 +1332,65 @@ class Parser {
                 this.expect(')');
                 const name = names[names.length - 1] ?? '';
                 const schema = names.length > 1 ? names[names.length - 2] : undefined;
-                return { kind: 'function', schema, name, args, star } satisfies FunctionExpr;
+                const call: FunctionExpr = { kind: 'function', schema, name, args, star, start: token.start };
+                if (distinct) call.distinct = true;
+                if (this.at('OVER')) {
+                    this.next();
+                    call.over = this.parseWindowSpec();
+                }
+                return call;
             }
             return {
                 kind: 'column',
                 qualifier: names.length > 1 ? names[names.length - 2] : undefined,
                 name: names[names.length - 1] ?? '',
+                start: token.start,
             } satisfies ColumnExpr;
         }
         throw syntax('syntax error', token);
+    }
+
+    private parseWindowSpec(): WindowSpec {
+        if (!this.at('(')) throw new ServerError('0A000', 'feature not supported', 'named window references are not implemented');
+        this.next();
+        const partitionBy = this.at('PARTITION') ? (this.next(), this.expect('BY'), this.parseExprList()) : [];
+        const orderBy = this.at('ORDER') ? this.parseOrderBy() : [];
+        let frame: WindowFrame | undefined;
+        if (this.at('ROWS') || this.at('RANGE') || this.at('GROUPS')) frame = this.parseFrame();
+        this.expect(')');
+        return { partitionBy, orderBy, frame };
+    }
+
+    private parseFrame(): WindowFrame {
+        const mode = this.next().upper.toLowerCase() as 'rows' | 'range';
+        let start: FrameBound;
+        let end: FrameBound;
+        if (this.at('BETWEEN')) {
+            this.next();
+            start = this.parseFrameBound();
+            this.expect('AND');
+            end = this.parseFrameBound();
+        }
+        else {
+            start = this.parseFrameBound();
+            end = { type: 'current-row' };
+        }
+        return { mode, start, end };
+    }
+
+    private parseFrameBound(): FrameBound {
+        if (this.accept('UNBOUNDED')) {
+            return this.accept('PRECEDING') ? { type: 'unbounded-preceding' } : (this.expect('FOLLOWING'), { type: 'unbounded-following' });
+        }
+        if (this.at('CURRENT')) {
+            this.next();
+            this.expect('ROW');
+            return { type: 'current-row' };
+        }
+        const offset = this.parseExpr();
+        if (this.accept('PRECEDING')) return { type: 'preceding', offset };
+        this.expect('FOLLOWING');
+        return { type: 'following', offset };
     }
 
     private parseCase(): Expr {
@@ -1546,10 +1778,11 @@ class Parser {
     }
 
     private parseRelationRef(): RelationRef {
+        const startToken = this.peek();
         const names = this.parseNamePath();
         const schema = names.length > 1 ? names[names.length - 2] : undefined;
         const name = names[names.length - 1] ?? '';
-        return { kind: 'relation', schema, name, alias: undefined, args: undefined };
+        return { kind: 'relation', schema, name, alias: undefined, start: startToken.start, args: undefined };
     }
 }
 
