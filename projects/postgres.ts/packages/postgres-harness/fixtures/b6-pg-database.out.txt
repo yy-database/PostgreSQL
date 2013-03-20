@@ -1,0 +1,7 @@
+ oid |  datname  | datdba | encoding | datlocprovider | datistemplate | datallowconn | datconnlimit | datfrozenxid | datminmxid | dattablespace | datcollate | datctype | daticulocale | daticurules | datcollversion |               datacl                
+-----+-----------+--------+----------+----------------+---------------+--------------+--------------+--------------+------------+---------------+------------+----------+--------------+-------------+----------------+-------------------------------------
+   5 | postgres  |     10 |        6 | c              | f             | t            |           -1 |          722 |          1 |          1663 | C          | C        |              |             |                | 
+   1 | template1 |     10 |        6 | c              | t             | t            |           -1 |          722 |          1 |          1663 | C          | C        |              |             |                | {=c/postgres,postgres=CTc/postgres}
+   4 | template0 |     10 |        6 | c              | t             | f            |           -1 |          722 |          1 |          1663 | C          | C        |              |             |                | {=c/postgres,postgres=CTc/postgres}
+(3 rows)
+
