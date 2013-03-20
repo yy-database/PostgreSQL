@@ -31,7 +31,7 @@ use database_formats::yy::yykv::{
 use database_types::cluster::{Error as ClusterError, ShardId};
 use database_types::ReasonCode;
 
-use crate::error::PostgresError;
+use crate::PostgresError;
 
 const DEFAULT_SHARD_ID: &str = "local-0";
 const CATALOG_FILE: &str = "local-0.yyds";

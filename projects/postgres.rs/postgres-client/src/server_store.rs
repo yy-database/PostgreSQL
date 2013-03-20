@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use database_storage::cluster_kv::{FileShard, InlineValue, Key, KvStore, ShardChange, StoredValue};
 use database_types::cluster::Namespace;
 
-use crate::error::PostgresError;
+use crate::PostgresError;
 
 const DEFAULT_SHARD_ID: &str = "local-0";
 const CATALOG_FILE: &str = "local-0.yyds";

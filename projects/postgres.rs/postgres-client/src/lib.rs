@@ -11,18 +11,21 @@
 //! fields, and [`Store`] persists rows. Rendering, command lines and server
 //! emulation are composed outside.
 
-mod client;
-mod error;
-pub mod protocol;
 pub mod psql;
 pub mod server_store;
 pub mod store;
 
-pub use client::{
-    BackendKeyData, ClientConfig, Column, Connection, CopyInReport, CopyOutReport, Param, Portal, PortalReport,
-    Prepared, QueryResult, Report,
+/// Protocol-v3 message builders and parsers, re-exported from
+/// `database-protocol-pgsql`.
+pub mod protocol {
+    pub use database_protocol_pgsql::*;
+}
+
+pub use database_client::pgsql::client::{
+    BackendKeyData, ClientConfig, Column, Connection, CopyInReport, CopyOutReport, Param, Portal, PortalReport, Prepared,
+    QueryResult, Report,
 };
-pub use error::{MessageField, Notice, PostgresError};
+pub use database_client::pgsql::error::{MessageField, Notice, PostgresError};
 pub use psql::PsqlOptions;
 pub use server_store::{ServerChange, ServerRow, ServerStore};
 pub use store::Store;

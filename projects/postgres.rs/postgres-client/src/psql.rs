@@ -3,7 +3,7 @@
 //! These are pure transformations, so the TypeScript and Python command lines
 //! can compose the same behavior from one implementation.
 
-use crate::client::QueryResult;
+use crate::QueryResult;
 
 /// Effective `psql` command line options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +128,7 @@ pub fn format_results(results: &[QueryResult], options: &PsqlOptions) -> Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::Column;
+    use crate::Column;
 
     #[test]
     fn defaults_and_flags() {
