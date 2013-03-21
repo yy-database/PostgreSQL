@@ -1125,11 +1125,55 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             const list = fixture.cases.find((item) => item.command === '\\l');
             await withClient(batch4, async (client) => {
                 const result = await client.query(list.sql);
-                assert(result.rowCount === 1, `\\l returned ${result.rowCount} rows`);
+                assert(result.rowCount === 3, `\\l returned ${result.rowCount} rows`);
+                const names = result.rows.map((row) => row.Name);
+                assert(JSON.stringify(names) === '["postgres","template0","template1"]', `\\l names are ${JSON.stringify(names)}`);
                 const row = result.rows[0];
-                assert(row.Name === 'postgres' && row.Owner === 'postgres', `\\l row is ${JSON.stringify(row)}`);
+                assert(row.Owner === 'postgres', `\\l owner is ${row.Owner}`);
                 assert(row.Encoding === 'UTF8', `\\l encoding is ${row.Encoding}`);
                 assert(row['Locale Provider'] === 'libc' && row.Collate === 'C' && row.Ctype === 'C', `\\l locale is ${JSON.stringify(row)}`);
+                assert(result.rows[0]['Access privileges'] === null, `postgres ACL is ${JSON.stringify(result.rows[0]['Access privileges'])}`);
+                const acl = '=c/postgres\npostgres=CTc/postgres';
+                for (const template of result.rows.slice(1)) {
+                    assert(template['Access privileges'] === acl, `${template.Name} ACL is ${JSON.stringify(template['Access privileges'])}`);
+                }
+            });
+        });
+
+        await check('b6/catalog', async () => {
+            await withClient(batch4, async (client) => {
+                const result = await client.query('SELECT * FROM pg_database');
+                assert(result.rowCount === 3, `pg_database returned ${result.rowCount} rows`);
+                const names = result.rows.map((row) => row.datname);
+                assert(JSON.stringify(names) === '["postgres","template1","template0"]', `pg_database order is ${JSON.stringify(names)}`);
+                const postgres = result.rows[0];
+                assert(postgres.datistemplate === false && postgres.datallowconn === true, 'postgres flags are wrong');
+                assert(postgres.datacl === null, `postgres datacl is ${JSON.stringify(postgres.datacl)}`);
+                assert(postgres.datdba === 10 && postgres.encoding === 6 && postgres.dattablespace === 1663, 'postgres attributes are wrong');
+                const acl = ['=c/postgres', 'postgres=CTc/postgres'];
+                for (const template of result.rows.slice(1)) {
+                    assert(template.datistemplate === true, `${template.datname} is not a template`);
+                    assert(Array.isArray(template.datacl) && JSON.stringify(template.datacl) === JSON.stringify(acl), `${template.datname} datacl is ${JSON.stringify(template.datacl)}`);
+                }
+                assert(result.rows[1].datallowconn === true && result.rows[2].datallowconn === false, 'template allowconn flags are wrong');
+            });
+        });
+
+        await check('catalog/meta-lplus', async () => {
+            const fixture = JSON.parse(fs.readFileSync(path.join(harnessDir, 'fixtures', 'meta-queries.json'), 'utf8'));
+            const list = fixture.cases.find((item) => item.command === '\\l+');
+            await withClient(batch4, async (client) => {
+                const result = await client.query(list.sql);
+                assert(result.rowCount === 3, `\\l+ returned ${result.rowCount} rows`);
+                assert(
+                    JSON.stringify(result.fields.map((field) => field.name)) ===
+                        JSON.stringify(['Name', 'Owner', 'Encoding', 'Locale Provider', 'Collate', 'Ctype', 'ICU Locale', 'ICU Rules', 'Access privileges', 'Size', 'Tablespace', 'Description']),
+                    `\\l+ columns are ${JSON.stringify(result.fields.map((field) => field.name))}`,
+                );
+                for (const row of result.rows) {
+                    assert(/^[0-9]+ (bytes|kB|MB|GB|TB)$/.test(row.Size), `${row.Name} size is ${row.Size}`);
+                    assert(row.Tablespace === 'pg_default', `${row.Name} tablespace is ${row.Tablespace}`);
+                }
             });
         });
 
@@ -1341,13 +1385,16 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             await checkFixture('psql/b5-copy-bad', 'b5-copy-bad', 'b5-copy-bad.sql');
             await checkFixture('psql/b5-cursors', 'b5-cursors', 'b5-cursors.sql');
             await checkFixture('psql/b5-prepare', 'b5-prepare', 'b5-prepare.sql');
+            await checkFixture('psql/b6-l', 'b6-l', 'b6-l.sql');
+            await checkFixture('psql/b6-datacl', 'b6-datacl', 'b6-datacl.sql');
+            await checkFixture('psql/b6-pg-database', 'b6-pg-database', 'b6-pg-database.sql');
         }
 
         return {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 63,
+            floor: 68,
         };
     } finally {
         await trust.close();

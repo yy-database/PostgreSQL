@@ -1277,12 +1277,49 @@ function evaluateArray(database: Database, expr: ArrayExpr, context: Context, pa
     return (expr.elements ?? []).map((element) => formatValue(evaluate(database, element, context, params), TEXT) ?? '').join(' ');
 }
 
+/** Formats bytes the way `pg_size_pretty` does, promoting only at ten of each unit. */
+function pgSizePretty(bytes: number): string {
+    const units = ['bytes', 'kB', 'MB', 'GB', 'TB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 10 * 1024 && unit < units.length - 1) {
+        value = Math.floor(value / 1024);
+        unit += 1;
+    }
+    return `${value} ${units[unit]}`;
+}
+
 function splitArray(value: SqlValue): SqlValue[] {
     if (value === null) return [];
     if (Array.isArray(value)) return value as SqlValue[];
     const text = String(value);
     if (text.length === 0) return [];
+    if (text.startsWith('{') && text.endsWith('}')) return parseArrayLiteral(text.slice(1, -1));
     return text.split(/\s+/);
+}
+
+/** Parses the inside of a PostgreSQL array literal such as `{=c/postgres,postgres=CTc/postgres}`. */
+function parseArrayLiteral(body: string): SqlValue[] {
+    if (body.length === 0) return [];
+    const values: SqlValue[] = [];
+    let current = '';
+    let quoted = false;
+    for (let index = 0; index < body.length; index += 1) {
+        const character = body[index]!;
+        if (character === '\\') {
+            current += body[index + 1] ?? '';
+            index += 1;
+        } else if (character === '"') {
+            quoted = !quoted;
+        } else if (character === ',' && !quoted) {
+            values.push(current);
+            current = '';
+        } else {
+            current += character;
+        }
+    }
+    values.push(current);
+    return values;
 }
 
 function evaluateFunction(database: Database, expr: FunctionExpr, context: Context, params: SqlValue[]): SqlValue {
@@ -1353,6 +1390,21 @@ function evaluateFunction(database: Database, expr: FunctionExpr, context: Conte
         }
         case 'pg_encoding_to_char':
             return pgEncodingToChar(args[0] ?? null);
+        case 'has_database_privilege':
+            return true;
+        case 'pg_database_size':
+            // Databases share one physical store, so the size is a fixed stand-in.
+            return 8000000;
+        case 'pg_size_pretty':
+            return pgSizePretty(Number(args[0] ?? 0));
+        case 'shobj_description': {
+            const descriptions: Record<string, string> = {
+                '1': 'default template for new databases',
+                '4': 'unmodifiable empty database',
+                '5': 'default administrative connection database',
+            };
+            return descriptions[String(args[0] ?? '')] ?? null;
+        }
         case 'pg_function_is_visible':
             return true;
         case 'pg_get_function_result':

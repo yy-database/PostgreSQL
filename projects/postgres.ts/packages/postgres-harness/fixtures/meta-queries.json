@@ -28,9 +28,16 @@
         {
             "name": "l",
             "command": "\\l",
-            "rows": 1,
-            "note": "The real cluster lists every database; this server models only the current one, so the row set is environment dependent.",
+            "rows": 3,
+            "note": "A fresh 16.9 cluster always lists postgres, template1 and template0.",
             "sql": "SELECT\n  d.datname as \"Name\",\n  pg_catalog.pg_get_userbyid(d.datdba) as \"Owner\",\n  pg_catalog.pg_encoding_to_char(d.encoding) as \"Encoding\",\n  CASE d.datlocprovider WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' END AS \"Locale Provider\",\n  d.datcollate as \"Collate\",\n  d.datctype as \"Ctype\",\n  d.daticulocale as \"ICU Locale\",\n  d.daticurules as \"ICU Rules\",\n  pg_catalog.array_to_string(d.datacl, E'\\n') AS \"Access privileges\"\nFROM pg_catalog.pg_database d\nORDER BY 1;"
+        },
+        {
+            "name": "lplus",
+            "command": "\\l+",
+            "rows": 3,
+            "note": "Size is a fixed stand-in because all databases share one physical store, so only the shape is asserted.",
+            "sql": "SELECT\n  d.datname as \"Name\",\n  pg_catalog.pg_get_userbyid(d.datdba) as \"Owner\",\n  pg_catalog.pg_encoding_to_char(d.encoding) as \"Encoding\",\n  CASE d.datlocprovider WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' END AS \"Locale Provider\",\n  d.datcollate as \"Collate\",\n  d.datctype as \"Ctype\",\n  d.daticulocale as \"ICU Locale\",\n  d.daticurules as \"ICU Rules\",\n  pg_catalog.array_to_string(d.datacl, E'\\n') AS \"Access privileges\",\n  CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT')\n       THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname))\n       ELSE 'No Access'\n  END as \"Size\",\n  t.spcname as \"Tablespace\",\n  pg_catalog.shobj_description(d.oid, 'pg_database') as \"Description\"\nFROM pg_catalog.pg_database d\n  JOIN pg_catalog.pg_tablespace t on d.dattablespace = t.oid\nORDER BY 1;"
         }
     ]
 }
