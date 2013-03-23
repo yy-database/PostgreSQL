@@ -11,12 +11,16 @@ fn config() -> ClientConfig {
         .expect("blocked: POSTGRES_TEST_PORT must point at a running PostgreSQL server")
         .parse()
         .expect("POSTGRES_TEST_PORT must be a number");
-    ClientConfig::new(
+    let config = ClientConfig::new(
         std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
         port,
         std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "postgres".into()),
         std::env::var("POSTGRES_TEST_DATABASE").unwrap_or_else(|_| "postgres".into()),
-    )
+    );
+    match std::env::var("POSTGRES_TEST_PASSWORD") {
+        Ok(password) => config.with_password(password),
+        Err(_) => config,
+    }
 }
 
 #[test]
