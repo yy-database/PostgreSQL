@@ -2,6 +2,7 @@
 
 import { ServerError } from '../errors.ts';
 import { type CatalogDoc, assertCatalog, emptyCatalog } from './catalog.ts';
+import type { ClusterDatabase } from './cluster.ts';
 import type { SqlValue } from './types.ts';
 
 export interface StoredRow {
@@ -22,11 +23,11 @@ export interface Storage {
     commitChanges(changes: StoredChange[]): void;
 }
 
-const CATALOG_NAMESPACE = 'pg_catalog';
-const CATALOG_KEY = 'catalog';
-const DATA_NAMESPACE_PREFIX = 'pg_data.';
+export const CATALOG_NAMESPACE = 'pg_catalog';
+export const CATALOG_KEY = 'catalog';
+export const DATA_NAMESPACE_PREFIX = 'pg_data.';
 /** Non-transactional `nextval` high-water marks, one key per sequence oid. */
-const SEQUENCE_STATE_NAMESPACE = 'pg_sequence_state';
+export const SEQUENCE_STATE_NAMESPACE = 'pg_sequence_state';
 
 export function dataNamespace(relOid: number): string {
     return `${DATA_NAMESPACE_PREFIX}${relOid}`;
@@ -74,18 +75,21 @@ export function createSessionRuntime(): SessionRuntime {
 export class Database {
     catalog: CatalogDoc;
     readonly session: SessionRuntime;
+    /** Cluster-wide `pg_database` rows, shared with every session on the store. */
+    readonly databases: ClusterDatabase[];
     private readonly storage: Storage;
     private readonly tables = new Map<number, Map<string, SqlValue[]>>();
     private readonly writes = new Map<number, Map<string, SqlValue[] | null>>();
     private catalogDirty = false;
 
-    private constructor(storage: Storage, catalog: CatalogDoc, session: SessionRuntime) {
+    private constructor(storage: Storage, catalog: CatalogDoc, session: SessionRuntime, databases: ClusterDatabase[]) {
         this.storage = storage;
         this.catalog = catalog;
         this.session = session;
+        this.databases = databases;
     }
 
-    static open(storage: Storage, session: SessionRuntime = createSessionRuntime()): Database {
+    static open(storage: Storage, session: SessionRuntime = createSessionRuntime(), databases: ClusterDatabase[] = []): Database {
         const catalog = loadCatalog(storage);
         // `nextval` survives statement rollback and separate sessions, so the
         // journal below is authoritative whenever it is ahead of the catalog.
@@ -95,12 +99,12 @@ export class Database {
             const sequence = catalog.sequences.find((candidate) => candidate.oid === oid);
             if (sequence && Number.isFinite(value) && value > sequence.lastValue) sequence.lastValue = value;
         }
-        return new Database(storage, catalog, session);
+        return new Database(storage, catalog, session, databases);
     }
 
     /** Copies the working set for `SAVEPOINT`/`ROLLBACK TO`; shares row arrays. */
     clone(): Database {
-        const copy = new Database(this.storage, structuredClone(this.catalog), this.session);
+        const copy = new Database(this.storage, structuredClone(this.catalog), this.session, this.databases);
         for (const [relOid, rows] of this.tables) copy.tables.set(relOid, new Map(rows));
         for (const [relOid, rows] of this.writes) copy.writes.set(relOid, new Map(rows));
         copy.catalogDirty = this.catalogDirty;

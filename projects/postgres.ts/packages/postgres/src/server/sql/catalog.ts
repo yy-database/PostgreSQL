@@ -1,6 +1,7 @@
 /** The single catalog document and its pure `pg_catalog` projections. */
 
 import { ServerError } from '../errors.ts';
+import type { ClusterDatabase } from './cluster.ts';
 import { type DataType, type SqlValue, formatType, typeOf } from './types.ts';
 
 export const CATALOG_VERSION = 2;
@@ -593,7 +594,7 @@ export function relationDisplayName(doc: CatalogDoc, oidValue: number): string |
 }
 
 /** Projects the whole `pg_catalog` surface from the single catalog document. */
-export function catalogTables(doc: CatalogDoc): Map<string, TableData> {
+export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[]): Map<string, TableData> {
     const tables = new Map<string, TableData>();
     const push = (relation: string, row: Record<string, SqlValue>): void => {
         const columns = SYSTEM_BY_NAME.get(relation)?.columns;
@@ -878,64 +879,27 @@ export function catalogTables(doc: CatalogDoc): Map<string, TableData> {
         rolconnlimit: -1,
     });
 
-    const templateAcl = '{=c/postgres,postgres=CTc/postgres}';
-    push('pg_database', {
-        oid: 5,
-        datname: 'postgres',
-        datdba: POSTGRES_ROLE,
-        encoding: 6,
-        datlocprovider: 'c',
-        datistemplate: false,
-        datallowconn: true,
-        datconnlimit: -1,
-        datfrozenxid: 722,
-        datminmxid: 1,
-        dattablespace: 1663,
-        datcollate: 'C',
-        datctype: 'C',
-        daticulocale: null,
-        daticurules: null,
-        datcollversion: null,
-        datacl: null,
-    });
-    push('pg_database', {
-        oid: 1,
-        datname: 'template1',
-        datdba: POSTGRES_ROLE,
-        encoding: 6,
-        datlocprovider: 'c',
-        datistemplate: true,
-        datallowconn: true,
-        datconnlimit: -1,
-        datfrozenxid: 722,
-        datminmxid: 1,
-        dattablespace: 1663,
-        datcollate: 'C',
-        datctype: 'C',
-        daticulocale: null,
-        daticurules: null,
-        datcollversion: null,
-        datacl: templateAcl,
-    });
-    push('pg_database', {
-        oid: 4,
-        datname: 'template0',
-        datdba: POSTGRES_ROLE,
-        encoding: 6,
-        datlocprovider: 'c',
-        datistemplate: true,
-        datallowconn: false,
-        datconnlimit: -1,
-        datfrozenxid: 722,
-        datminmxid: 1,
-        dattablespace: 1663,
-        datcollate: 'C',
-        datctype: 'C',
-        daticulocale: null,
-        daticurules: null,
-        datcollversion: null,
-        datacl: templateAcl,
-    });
+    for (const database of databases) {
+        push('pg_database', {
+            oid: database.oid,
+            datname: database.datname,
+            datdba: database.datdba,
+            encoding: database.encoding,
+            datlocprovider: database.datlocprovider,
+            datistemplate: database.datistemplate,
+            datallowconn: database.datallowconn,
+            datconnlimit: database.datconnlimit,
+            datfrozenxid: database.datfrozenxid,
+            datminmxid: database.datminmxid,
+            dattablespace: database.dattablespace,
+            datcollate: database.datcollate,
+            datctype: database.datctype,
+            daticulocale: database.daticulocale,
+            daticurules: database.daticurules,
+            datcollversion: database.datcollversion,
+            datacl: database.datacl,
+        });
+    }
 
     push('pg_tablespace', { oid: 1663, spcname: 'pg_default', spcowner: POSTGRES_ROLE });
     push('pg_tablespace', { oid: 1664, spcname: 'pg_global', spcowner: POSTGRES_ROLE });

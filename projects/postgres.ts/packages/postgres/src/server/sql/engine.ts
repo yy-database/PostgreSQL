@@ -1029,7 +1029,7 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
     }
     const system = ref.schema === 'pg_catalog' ? systemColumns(ref.name) : ref.schema === undefined ? systemColumns(ref.name) : undefined;
     if (system) {
-        const table = catalogTables(database.catalog).get(ref.name);
+        const table = catalogTables(database.catalog, database.databases).get(ref.name);
         return {
             columns: (table?.columns ?? system).map((column) => ({ alias, name: column.name, type: column.type })),
             rows: table?.rows ?? [],

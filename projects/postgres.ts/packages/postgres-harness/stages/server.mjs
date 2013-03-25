@@ -226,6 +226,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batch3 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch3-')) });
     const batch4 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch4-')) });
     const batch5 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch5-')) });
+    const batch7 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch7-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -1177,6 +1178,195 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         });
 
+        // Batch 7: cluster directory isolation plus CREATE/DROP DATABASE.
+        const connectDatabase = async (server, database) => {
+            const client = new pg.Client({ host: server.host, port: server.port, user: 'postgres', database });
+            await client.connect();
+            return client;
+        };
+        const failureOf = (promise) => promise.then(() => null, (error) => error);
+
+        await check('database/create-isolation', async () => {
+            await withClient(batch7, async (client) => {
+                await client.query('CREATE TABLE postgres_only (id int)');
+                const created = await client.query('CREATE DATABASE b7_iso');
+                assert(created.command === 'CREATE', `create tag is ${created.command}`);
+                const listed = await client.query('SELECT oid, datname FROM pg_database ORDER BY datname');
+                assert(
+                    JSON.stringify(listed.rows) ===
+                        '[{"oid":16384,"datname":"b7_iso"},{"oid":5,"datname":"postgres"},{"oid":4,"datname":"template0"},{"oid":1,"datname":"template1"}]',
+                    `pg_database rows are ${JSON.stringify(listed.rows)}`,
+                );
+            });
+            const app = await connectDatabase(batch7, 'b7_iso');
+            try {
+                const inherited = await failureOf(app.query('SELECT * FROM postgres_only'));
+                assert(inherited?.code === '42P01', `new database sees a postgres table: ${inherited?.code}`);
+                await app.query('CREATE TABLE only_here (id int)');
+                await app.query('INSERT INTO only_here VALUES (1)');
+                const count = await app.query('SELECT count(*) AS n FROM only_here');
+                assert(count.rows[0]?.n === '1', `b7_iso count is ${count.rows[0]?.n}`);
+            } finally {
+                await app.end();
+            }
+            await withClient(batch7, async (client) => {
+                const leaked = await failureOf(client.query('SELECT * FROM only_here'));
+                assert(leaked?.code === '42P01', `postgres sees a clone table: ${leaked?.code}`);
+                const dropped = await client.query('DROP DATABASE b7_iso');
+                assert(dropped.command === 'DROP', `drop tag is ${dropped.command}`);
+            });
+        });
+
+        await check('database/errors', async () => {
+            await withClient(batch7, async (client) => {
+                await client.query('BEGIN');
+                const createInTransaction = await failureOf(client.query('CREATE DATABASE b7_txn_create'));
+                assert(
+                    createInTransaction?.code === '25001' &&
+                        createInTransaction.message === 'CREATE DATABASE cannot run inside a transaction block',
+                    `create in transaction is ${createInTransaction?.code}/${createInTransaction?.message}`,
+                );
+                await client.query('ROLLBACK');
+
+                await client.query('BEGIN');
+                const dropInTransaction = await failureOf(client.query('DROP DATABASE b7_txn_drop'));
+                assert(
+                    dropInTransaction?.code === '25001' && dropInTransaction.message === 'DROP DATABASE cannot run inside a transaction block',
+                    `drop in transaction is ${dropInTransaction?.code}/${dropInTransaction?.message}`,
+                );
+                await client.query('ROLLBACK');
+
+                await client.query('CREATE DATABASE b7_dup');
+                const duplicate = await failureOf(client.query('CREATE DATABASE b7_dup'));
+                assert(duplicate?.code === '42P04' && duplicate.message === 'database "b7_dup" already exists', `duplicate is ${duplicate?.code}`);
+                const unknownTemplate = await failureOf(client.query('CREATE DATABASE b7_tpl TEMPLATE b7_no_template'));
+                assert(unknownTemplate?.code === '3D000', `unknown template is ${unknownTemplate?.code}`);
+                const missing = await failureOf(client.query('DROP DATABASE b7_missing'));
+                assert(missing?.code === '3D000' && missing.message === 'database "b7_missing" does not exist', `missing drop is ${missing?.code}`);
+                const template = await failureOf(client.query('DROP DATABASE template1'));
+                assert(template?.code === '42809' && template.message === 'cannot drop a template database', `template drop is ${template?.code}`);
+                const current = await failureOf(client.query('DROP DATABASE postgres'));
+                assert(
+                    current?.code === '55006' && current.message === 'cannot drop the currently open database',
+                    `current drop is ${current?.code}/${current?.message}`,
+                );
+
+                const notices = [];
+                const onNotice = (notice) => notices.push(notice);
+                client.on('notice', onNotice);
+                try {
+                    const skipped = await client.query('DROP DATABASE IF EXISTS b7_missing_again');
+                    assert(skipped.command === 'DROP', `IF EXISTS tag is ${skipped.command}`);
+                } finally {
+                    client.off('notice', onNotice);
+                }
+                assert(notices.length === 1, `IF EXISTS emitted ${notices.length} notices`);
+                assert(notices[0]?.code === '00000', `notice code is ${notices[0]?.code}`);
+                assert(
+                    notices[0]?.message === 'database "b7_missing_again" does not exist, skipping',
+                    `notice message is ${notices[0]?.message}`,
+                );
+                await client.query('DROP DATABASE b7_dup');
+            });
+        });
+
+        await check('database/occupied', async () => {
+            await withClient(batch7, async (client) => {
+                await client.query('CREATE DATABASE b7_busy');
+                const other = await connectDatabase(batch7, 'b7_busy');
+                try {
+                    const busy = await failureOf(client.query('DROP DATABASE b7_busy'));
+                    assert(
+                        busy?.code === '55006' && busy.message === 'database "b7_busy" is being accessed by other users',
+                        `busy drop is ${busy?.code}/${busy?.message}`,
+                    );
+                    assert(busy?.detail === 'There is 1 other session using the database.', `busy detail is ${busy?.detail}`);
+                } finally {
+                    await other.end();
+                }
+                const dropped = await client.query('DROP DATABASE b7_busy');
+                assert(dropped.command === 'DROP', `busy drop tag is ${dropped.command}`);
+            });
+        });
+
+        await check('database/startup', async () => {
+            const template0 = new pg.Client({ host: batch7.host, port: batch7.port, user: 'postgres', database: 'template0' });
+            const templateError = await failureOf(template0.connect());
+            assert(
+                templateError?.code === '55000' &&
+                    templateError.message === 'database "template0" is not currently accepting connections',
+                `template0 startup is ${templateError?.code}/${templateError?.message}`,
+            );
+            const nowhere = new pg.Client({ host: batch7.host, port: batch7.port, user: 'postgres', database: 'b7_no_such_database' });
+            const missingError = await failureOf(nowhere.connect());
+            assert(
+                missingError?.code === '3D000' && missingError.message === 'database "b7_no_such_database" does not exist',
+                `missing startup is ${missingError?.code}/${missingError?.message}`,
+            );
+            const template1 = await connectDatabase(batch7, 'template1');
+            try {
+                const databases = await template1.query('SELECT count(*) AS n FROM pg_database');
+                assert(databases.rows[0]?.n === '3', `template1 sees ${databases.rows[0]?.n} databases`);
+                const inherited = await template1.query("SELECT count(*) AS n FROM pg_catalog.pg_class WHERE relname = 'postgres_only'");
+                assert(inherited.rows[0]?.n === '0', `template1 inherited ${inherited.rows[0]?.n} postgres tables`);
+            } finally {
+                await template1.end();
+            }
+        });
+
+        await check('database/clone-template0', async () => {
+            await withClient(batch7, async (client) => {
+                const created = await client.query('CREATE DATABASE b7_clone TEMPLATE template0');
+                assert(created.command === 'CREATE', `clone tag is ${created.command}`);
+                const row = await client.query("SELECT datallowconn, datistemplate FROM pg_database WHERE datname = 'b7_clone'");
+                assert(row.rows[0]?.datallowconn === true && row.rows[0]?.datistemplate === false, `clone row is ${JSON.stringify(row.rows[0])}`);
+            });
+            const clone = await connectDatabase(batch7, 'b7_clone');
+            try {
+                await clone.query('CREATE TABLE cloned (id int)');
+            } finally {
+                await clone.end();
+            }
+            await withClient(batch7, async (client) => {
+                await client.query('DROP DATABASE b7_clone');
+            });
+        });
+
+        await check('database/persistence', async () => {
+            const persistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-db-persist-'));
+            const first = await startPostgresServer({ dataDir: persistDir });
+            try {
+                await withClient(first, async (client) => {
+                    await client.query('CREATE DATABASE b7_kept');
+                });
+                const app = await connectDatabase(first, 'b7_kept');
+                try {
+                    await app.query('CREATE TABLE kept (v text)');
+                    await app.query("INSERT INTO kept VALUES ('yes')");
+                } finally {
+                    await app.end();
+                }
+            } finally {
+                await first.close();
+            }
+            const second = await startPostgresServer({ dataDir: persistDir });
+            try {
+                const reopened = await connectDatabase(second, 'b7_kept');
+                try {
+                    const rows = await reopened.query('SELECT v FROM kept');
+                    assert(JSON.stringify(rows.rows) === '[{"v":"yes"}]', `persisted rows are ${JSON.stringify(rows.rows)}`);
+                } finally {
+                    await reopened.end();
+                }
+                await withClient(second, async (client) => {
+                    const listed = await client.query("SELECT datname FROM pg_database WHERE datname = 'b7_kept'");
+                    assert(listed.rowCount === 1, `cluster row rows are ${listed.rowCount}`);
+                });
+            } finally {
+                await second.close();
+            }
+        });
+
         // Batch 5: COPY, cursors, SQL-level PREPARE and LISTEN/NOTIFY.
         const setupB5 = fs.readFileSync(path.join(harnessDir, 'fixtures', 'b5-setup.sql'), 'utf8');
         await withClient(batch5, async (client) => {
@@ -1363,9 +1553,9 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                     child.once('error', reject);
                     child.once('close', (status) => resolve({ stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), status: status ?? 1 }));
                 });
-            const checkFixture = async (name, prefix, script) => {
+            const checkFixture = async (name, prefix, script, server = batch5) => {
                 await check(name, async () => {
-                    const result = await runFixture(batch5, script);
+                    const result = await runFixture(server, script);
                     const expectedOut = fs.readFileSync(path.join(harnessDir, 'fixtures', `${prefix}.out.txt`));
                     const expectedErr = fs.readFileSync(path.join(harnessDir, 'fixtures', `${prefix}.err.txt`));
                     assert(result.status === 0, `${script} exited with ${result.status}: ${result.stderr.toString('utf8')}`);
@@ -1388,13 +1578,14 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             await checkFixture('psql/b6-l', 'b6-l', 'b6-l.sql');
             await checkFixture('psql/b6-datacl', 'b6-datacl', 'b6-datacl.sql');
             await checkFixture('psql/b6-pg-database', 'b6-pg-database', 'b6-pg-database.sql');
+            await checkFixture('psql/b7-database', 'b7-database', 'b7-database.sql', batch7);
         }
 
         return {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 68,
+            floor: 76,
         };
     } finally {
         await trust.close();
@@ -1403,5 +1594,6 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batch3.close();
         await batch4.close();
         await batch5.close();
+        await batch7.close();
     }
 }

@@ -6,10 +6,20 @@ import { randomInt } from 'node:crypto';
 
 import { loadNative, type ServerStore } from '../native.ts';
 import { ServerError } from './errors.ts';
-import { storageFor } from './store.ts';
+import { cloneDatabase, databasePrefix, purgeDatabase, scopedStorage, storageFor } from './store.ts';
 import { createSessionRuntime, Database, type SessionRuntime, type Storage } from './sql/database.ts';
+import { type ClusterDatabase, ClusterStore } from './sql/cluster.ts';
 import { copyColumnCount, copyIn, copyOut } from './sql/copy.ts';
-import type { CopyStatement, CursorDirection, CursorStatement, PrepareStatement, Statement, TransactionStatement } from './sql/parser.ts';
+import type {
+    CopyStatement,
+    CreateDatabaseStatement,
+    CursorDirection,
+    CursorStatement,
+    DropDatabaseStatement,
+    PrepareStatement,
+    Statement,
+    TransactionStatement,
+} from './sql/parser.ts';
 import { constantValue, parseStatement } from './sql/parser.ts';
 import { describeSelect, runStatement, type Field, type Outcome } from './sql/engine.ts';
 import { TEXT, formatValue, parseLiteral, typeLength, typeOid, type SqlValue, type DataType } from './sql/types.ts';
@@ -191,9 +201,12 @@ interface SqlPrepared {
 class Session {
     private readonly socket: net.Socket;
     private readonly user: string;
-    private readonly database: string;
+    private database: string;
     private readonly auth: ServerAuth;
-    private readonly storage: Storage;
+    /** The unscoped store, used for cluster-level rows and per-database scoping. */
+    private readonly baseStorage: Storage;
+    private storage: Storage;
+    private readonly cluster: ClusterStore;
     private readonly pid = randomInt(1, 2 ** 31 - 1);
     private readonly secret = randomInt(1, 2 ** 31 - 1);
 
@@ -226,14 +239,21 @@ class Session {
           }
         | null = null;
 
-    constructor(socket: net.Socket, options: PostgresServerOptions, storage: Storage, hub: NotificationHub) {
+    constructor(socket: net.Socket, options: PostgresServerOptions, storage: Storage, hub: NotificationHub, cluster: ClusterStore) {
         this.socket = socket;
         this.user = options.user ?? 'postgres';
         this.database = options.database ?? 'postgres';
         this.auth = options.auth ?? 'trust';
-        this.storage = storage;
+        this.baseStorage = storage;
+        this.storage = scopedStorage(storage, databasePrefix(this.database));
+        this.cluster = cluster;
         this.hub = hub;
         hub.sessions.add(this);
+    }
+
+    /** `true` when this connection is open on `name`; used by `DROP DATABASE`. */
+    usesDatabase(name: string): boolean {
+        return this.database === name;
     }
 
     start(): void {
@@ -312,8 +332,13 @@ class Session {
             this.fail('28000', 'no PostgreSQL user name specified in startup packet');
             return;
         }
-        if (database !== this.database) {
+        const target = this.cluster.find(database);
+        if (!target) {
             this.fail('3D000', `database "${database}" does not exist`);
+            return;
+        }
+        if (!target.datallowconn) {
+            this.fail('55000', `database "${database}" is not currently accepting connections`);
             return;
         }
         if (user !== this.user) {
@@ -321,6 +346,8 @@ class Session {
             return;
         }
 
+        this.database = database;
+        this.storage = scopedStorage(this.baseStorage, databasePrefix(database));
         this.startupParameters = parameters;
         if (this.auth === 'trust') {
             this.completeAuthentication();
@@ -491,7 +518,7 @@ class Session {
                     outcomes.push(direct);
                     continue;
                 }
-                const database = this.transaction !== null ? this.transaction.database : (implicit ??= Database.open(this.storage, this.runtime));
+                const database = this.transaction !== null ? this.transaction.database : (implicit ??= Database.open(this.storage, this.runtime, this.cluster.doc.databases));
                 const before = database.clone();
                 let parsed: Statement | null = null;
                 try {
@@ -567,6 +594,10 @@ class Session {
         this.socket.write(noticeResponse({ severity: 'WARNING', code, message }));
     }
 
+    private notice(code: string, message: string): void {
+        this.socket.write(noticeResponse({ severity: 'NOTICE', code, message }));
+    }
+
     /** Runs `BEGIN`/`COMMIT`/`ROLLBACK`/savepoint commands and returns their tag. */
     private runTransaction(statement: TransactionStatement): Outcome {
         switch (statement.command) {
@@ -578,7 +609,7 @@ class Session {
                     this.warn('25001', 'there is already a transaction in progress');
                     return { kind: 'command', tag: 'BEGIN' };
                 }
-                this.transaction = { database: Database.open(this.storage, this.runtime), savepoints: [], aborted: false };
+                this.transaction = { database: Database.open(this.storage, this.runtime, this.cluster.doc.databases), savepoints: [], aborted: false };
                 return { kind: 'command', tag: 'BEGIN' };
             case 'commit':
                 if (this.transaction === null) {
@@ -732,9 +763,107 @@ class Session {
                 this.pending.push({ channel: statement.channel, payload });
                 return { kind: 'command', tag: 'NOTIFY' };
             }
+            case 'create-database':
+                return this.runCreateDatabase(statement);
+            case 'drop-database':
+                return this.runDropDatabase(statement);
             default:
                 return runStatement(database, statement, parameters);
         }
+    }
+
+    /**
+     * `CREATE DATABASE`: clones the template database's namespaces into the new
+     * `db:<name>:` prefix and adds one cluster directory row.
+     */
+    private runCreateDatabase(statement: CreateDatabaseStatement): ServerOutcome {
+        if (this.transaction !== null) {
+            throw new ServerError('25001', 'CREATE DATABASE cannot run inside a transaction block');
+        }
+        const name = statement.name;
+        if (this.cluster.find(name)) throw new ServerError('42P04', `database "${name}" already exists`);
+        const templateName = statement.template ?? 'template1';
+        const template = this.cluster.find(templateName);
+        if (!template) throw new ServerError('3D000', `database "${templateName}" does not exist`);
+
+        const database: ClusterDatabase = {
+            oid: this.cluster.nextOid(),
+            datname: name,
+            datdba: template.datdba,
+            encoding: template.encoding,
+            datlocprovider: template.datlocprovider,
+            datistemplate: false,
+            datallowconn: true,
+            datconnlimit: template.datconnlimit,
+            datfrozenxid: template.datfrozenxid,
+            datminmxid: template.datminmxid,
+            dattablespace: template.dattablespace,
+            datcollate: template.datcollate,
+            datctype: template.datctype,
+            daticulocale: template.daticulocale,
+            daticurules: template.daticurules,
+            datcollversion: template.datcollversion,
+            datacl: null,
+        };
+        const changes = cloneDatabase(this.baseStorage, templateName, name);
+        this.cluster.append(database);
+        changes.push(this.cluster.change());
+        try {
+            this.baseStorage.commitChanges(changes);
+        } catch (error) {
+            this.cluster.remove(name);
+            throw new ServerError('58030', 'could not write to the data directory', error instanceof Error ? error.message : String(error));
+        }
+        return { kind: 'command', tag: 'CREATE DATABASE' };
+    }
+
+    /**
+     * `DROP DATABASE`: removes the cluster row and every durable row the
+     * database owns, in one commit.
+     */
+    private runDropDatabase(statement: DropDatabaseStatement): ServerOutcome {
+        if (this.transaction !== null) {
+            throw new ServerError('25001', 'DROP DATABASE cannot run inside a transaction block');
+        }
+        const name = statement.name;
+        const target = this.cluster.find(name);
+        if (!target) {
+            if (!statement.ifExists) throw new ServerError('3D000', `database "${name}" does not exist`);
+            this.notice('00000', `database "${name}" does not exist, skipping`);
+            return { kind: 'command', tag: 'DROP DATABASE' };
+        }
+        if (target.datistemplate) throw new ServerError('42809', 'cannot drop a template database');
+        if (name === this.database) throw new ServerError('55006', 'cannot drop the currently open database');
+        const users = this.otherSessionsOn(name);
+        if (users > 0) {
+            if (statement.force) {
+                throw new ServerError('0A000', 'feature not supported', 'DROP DATABASE ... WITH (FORCE) is not implemented');
+            }
+            throw new ServerError(
+                '55006',
+                `database "${name}" is being accessed by other users`,
+                users === 1 ? 'There is 1 other session using the database.' : `There are ${users} other sessions using the database.`,
+            );
+        }
+
+        const changes = purgeDatabase(this.baseStorage, name);
+        this.cluster.remove(name);
+        changes.push(this.cluster.change());
+        try {
+            this.baseStorage.commitChanges(changes);
+        } catch (error) {
+            throw new ServerError('58030', 'could not write to the data directory', error instanceof Error ? error.message : String(error));
+        }
+        return { kind: 'command', tag: 'DROP DATABASE' };
+    }
+
+    /** Sessions other than this one currently connected to `name`. */
+    private otherSessionsOn(name: string): number {
+        let count = 0;
+        for (const session of this.hub.sessions) {
+            if (session !== this && session.usesDatabase(name)) count += 1;
+        }
+        return count;
     }
 
     private runPrepare(statement: PrepareStatement): ServerOutcome {
@@ -828,7 +957,7 @@ class Session {
                 throw error;
             }
         }
-        const database = Database.open(this.storage, this.runtime);
+        const database = Database.open(this.storage, this.runtime, this.cluster.doc.databases);
         const before = database.clone();
         try {
             const outcome = this.runParsed(state, database, parseStatement(trimmed), parameters);
@@ -933,7 +1062,7 @@ class Session {
         const parsed = parseStatement(statement);
         if (parsed.kind !== 'select') return noData();
         const placeholders = Array.from({ length: parameterCount }, () => null);
-        const database = this.transaction?.database ?? Database.open(this.storage, this.runtime);
+        const database = this.transaction?.database ?? Database.open(this.storage, this.runtime, this.cluster.doc.databases);
         return rowDescription(wireFields(describeSelect(database, parsed, placeholders)));
     }
 
@@ -1111,12 +1240,15 @@ function rewriteParamTypes(statement: Statement, types: DataType[]): Statement {
 export function startPostgresServer(options: PostgresServerOptions = {}): Promise<PostgresServerHandle> {
     const dataDir = options.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-data-'));
     let store: ServerStore;
+    let storage: Storage;
+    let cluster: ClusterStore;
     try {
         store = new (loadNative().ServerStore)(dataDir);
+        storage = storageFor(store);
+        cluster = new ClusterStore(storage);
     } catch (error) {
         return Promise.reject(error);
     }
-    const storage = storageFor(store);
 
     const sockets = new Set<net.Socket>();
     const host = options.host ?? '127.0.0.1';
@@ -1124,7 +1256,7 @@ export function startPostgresServer(options: PostgresServerOptions = {}): Promis
     const server = net.createServer((socket) => {
         sockets.add(socket);
         socket.on('close', () => sockets.delete(socket));
-        const session = new Session(socket, options, storage, hub);
+        const session = new Session(socket, options, storage, hub, cluster);
         session.start();
     });
 

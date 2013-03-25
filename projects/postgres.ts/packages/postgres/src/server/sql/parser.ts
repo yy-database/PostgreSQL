@@ -357,6 +357,21 @@ export interface DropIndexStatement {
     cascade: boolean;
 }
 
+/** `CREATE DATABASE name [TEMPLATE name]`, executed outside a transaction block. */
+export interface CreateDatabaseStatement {
+    kind: 'create-database';
+    name: string;
+    template: string | undefined;
+}
+
+/** `DROP DATABASE [IF EXISTS] name`, executed outside a transaction block. */
+export interface DropDatabaseStatement {
+    kind: 'drop-database';
+    name: string;
+    ifExists: boolean;
+    force: boolean;
+}
+
 export type AlterTableAction =
     | { kind: 'add-check'; name: string | undefined; expr: Expr; source: string; notValid: boolean }
     | { kind: 'add-foreign'; name: string | undefined; columns: string[]; reference: ReferenceClause }
@@ -454,6 +469,8 @@ export type Statement =
     | DropTableStatement
     | CreateIndexStatement
     | DropIndexStatement
+    | CreateDatabaseStatement
+    | DropDatabaseStatement
     | AlterTableStatement
     | TransactionStatement
     | CopyStatement
@@ -1920,6 +1937,7 @@ class Parser {
 
     private parseCreate(): Statement {
         this.expect('CREATE');
+        if (this.at('DATABASE')) return this.parseCreateDatabase();
         if (this.at('UNIQUE') || this.at('INDEX')) return this.parseCreateIndex();
         this.expect('TABLE');
         const ifNotExists = this.at('IF') ? (this.next(), this.expect('NOT'), this.expect('EXISTS'), true) : false;
@@ -1978,6 +1996,14 @@ class Parser {
         } while (this.accept(','));
         this.expect(')');
         return { kind: 'create-table', table, ifNotExists, columns, constraints };
+    }
+
+    private parseCreateDatabase(): CreateDatabaseStatement {
+        this.expect('DATABASE');
+        const name = this.identifier();
+        this.accept('WITH');
+        const template = this.at('TEMPLATE') ? (this.next(), this.accept('='), this.identifier()) : undefined;
+        return { kind: 'create-database', name, template };
     }
 
     private parseCreateIndex(): CreateIndexStatement {
@@ -2203,6 +2229,7 @@ class Parser {
 
     private parseDrop(): Statement {
         this.expect('DROP');
+        if (this.at('DATABASE')) return this.parseDropDatabase();
         if (this.at('INDEX')) {
             this.next();
             const ifExists = this.at('IF') ? (this.next(), this.expect('EXISTS'), true) : false;
@@ -2217,6 +2244,22 @@ class Parser {
         const cascade = this.accept('CASCADE');
         this.accept('RESTRICT');
         return { kind: 'drop-table', table, ifExists, cascade };
+    }
+
+    private parseDropDatabase(): DropDatabaseStatement {
+        this.expect('DATABASE');
+        const ifExists = this.at('IF') ? (this.next(), this.expect('EXISTS'), true) : false;
+        const name = this.identifier();
+        let force = false;
+        if (this.accept('WITH')) {
+            this.expect('(');
+            if (this.at('FORCE')) {
+                this.next();
+                force = true;
+            }
+            this.expect(')');
+        }
+        return { kind: 'drop-database', name, ifExists, force };
     }
 
     private parseRelationRef(): RelationRef {

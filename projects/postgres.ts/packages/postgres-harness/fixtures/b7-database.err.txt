@@ -1,0 +1,8 @@
+psql:b7-database.sql:2: ERROR:  database "b7_fixture" already exists
+psql:b7-database.sql:6: NOTICE:  database "b7_fixture" does not exist, skipping
+psql:b7-database.sql:7: ERROR:  database "b7_no_such" does not exist
+psql:b7-database.sql:8: ERROR:  cannot drop a template database
+psql:b7-database.sql:9: ERROR:  cannot drop a template database
+psql:b7-database.sql:10: ERROR:  cannot drop the currently open database
+psql:b7-database.sql:12: ERROR:  CREATE DATABASE cannot run inside a transaction block
+psql:b7-database.sql:15: ERROR:  DROP DATABASE cannot run inside a transaction block
