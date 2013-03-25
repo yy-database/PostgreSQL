@@ -537,7 +537,7 @@ class Session {
                         this.socket.write(copyInResponse(columns));
                         return;
                     }
-                    outcomes.push(this.runParsed(state, database, parsed, []));
+                    outcomes.push(this.runParsed(state, database, parsed, [], statements.length === 1));
                 } catch (error) {
                     database.restore(before);
                     throw error;
@@ -713,8 +713,11 @@ class Session {
         return null;
     }
 
-    /** Runs one statement: session GUCs, then session-owned SQL, then the engine. */
-    private runParsed(state: SessionState, database: Database, statement: Statement, parameters: SqlValue[]): ServerOutcome {
+    /**
+     * Runs one statement: session GUCs, then session-owned SQL, then the engine.
+     * `topLevel` is false for every statement of a multi-statement simple query.
+     */
+    private runParsed(state: SessionState, database: Database, statement: Statement, parameters: SqlValue[], topLevel = true): ServerOutcome {
         switch (statement.kind) {
             case 'copy': {
                 if (statement.direction === 'from') {
@@ -764,9 +767,9 @@ class Session {
                 return { kind: 'command', tag: 'NOTIFY' };
             }
             case 'create-database':
-                return this.runCreateDatabase(statement);
+                return this.runCreateDatabase(statement, topLevel);
             case 'drop-database':
-                return this.runDropDatabase(statement);
+                return this.runDropDatabase(statement, topLevel);
             default:
                 return runStatement(database, statement, parameters);
         }
@@ -776,8 +779,8 @@ class Session {
      * `CREATE DATABASE`: clones the template database's namespaces into the new
      * `db:<name>:` prefix and adds one cluster directory row.
      */
-    private runCreateDatabase(statement: CreateDatabaseStatement): ServerOutcome {
-        if (this.transaction !== null) {
+    private runCreateDatabase(statement: CreateDatabaseStatement, topLevel: boolean): ServerOutcome {
+        if (this.transaction !== null || !topLevel) {
             throw new ServerError('25001', 'CREATE DATABASE cannot run inside a transaction block');
         }
         const name = statement.name;
@@ -821,8 +824,8 @@ class Session {
      * `DROP DATABASE`: removes the cluster row and every durable row the
      * database owns, in one commit.
      */
-    private runDropDatabase(statement: DropDatabaseStatement): ServerOutcome {
-        if (this.transaction !== null) {
+    private runDropDatabase(statement: DropDatabaseStatement, topLevel: boolean): ServerOutcome {
+        if (this.transaction !== null || !topLevel) {
             throw new ServerError('25001', 'DROP DATABASE cannot run inside a transaction block');
         }
         const name = statement.name;

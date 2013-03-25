@@ -1236,6 +1236,19 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 );
                 await client.query('ROLLBACK');
 
+                const multiCreate = await failureOf(client.query('CREATE DATABASE b7_multi; SELECT 1'));
+                assert(
+                    multiCreate?.code === '25001' && multiCreate.message === 'CREATE DATABASE cannot run inside a transaction block',
+                    `multi-statement create is ${multiCreate?.code}/${multiCreate?.message}`,
+                );
+                const multiDrop = await failureOf(client.query('DROP DATABASE b7_multi_drop; SELECT 1'));
+                assert(
+                    multiDrop?.code === '25001' && multiDrop.message === 'DROP DATABASE cannot run inside a transaction block',
+                    `multi-statement drop is ${multiDrop?.code}/${multiDrop?.message}`,
+                );
+                const multiLeft = await client.query("SELECT count(*) AS n FROM pg_database WHERE datname = 'b7_multi'");
+                assert(multiLeft.rows[0]?.n === '0', `multi-statement create left ${multiLeft.rows[0]?.n} rows`);
+
                 await client.query('CREATE DATABASE b7_dup');
                 const duplicate = await failureOf(client.query('CREATE DATABASE b7_dup'));
                 assert(duplicate?.code === '42P04' && duplicate.message === 'database "b7_dup" already exists', `duplicate is ${duplicate?.code}`);
