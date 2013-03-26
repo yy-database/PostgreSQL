@@ -1,0 +1,12 @@
+CREATE DATABASE
+     datname     | datallowconn | datconnlimit 
+-----------------+--------------+--------------
+ b8_fixture_opts | t            |            5
+(1 row)
+
+ public_connect | public_temp 
+----------------+-------------
+ t              | t
+(1 row)
+
+DROP DATABASE

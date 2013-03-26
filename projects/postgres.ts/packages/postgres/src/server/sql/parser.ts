@@ -357,11 +357,13 @@ export interface DropIndexStatement {
     cascade: boolean;
 }
 
-/** `CREATE DATABASE name [TEMPLATE name]`, executed outside a transaction block. */
+/** `CREATE DATABASE` options this server accepts, executed outside a transaction block. */
 export interface CreateDatabaseStatement {
     kind: 'create-database';
     name: string;
     template: string | undefined;
+    connectionLimit: number | undefined;
+    allowConnections: boolean | undefined;
 }
 
 /** `DROP DATABASE [IF EXISTS] name`, executed outside a transaction block. */
@@ -2002,8 +2004,59 @@ class Parser {
         this.expect('DATABASE');
         const name = this.identifier();
         this.accept('WITH');
-        const template = this.at('TEMPLATE') ? (this.next(), this.accept('='), this.identifier()) : undefined;
-        return { kind: 'create-database', name, template };
+        let template: string | undefined;
+        let connectionLimit: number | undefined;
+        let allowConnections: boolean | undefined;
+        for (;;) {
+            if (this.at('TEMPLATE')) {
+                this.next();
+                this.accept('=');
+                template = this.identifier();
+                continue;
+            }
+            if (this.at('ALLOW_CONNECTIONS')) {
+                this.next();
+                this.accept('=');
+                allowConnections = this.booleanOption('allow_connections');
+                continue;
+            }
+            if (this.at('CONNECTION')) {
+                this.next();
+                this.expect('LIMIT');
+                this.accept('=');
+                connectionLimit = this.integerOption('connection_limit');
+                continue;
+            }
+            break;
+        }
+        return { kind: 'create-database', name, template, connectionLimit, allowConnections };
+    }
+
+    /** Boolean option value, rejected with PostgreSQL's `defGetBoolean` wording. */
+    private booleanOption(option: string): boolean {
+        const token = this.peek();
+        if (token.upper === 'TRUE' || token.upper === 'ON' || token.value === '1') {
+            this.next();
+            return true;
+        }
+        if (token.upper === 'FALSE' || token.upper === 'OFF' || token.value === '0') {
+            this.next();
+            return false;
+        }
+        throw new ServerError('42601', `${option} requires a Boolean value`, undefined, token.start);
+    }
+
+    /** Signed integer option value, rejected with PostgreSQL's `defGetInt32` wording. */
+    private integerOption(option: string): number {
+        let sign = 1;
+        if (this.accept('-')) sign = -1;
+        else this.accept('+');
+        const token = this.peek();
+        if (token.kind !== 'number' || !/^\d+$/.test(token.value)) {
+            throw new ServerError('42601', `${option} requires an integer value`, undefined, token.start);
+        }
+        this.next();
+        return sign * Number(token.value);
     }
 
     private parseCreateIndex(): CreateIndexStatement {

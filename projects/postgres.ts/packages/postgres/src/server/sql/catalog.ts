@@ -879,6 +879,19 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[]): Ma
         rolconnlimit: -1,
     });
 
+    push('pg_roles', {
+        oid: PG_DATABASE_OWNER_ROLE,
+        rolname: 'pg_database_owner',
+        rolsuper: false,
+        rolinherit: true,
+        rolcreaterole: false,
+        rolcreatedb: false,
+        rolcanlogin: false,
+        rolreplication: false,
+        rolbypassrls: false,
+        rolconnlimit: -1,
+    });
+
     for (const database of databases) {
         push('pg_database', {
             oid: database.oid,

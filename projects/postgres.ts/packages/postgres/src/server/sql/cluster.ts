@@ -1,6 +1,7 @@
 /** Cluster-wide database directory shared by every session on one data directory. */
 
-import { FIRST_USER_OID, POSTGRES_ROLE } from './catalog.ts';
+import { ServerError } from '../errors.ts';
+import { FIRST_USER_OID, POSTGRES_ROLE, pgGetUserById } from './catalog.ts';
 import type { Storage, StoredChange } from './database.ts';
 
 export const CLUSTER_NAMESPACE = 'pg_cluster';
@@ -183,4 +184,97 @@ export class ClusterStore {
             value: encode(JSON.stringify(this.doc)),
         };
     }
+}
+
+/** Database privilege letters PostgreSQL stores in `datacl`. */
+const DATABASE_PRIVILEGES: Record<string, string> = {
+    connect: 'c',
+    create: 'C',
+    temp: 'T',
+    temporary: 'T',
+};
+
+/** PostgreSQL's implicit database ACL: PUBLIC gets TEMP and CONNECT, the owner gets all three. */
+const DEFAULT_PUBLIC_PRIVILEGES = 'Tc';
+const DEFAULT_OWNER_PRIVILEGES = 'CTc';
+
+/** Roles known to the catalogue. `pg_database_owner` is built in and cannot log in. */
+const KNOWN_ROLES = new Set(['postgres', 'pg_database_owner']);
+
+/** One `datacl` element, `grantee=privileges/grantor`; an empty grantee is PUBLIC. */
+interface AclEntry {
+    grantee: string;
+    privileges: string;
+}
+
+function parseAclEntry(text: string): AclEntry {
+    const equals = text.indexOf('=');
+    const slash = text.lastIndexOf('/');
+    if (equals < 0 || slash <= equals) return { grantee: text, privileges: '' };
+    return { grantee: text.slice(0, equals), privileges: text.slice(equals + 1, slash) };
+}
+
+/** Splits a `datacl` text-array literal into entries, unquoting role names. */
+function aclEntries(datacl: string): AclEntry[] {
+    const body = datacl.trim().replace(/^\{/, '').replace(/\}$/, '');
+    if (body.length === 0) return [];
+    const entries: AclEntry[] = [];
+    let current = '';
+    let quoted = false;
+    for (let index = 0; index < body.length; index += 1) {
+        const character = body[index]!;
+        if (quoted) {
+            if (character === '\\') {
+                current += body[index + 1] ?? '';
+                index += 1;
+            } else if (character === '"') quoted = false;
+            else current += character;
+            continue;
+        }
+        if (character === '"') {
+            quoted = true;
+            continue;
+        }
+        if (character === ',') {
+            entries.push(parseAclEntry(current));
+            current = '';
+            continue;
+        }
+        current += character;
+    }
+    entries.push(parseAclEntry(current));
+    return entries;
+}
+
+/** The ACL entries that apply to one database, materialising the default when `datacl` is null. */
+function databaseAcl(database: ClusterDatabase): AclEntry[] {
+    if (database.datacl !== null) return aclEntries(database.datacl);
+    const owner = pgGetUserById(database.datdba);
+    return [
+        { grantee: '', privileges: DEFAULT_PUBLIC_PRIVILEGES },
+        ...(typeof owner === 'string' ? [{ grantee: owner, privileges: DEFAULT_OWNER_PRIVILEGES }] : []),
+    ];
+}
+
+/**
+ * `has_database_privilege([user,] database, privilege)` over the cluster rows.
+ *
+ * Superusers and the database owner hold every privilege implicitly, matching
+ * PostgreSQL. Other roles are resolved through `datacl`, falling back to the
+ * default database ACL when the column is null.
+ */
+export function hasDatabasePrivilege(databases: ClusterDatabase[], user: string, databaseName: string, privilege: string): boolean {
+    const letter = DATABASE_PRIVILEGES[privilege.toLowerCase()];
+    if (letter === undefined) throw new ServerError('22023', `unrecognized privilege type: "${privilege}"`);
+    if (!KNOWN_ROLES.has(user)) throw new ServerError('42704', `role "${user}" does not exist`);
+    const database = databases.find((row) => row.datname === databaseName);
+    if (!database) throw new ServerError('3D000', `database "${databaseName}" does not exist`);
+    if (user === 'postgres') return true;
+    const owner = pgGetUserById(database.datdba);
+    if (typeof owner === 'string' && owner === user) return true;
+    for (const entry of databaseAcl(database)) {
+        if (entry.grantee !== '' && entry.grantee !== user) continue;
+        if (entry.privileges.includes(letter)) return true;
+    }
+    return false;
 }

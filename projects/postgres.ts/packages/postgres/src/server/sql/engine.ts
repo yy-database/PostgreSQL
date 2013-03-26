@@ -18,6 +18,7 @@ import {
     typeByOid,
 } from './catalog.ts';
 import type { Database } from './database.ts';
+import { hasDatabasePrivilege } from './cluster.ts';
 import {
     type ArrayExpr,
     type AnyExpr,
@@ -757,6 +758,7 @@ function functionType(name: string): DataType {
             return typeOf('name');
         case 'pg_table_is_visible':
         case 'pg_relation_is_publishable':
+        case 'has_database_privilege':
             return BOOL;
         case 'generate_series':
             return INT4;
@@ -1390,8 +1392,13 @@ function evaluateFunction(database: Database, expr: FunctionExpr, context: Conte
         }
         case 'pg_encoding_to_char':
             return pgEncodingToChar(args[0] ?? null);
-        case 'has_database_privilege':
-            return true;
+        case 'has_database_privilege': {
+            const text = (value: SqlValue | undefined) => formatValue(value ?? null, TEXT) ?? '';
+            const [first, second, third] = args;
+            return third === undefined
+                ? hasDatabasePrivilege(database.databases, 'postgres', text(first), text(second))
+                : hasDatabasePrivilege(database.databases, text(first), text(second), text(third));
+        }
         case 'pg_database_size':
             // Databases share one physical store, so the size is a fixed stand-in.
             return 8000000;

@@ -227,6 +227,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batch4 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch4-')) });
     const batch5 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch5-')) });
     const batch7 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch7-')) });
+    const batch8 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch8-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -1380,6 +1381,131 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             }
         });
 
+        // Batch 8: database options, template clone boundaries, ACL and FORCE.
+        await check('database/options', async () => {
+            await withClient(batch8, async (client) => {
+                const created = await client.query(
+                    'CREATE DATABASE b8_opts WITH TEMPLATE = template0 CONNECTION LIMIT = 5 ALLOW_CONNECTIONS = true',
+                );
+                assert(created.command === 'CREATE', `options create tag is ${created.command}`);
+                const row = await client.query("SELECT datconnlimit, datallowconn, datistemplate FROM pg_database WHERE datname = 'b8_opts'");
+                assert(
+                    JSON.stringify(row.rows[0]) === '{"datconnlimit":5,"datallowconn":true,"datistemplate":false}',
+                    `option row is ${JSON.stringify(row.rows[0])}`,
+                );
+                const shut = await client.query('CREATE DATABASE b8_shut ALLOW_CONNECTIONS false');
+                assert(shut.command === 'CREATE', `shut create tag is ${shut.command}`);
+                // `CONNECTION LIMIT` and `ALLOW_CONNECTIONS` are not inherited from the template.
+                await client.query('CREATE DATABASE b8_parent CONNECTION LIMIT = 1 ALLOW_CONNECTIONS = false');
+                await client.query('CREATE DATABASE b8_child TEMPLATE b8_parent');
+                const inherited = await client.query("SELECT datconnlimit, datallowconn FROM pg_database WHERE datname = 'b8_child'");
+                assert(
+                    JSON.stringify(inherited.rows[0]) === '{"datconnlimit":-1,"datallowconn":true}',
+                    `child row is ${JSON.stringify(inherited.rows[0])}`,
+                );
+            });
+            const shut = new pg.Client({ host: batch8.host, port: batch8.port, user: 'postgres', database: 'b8_shut' });
+            const shutError = await failureOf(shut.connect());
+            assert(
+                shutError?.code === '55000' && shutError.message === 'database "b8_shut" is not currently accepting connections',
+                `allow_connections startup is ${shutError?.code}/${shutError?.message}`,
+            );
+            await shut.end().catch(() => undefined);
+            // PostgreSQL exempts superusers from `CONNECTION LIMIT`; every session here is that role.
+            const first = await connectDatabase(batch8, 'b8_opts');
+            const second = await connectDatabase(batch8, 'b8_opts');
+            await first.end();
+            await second.end();
+            await withClient(batch8, async (client) => {
+                for (const name of ['b8_shut', 'b8_child', 'b8_parent', 'b8_opts']) await client.query(`DROP DATABASE ${name}`);
+            });
+        });
+
+        await check('database/parse-errors', async () => {
+            await withClient(batch8, async (client) => {
+                const limit = await failureOf(client.query('CREATE DATABASE b8_bad CONNECTION LIMIT foo'));
+                assert(
+                    limit?.code === '42601' && limit.message === 'connection_limit requires an integer value',
+                    `bad connection limit is ${limit?.code}/${limit?.message}`,
+                );
+                const allow = await failureOf(client.query('CREATE DATABASE b8_bad ALLOW_CONNECTIONS maybe'));
+                assert(
+                    allow?.code === '42601' && allow.message === 'allow_connections requires a Boolean value',
+                    `bad allow_connections is ${allow?.code}/${allow?.message}`,
+                );
+            });
+        });
+
+        await check('database/clone-source-busy', async () => {
+            await withClient(batch8, async (client) => {
+                await client.query('CREATE DATABASE b8_src8');
+                const other = await connectDatabase(batch8, 'b8_src8');
+                try {
+                    const busy = await failureOf(client.query('CREATE DATABASE b8_src8_clone TEMPLATE b8_src8'));
+                    assert(
+                        busy?.code === '55006' &&
+                            busy.message === 'source database "b8_src8" is being accessed by other users',
+                        `busy source is ${busy?.code}/${busy?.message}`,
+                    );
+                    assert(busy?.detail === 'There is 1 other session using the database.', `busy source detail is ${busy?.detail}`);
+                } finally {
+                    await other.end();
+                }
+                const cloned = await client.query('CREATE DATABASE b8_src8_clone TEMPLATE b8_src8');
+                assert(cloned.command === 'CREATE', `clone tag is ${cloned.command}`);
+                await client.query('DROP DATABASE b8_src8_clone');
+                await client.query('DROP DATABASE b8_src8');
+            });
+        });
+
+        await check('database/force', async () => {
+            await withClient(batch8, async (client) => {
+                await client.query('CREATE DATABASE b8_force');
+                const victim = await connectDatabase(batch8, 'b8_force');
+                const terminated = new Promise((resolve) => victim.once('error', (error) => resolve(error)));
+                try {
+                    const busy = await failureOf(client.query('DROP DATABASE b8_force'));
+                    assert(busy?.code === '55006', `drop without force is ${busy?.code}`);
+                    const dropped = await client.query('DROP DATABASE b8_force WITH (FORCE)');
+                    assert(dropped.command === 'DROP', `force drop tag is ${dropped.command}`);
+                    const error = await Promise.race([terminated, new Promise((resolve) => setTimeout(() => resolve(null), 2000))]);
+                    assert(
+                        error?.code === '57P01' && error.message === 'terminating connection due to administrator command',
+                        `terminated session is ${error?.code}/${error?.message}`,
+                    );
+                } finally {
+                    await victim.end().catch(() => undefined);
+                }
+            });
+        });
+
+        await check('database/acl', async () => {
+            await withClient(batch8, async (client) => {
+                const privileges = await client.query(
+                    "SELECT has_database_privilege('postgres','template1','CONNECT') AS owner_connect, " +
+                        "has_database_privilege('postgres','template1','TEMP') AS owner_temp, " +
+                        "has_database_privilege('pg_database_owner','template1','CONNECT') AS public_connect, " +
+                        "has_database_privilege('pg_database_owner','template1','TEMP') AS public_temp, " +
+                        "has_database_privilege('pg_database_owner','postgres','TEMP') AS default_temp, " +
+                        "has_database_privilege('template1','CONNECT') AS current_user_connect",
+                );
+                assert(
+                    JSON.stringify(privileges.rows[0]) ===
+                        '{"owner_connect":true,"owner_temp":true,"public_connect":true,"public_temp":false,"default_temp":true,"current_user_connect":true}',
+                    `privileges are ${JSON.stringify(privileges.rows[0])}`,
+                );
+                const role = await failureOf(client.query("SELECT has_database_privilege('nobody','postgres','CONNECT')"));
+                assert(role?.code === '42704' && role.message === 'role "nobody" does not exist', `unknown role is ${role?.code}`);
+                const database = await failureOf(client.query("SELECT has_database_privilege('postgres','b8_nodb','CONNECT')"));
+                assert(database?.code === '3D000' && database.message === 'database "b8_nodb" does not exist', `unknown database is ${database?.code}`);
+                const privilege = await failureOf(client.query("SELECT has_database_privilege('postgres','postgres','NOPE')"));
+                assert(
+                    privilege?.code === '22023' && privilege.message === 'unrecognized privilege type: "NOPE"',
+                    `unknown privilege is ${privilege?.code}`,
+                );
+            });
+        });
+
         // Batch 5: COPY, cursors, SQL-level PREPARE and LISTEN/NOTIFY.
         const setupB5 = fs.readFileSync(path.join(harnessDir, 'fixtures', 'b5-setup.sql'), 'utf8');
         await withClient(batch5, async (client) => {
@@ -1592,13 +1718,14 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             await checkFixture('psql/b6-datacl', 'b6-datacl', 'b6-datacl.sql');
             await checkFixture('psql/b6-pg-database', 'b6-pg-database', 'b6-pg-database.sql');
             await checkFixture('psql/b7-database', 'b7-database', 'b7-database.sql', batch7);
+            await checkFixture('psql/b8-options', 'b8-options', 'b8-options.sql', batch8);
         }
 
         return {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 76,
+            floor: 82,
         };
     } finally {
         await trust.close();
@@ -1608,5 +1735,6 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batch4.close();
         await batch5.close();
         await batch7.close();
+        await batch8.close();
     }
 }

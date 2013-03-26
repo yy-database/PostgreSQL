@@ -8,7 +8,7 @@ import { loadNative, type ServerStore } from '../native.ts';
 import { ServerError } from './errors.ts';
 import { cloneDatabase, databasePrefix, purgeDatabase, scopedStorage, storageFor } from './store.ts';
 import { createSessionRuntime, Database, type SessionRuntime, type Storage } from './sql/database.ts';
-import { type ClusterDatabase, ClusterStore } from './sql/cluster.ts';
+import { type ClusterDatabase, ClusterStore, hasDatabasePrivilege } from './sql/cluster.ts';
 import { copyColumnCount, copyIn, copyOut } from './sql/copy.ts';
 import type {
     CopyStatement,
@@ -271,6 +271,14 @@ class Session {
         this.socket.destroy();
     }
 
+    /** Ends a session the way `DROP DATABASE ... WITH (FORCE)` does. */
+    terminate(): void {
+        this.closing = true;
+        this.hub.sessions.delete(this);
+        this.socket.write(errorResponse({ severity: 'FATAL', code: '57P01', message: 'terminating connection due to administrator command' }));
+        this.socket.end();
+    }
+
     private pump(): void {
         while (!this.closing) {
             if (this.startupPhase) {
@@ -343,6 +351,10 @@ class Session {
         }
         if (user !== this.user) {
             this.fail('28000', `role "${user}" does not exist`);
+            return;
+        }
+        if (!hasDatabasePrivilege(this.cluster.doc.databases, user, database, 'CONNECT')) {
+            this.fail('42501', `permission denied for database "${database}"`, 'User does not have CONNECT privilege.');
             return;
         }
 
@@ -788,6 +800,14 @@ class Session {
         const templateName = statement.template ?? 'template1';
         const template = this.cluster.find(templateName);
         if (!template) throw new ServerError('3D000', `database "${templateName}" does not exist`);
+        const users = this.otherSessionsOn(templateName);
+        if (users > 0) {
+            throw new ServerError(
+                '55006',
+                `source database "${templateName}" is being accessed by other users`,
+                users === 1 ? 'There is 1 other session using the database.' : `There are ${users} other sessions using the database.`,
+            );
+        }
 
         const database: ClusterDatabase = {
             oid: this.cluster.nextOid(),
@@ -796,8 +816,9 @@ class Session {
             encoding: template.encoding,
             datlocprovider: template.datlocprovider,
             datistemplate: false,
-            datallowconn: true,
-            datconnlimit: template.datconnlimit,
+            // `ALLOW_CONNECTIONS` and `CONNECTION LIMIT` are not inherited from the template.
+            datallowconn: statement.allowConnections ?? true,
+            datconnlimit: statement.connectionLimit ?? -1,
             datfrozenxid: template.datfrozenxid,
             datminmxid: template.datminmxid,
             dattablespace: template.dattablespace,
@@ -837,11 +858,9 @@ class Session {
         }
         if (target.datistemplate) throw new ServerError('42809', 'cannot drop a template database');
         if (name === this.database) throw new ServerError('55006', 'cannot drop the currently open database');
+        if (statement.force) this.terminateSessionsOn(name);
         const users = this.otherSessionsOn(name);
         if (users > 0) {
-            if (statement.force) {
-                throw new ServerError('0A000', 'feature not supported', 'DROP DATABASE ... WITH (FORCE) is not implemented');
-            }
             throw new ServerError(
                 '55006',
                 `database "${name}" is being accessed by other users`,
@@ -867,6 +886,13 @@ class Session {
             if (session !== this && session.usesDatabase(name)) count += 1;
         }
         return count;
+    }
+
+    /** Ends every other session on `name` for `DROP DATABASE ... WITH (FORCE)`. */
+    private terminateSessionsOn(name: string): void {
+        for (const session of [...this.hub.sessions]) {
+            if (session !== this && session.usesDatabase(name)) session.terminate();
+        }
     }
 
     private runPrepare(statement: PrepareStatement): ServerOutcome {
@@ -1140,8 +1166,8 @@ class Session {
         this.sendError(error);
     }
 
-    private fail(code: string, message: string): void {
-        this.socket.write(errorResponse({ severity: 'FATAL', code, message }));
+    private fail(code: string, message: string, detail?: string): void {
+        this.socket.write(errorResponse({ severity: 'FATAL', code, message, ...(detail ? { detail } : {}) }));
         this.closing = true;
         this.socket.end();
     }
