@@ -23,6 +23,8 @@ export async function runRust(repositoryRoot, env) {
         name: 'rust',
         output,
         counts: { executed, skipped, failed: failed + (result.status === 0 ? 0 : 1) },
+        // 58 before the client re-export. docs/pgsql-client-test-migration.md
+        // attributes all 25 removed tests to the upstream crates.
         floor: 35,
     };
 }
