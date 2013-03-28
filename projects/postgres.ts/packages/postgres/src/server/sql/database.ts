@@ -2,7 +2,7 @@
 
 import { ServerError } from '../errors.ts';
 import { type CatalogDoc, assertCatalog, emptyCatalog } from './catalog.ts';
-import { type ClusterRole, ClusterStore } from './cluster.ts';
+import { type ClusterDatabase, type ClusterRole, ClusterStore } from './cluster.ts';
 import type { SqlValue } from './types.ts';
 
 export interface StoredRow {
@@ -83,6 +83,8 @@ export class Database {
     readonly cluster: ClusterStore;
     /** This message's working copy of `pg_roles`, persisted on commit. */
     roles: ClusterRole[];
+    /** This message's working copy of `datacl`, keyed by database name. */
+    private databaseAcls = new Map<string, string | null>();
     private readonly storage: Storage;
     private readonly tables = new Map<number, Map<string, SqlValue[]>>();
     private readonly writes = new Map<number, Map<string, SqlValue[] | null>>();
@@ -96,11 +98,27 @@ export class Database {
         this.session = session;
         this.cluster = cluster;
         this.roles = structuredClone(cluster.doc.roles);
+        for (const row of cluster.doc.databases) this.databaseAcls.set(row.datname, row.datacl);
     }
 
-    /** Cluster-wide `pg_database` rows, shared with every session on the store. */
-    get databases() {
-        return this.cluster.doc.databases;
+    /** Cluster-wide `pg_database` rows, with this message's `datacl` changes layered on top. */
+    get databases(): ClusterDatabase[] {
+        return this.cluster.doc.databases.map((row) => {
+            const acl = this.databaseAcls.get(row.datname);
+            return acl === undefined || acl === row.datacl ? row : { ...row, datacl: acl };
+        });
+    }
+
+    /** `datacl` of one database as this message currently sees it. */
+    databaseAcl(name: string): string | null | undefined {
+        if (this.databaseAcls.has(name)) return this.databaseAcls.get(name);
+        return this.cluster.doc.databases.find((row) => row.datname === name)?.datacl;
+    }
+
+    /** Records a `datacl` change in the working copy so a rollback can drop it. */
+    setDatabaseAcl(name: string, text: string | null): void {
+        this.databaseAcls.set(name, text);
+        this.clusterDirty = true;
     }
 
     static open(storage: Storage, cluster: ClusterStore, session: SessionRuntime = createSessionRuntime()): Database {
@@ -120,6 +138,7 @@ export class Database {
     clone(): Database {
         const copy = new Database(this.storage, structuredClone(this.catalog), this.session, this.cluster);
         copy.roles = structuredClone(this.roles);
+        copy.databaseAcls = new Map(this.databaseAcls);
         for (const [relOid, rows] of this.tables) copy.tables.set(relOid, new Map(rows));
         for (const [relOid, rows] of this.writes) copy.writes.set(relOid, new Map(rows));
         copy.catalogDirty = this.catalogDirty;
@@ -173,11 +192,6 @@ export class Database {
         this.rolesDirty = true;
     }
 
-    /** Marks a `datacl` change carried by the shared cluster document. */
-    markClusterDirty(): void {
-        this.clusterDirty = true;
-    }
-
     private changesFor(relOid: number): Map<string, SqlValue[] | null> {
         const existing = this.writes.get(relOid);
         if (existing) return existing;
@@ -190,6 +204,7 @@ export class Database {
     restore(other: Database): void {
         this.catalog = other.catalog;
         this.roles = structuredClone(other.roles);
+        this.databaseAcls = new Map(other.databaseAcls);
         this.tables.clear();
         for (const [relOid, rows] of other.tables) this.tables.set(relOid, rows);
         this.writes.clear();
@@ -250,6 +265,12 @@ export class Database {
             });
         }
         if (this.rolesDirty) this.cluster.doc.roles = this.roles;
+        if (this.clusterDirty) {
+            for (const row of this.cluster.doc.databases) {
+                if (!this.databaseAcls.has(row.datname)) continue;
+                row.datacl = this.databaseAcls.get(row.datname) ?? null;
+            }
+        }
         if (this.rolesDirty || this.clusterDirty) changes.push(this.cluster.change());
         if (changes.length === 0) return;
         try {

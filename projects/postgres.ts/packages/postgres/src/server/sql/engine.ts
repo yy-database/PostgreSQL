@@ -2738,9 +2738,9 @@ function renameAclReferences(database: Database, oldName: string, newName: strin
         return formatAcl(entries);
     };
     for (const row of database.databases) {
-        if (row.datacl !== null && parseAcl(row.datacl).some((entry) => entry.grantor === oldName || entry.grantee === oldName)) {
-            row.datacl = rewrite(row.datacl) ?? null;
-            database.markClusterDirty();
+        const acl = database.databaseAcl(row.datname);
+        if (acl !== null && acl !== undefined && parseAcl(acl).some((entry) => entry.grantor === oldName || entry.grantee === oldName)) {
+            database.setDatabaseAcl(row.datname, rewrite(acl) ?? null);
         }
     }
     let catalogChanged = false;
@@ -2854,10 +2854,12 @@ function grantPrivileges(database: Database, statement: GrantStatement): Outcome
     if (letters.length === 0) throw new ServerError('42601', 'syntax error', `unrecognized privilege type: "${statement.privileges.join(', ')}"`);
     checkGrantees(database, statement.grantees);
     if (statement.objectType === 'database') {
-        const row = database.databases.find((candidate) => candidate.datname === statement.objectName)!;
-        const entries = row.datacl === null ? defaultAcl('database', grantor) : parseAcl(row.datacl);
-        row.datacl = formatAcl(grantAcl(entries, 'database', statement.grantees, letters, grantor, statement.grantOption));
-        database.markClusterDirty();
+        const acl = database.databaseAcl(statement.objectName);
+        const entries = acl === null || acl === undefined ? defaultAcl('database', grantor) : parseAcl(acl);
+        database.setDatabaseAcl(
+            statement.objectName,
+            formatAcl(grantAcl(entries, 'database', statement.grantees, letters, grantor, statement.grantOption)),
+        );
         return command('GRANT');
     }
     if (statement.objectType === 'schema') {
@@ -2889,11 +2891,13 @@ function revokePrivileges(database: Database, statement: RevokeStatement): Outco
         existing !== null && existing !== undefined
         || statement.grantees.some((grantee) => grantee === '' || grantee === grantor);
     if (statement.objectType === 'database') {
-        const row = database.databases.find((candidate) => candidate.datname === statement.objectName)!;
-        if (!touched(row.datacl)) return command('REVOKE');
-        const entries = row.datacl === null ? defaultAcl('database', grantor) : parseAcl(row.datacl);
-        row.datacl = formatAcl(revokeAcl(entries, 'database', statement.grantees, letters, statement.grantOptionOnly));
-        database.markClusterDirty();
+        const acl = database.databaseAcl(statement.objectName);
+        if (!touched(acl)) return command('REVOKE');
+        const entries = acl === null || acl === undefined ? defaultAcl('database', grantor) : parseAcl(acl);
+        database.setDatabaseAcl(
+            statement.objectName,
+            formatAcl(revokeAcl(entries, 'database', statement.grantees, letters, statement.grantOptionOnly)),
+        );
         return command('REVOKE');
     }
     if (statement.objectType === 'schema') {

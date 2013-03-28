@@ -1728,6 +1728,24 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         });
 
+        await check('roles/rollback', async () => {
+            await withClient(batch9, async (client) => {
+                await client.query('CREATE DATABASE b9_txn OWNER b9_alice');
+                const before = await client.query("SELECT datacl::text FROM pg_database WHERE datname = 'b9_txn'");
+                await client.query('BEGIN');
+                await client.query('GRANT CONNECT ON DATABASE b9_txn TO b9_bob');
+                const during = await client.query("SELECT datacl::text FROM pg_database WHERE datname = 'b9_txn'");
+                assert(
+                    during.rows[0].datacl === '{=Tc/b9_alice,b9_alice=CTc/b9_alice,b9_bob=c/b9_alice}',
+                    `in-transaction datacl is ${during.rows[0].datacl}`,
+                );
+                await client.query('ROLLBACK');
+                const after = await client.query("SELECT datacl::text FROM pg_database WHERE datname = 'b9_txn'");
+                assert(after.rows[0].datacl === before.rows[0].datacl, `rolled back datacl is ${after.rows[0].datacl}`);
+                await client.query('DROP DATABASE b9_txn');
+            });
+        });
+
         // Batch 5: COPY, cursors, SQL-level PREPARE and LISTEN/NOTIFY.
         const setupB5 = fs.readFileSync(path.join(harnessDir, 'fixtures', 'b5-setup.sql'), 'utf8');
         await withClient(batch5, async (client) => {
@@ -1948,7 +1966,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 89,
+            floor: 90,
         };
     } finally {
         await trust.close();
