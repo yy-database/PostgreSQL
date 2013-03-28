@@ -5,6 +5,7 @@ import {
     type CatalogDoc,
     type ColumnMeta,
     PUBLIC_NAMESPACE,
+    SYSTEM_NAMESPACES,
     catalogTables,
     formatTypeByOid,
     pgGetConstraintDef,
@@ -18,7 +19,17 @@ import {
     typeByOid,
 } from './catalog.ts';
 import type { Database } from './database.ts';
-import { hasDatabasePrivilege } from './cluster.ts';
+import { type ClusterRole, findRole, hasDatabasePrivilege, roleIsSuperuser } from './cluster.ts';
+import { defaultAcl, defaultNamespaceAcl, formatAcl, grantAcl, parseAcl, privilegeLetters, revokeAcl } from './acl.ts';
+import {
+    checkGrant,
+    checkGrantOnOid,
+    checkGrantOnTable,
+    checkTableOwner,
+    currentRole,
+    currentRoleOid,
+    namespaceOid,
+} from './privilege.ts';
 import {
     type ArrayExpr,
     type AnyExpr,
@@ -50,6 +61,11 @@ import {
     type SubqueryExpr,
     type Target,
     type AlterTableStatement,
+    type AlterRoleStatement,
+    type CreateRoleStatement,
+    type DropRoleStatement,
+    type GrantStatement,
+    type RevokeStatement,
     type UnaryExpr,
     type UpdateStatement,
     type WindowFrame,
@@ -79,7 +95,7 @@ export interface Field {
 
 export type Outcome =
     | { kind: 'rows'; fields: Field[]; rows: SqlValue[][]; tag: string }
-    | { kind: 'command'; tag: string };
+    | { kind: 'command'; tag: string; notices?: { code: string; message: string }[] };
 
 interface Binding {
     alias: string;
@@ -158,6 +174,16 @@ export function runStatement(database: Database, statement: Statement, params: S
             return dropIndex(database, statement);
         case 'alter-table':
             return alterTable(database, statement);
+        case 'create-role':
+            return createRole(database, statement);
+        case 'alter-role':
+            return alterRole(database, statement);
+        case 'drop-role':
+            return dropRole(database, statement);
+        case 'grant':
+            return grantPrivileges(database, statement);
+        case 'revoke':
+            return revokePrivileges(database, statement);
         case 'transaction':
             throw new ServerError('0A000', 'feature not supported', 'transaction control is handled by the session');
     }
@@ -1031,7 +1057,7 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
     }
     const system = ref.schema === 'pg_catalog' ? systemColumns(ref.name) : ref.schema === undefined ? systemColumns(ref.name) : undefined;
     if (system) {
-        const table = catalogTables(database.catalog, database.databases).get(ref.name);
+        const table = catalogTables(database.catalog, database.databases, database.roles).get(ref.name);
         return {
             columns: (table?.columns ?? system).map((column) => ({ alias, name: column.name, type: column.type })),
             rows: table?.rows ?? [],
@@ -1040,6 +1066,7 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
     if (ref.schema !== undefined && ref.schema !== 'public') throw new ServerError('3F000', `schema "${ref.schema}" does not exist`, undefined, ref.start);
     const relation = relationByName(database.catalog, ref.name);
     if (!relation) throw new ServerError('42P01', `relation "${ref.name}" does not exist`, undefined, ref.start);
+    checkGrantOnTable(database, relation, 'SELECT');
     const columns: ColumnMeta[] = database.catalog.columns
         .filter((column) => column.relid === relation.oid)
         .sort((left, right) => left.attnum - right.attnum)
@@ -1343,7 +1370,7 @@ function evaluateFunction(database: Database, expr: FunctionExpr, context: Conte
     const args = expr.args.map((argument) => evaluate(database, argument, context, params));
     switch (name) {
         case 'pg_get_userbyid':
-            return pgGetUserById(args[0] ?? null);
+            return pgGetUserById(args[0] ?? null, database.roles);
         case 'pg_table_is_visible':
             return pgTableIsVisible(args[0] ?? null, database.catalog);
         case 'pg_relation_is_publishable':
@@ -1396,8 +1423,8 @@ function evaluateFunction(database: Database, expr: FunctionExpr, context: Conte
             const text = (value: SqlValue | undefined) => formatValue(value ?? null, TEXT) ?? '';
             const [first, second, third] = args;
             return third === undefined
-                ? hasDatabasePrivilege(database.databases, 'postgres', text(first), text(second))
-                : hasDatabasePrivilege(database.databases, text(first), text(second), text(third));
+                ? hasDatabasePrivilege(database.databases, database.roles, database.session.user, text(first), text(second))
+                : hasDatabasePrivilege(database.databases, database.roles, text(first), text(second), text(third));
         }
         case 'pg_database_size':
             // Databases share one physical store, so the size is a fixed stand-in.
@@ -1728,7 +1755,7 @@ function allocateOid(catalog: CatalogDoc): number {
     return oid;
 }
 
-function addSequence(catalog: CatalogDoc, tableOid: number, name: string): number {
+function addSequence(catalog: CatalogDoc, tableOid: number, name: string, ownerOid: number): number {
     const oid = allocateOid(catalog);
     catalog.relations.push({
         oid,
@@ -1736,7 +1763,7 @@ function addSequence(catalog: CatalogDoc, tableOid: number, name: string): numbe
         namespace: PUBLIC_NAMESPACE,
         relkind: 'S',
         relam: 0,
-        owner: 10,
+        owner: ownerOid,
         relhasindex: false,
     });
     catalog.sequences.push({ oid, name, relid: tableOid, lastValue: 0 });
@@ -1783,7 +1810,7 @@ function addIndexRecord(database: Database, relid: number, attnums: number[], op
         namespace: PUBLIC_NAMESPACE,
         relkind: 'i',
         relam: BTREE_OID,
-        owner: 10,
+        owner: currentRoleOid(database),
         relhasindex: false,
     });
     catalog.indexes.push({
@@ -1901,6 +1928,8 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         if (statement.ifNotExists) return { kind: 'command', tag: 'CREATE TABLE' };
         throw new ServerError('42P07', `relation "${statement.table.name}" already exists`);
     }
+    checkGrant(database, { type: 'schema', name: 'public' }, 'CREATE');
+    const ownerOid = currentRoleOid(database);
 
     const names = new Set<string>();
     for (const column of statement.columns) {
@@ -1918,7 +1947,7 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         namespace: PUBLIC_NAMESPACE,
         relkind: 'r' as const,
         relam: 2,
-        owner: 10,
+        owner: ownerOid,
         relhasindex: false,
     };
 
@@ -1938,7 +1967,7 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         let sequenceOid: number | null = null;
         if (column.serial !== undefined) {
             const sequenceName = `${statement.table.name}_${column.name}_seq`.slice(0, 63);
-            sequenceOid = addSequence(catalog, tableOid, sequenceName);
+            sequenceOid = addSequence(catalog, tableOid, sequenceName, ownerOid);
             defaultText = `nextval('${sequenceName}'::regclass)`;
             defaultKind = 'sequence';
             column.notNull = true;
@@ -2068,6 +2097,7 @@ function createIndex(database: Database, statement: CreateIndexStatement): Outco
     }
     const relation = relationByName(catalog, statement.table.name);
     if (!relation || relation.relkind !== 'r') throw new ServerError('42P01', `relation "${statement.table.name}" does not exist`);
+    checkTableOwner(database, relation);
     if (statement.method.toLowerCase() !== 'btree') {
         throw new ServerError('0A000', 'feature not supported', `access method "${statement.method}" is not implemented`);
     }
@@ -2117,6 +2147,7 @@ function dropIndex(database: Database, statement: DropIndexStatement): Outcome {
         if (statement.ifExists) return { kind: 'command', tag: 'DROP INDEX' };
         throw new ServerError('42704', `index "${statement.name}" does not exist`);
     }
+    checkTableOwner(database, relation);
     catalog.relations = catalog.relations.filter((candidate) => candidate.oid !== relation.oid);
     catalog.indexes = catalog.indexes.filter((index) => index.oid !== relation.oid);
     catalog.constraints = catalog.constraints.filter((constraint) => constraint.indexOid !== relation.oid);
@@ -2128,7 +2159,15 @@ function alterTable(database: Database, statement: AlterTableStatement): Outcome
     const catalog = database.catalog;
     const relation = relationByName(catalog, statement.table.name);
     if (!relation || relation.relkind !== 'r') throw new ServerError('42P01', `relation "${statement.table.name}" does not exist`);
+    checkTableOwner(database, relation);
     const action = statement.action;
+    if (action.kind === 'owner') {
+        const role = findRole(database.roles, action.role);
+        if (!role) throw new ServerError('42704', `role "${action.role}" does not exist`);
+        relation.owner = role.oid;
+        database.markCatalogDirty();
+        return { kind: 'command', tag: 'ALTER TABLE' };
+    }
     if (action.kind === 'validate') {
         const constraint = catalog.constraints.find((candidate) => candidate.relid === relation.oid && candidate.name === action.name);
         if (!constraint) throw new ServerError('42704', `constraint "${action.name}" of relation "${relation.name}" does not exist`);
@@ -2162,6 +2201,7 @@ function dropTable(database: Database, statement: DropTableStatement): Outcome {
         throw new ServerError('42P01', `table "${statement.table.name}" does not exist`);
     }
     if (relation.relkind !== 'r') throw new ServerError('42P01', `table "${statement.table.name}" does not exist`);
+    checkTableOwner(database, relation);
     const referencing = catalog.relations.filter((candidate) => catalog.constraints.some((constraint) => constraint.confrelid === relation.oid && constraint.contype === 'f' && constraint.relid === candidate.oid));
     if (referencing.length > 0 && !statement.cascade) {
         throw new ServerError(
@@ -2350,6 +2390,7 @@ function enforceForeignKeys(database: Database, shape: TableShape, values: SqlVa
 
 function insertRows(database: Database, statement: InsertStatement, params: SqlValue[]): Outcome {
     const shape = tableShape(database, statement.table);
+    checkGrantOnOid(database, shape.oid, 'INSERT');
     const targetColumns = statement.columns
         ? statement.columns.map((columnName) => {
                 const column = shape.columns.find((candidate) => candidate.name === columnName);
@@ -2441,6 +2482,7 @@ function removeRow(database: Database, shape: TableShape, key: string, values: S
 
 function updateRows(database: Database, statement: UpdateStatement, params: SqlValue[]): Outcome {
     const shape = tableShape(database, statement.table);
+    checkGrantOnOid(database, shape.oid, 'UPDATE');
     for (const assignment of statement.assignments) {
         if (!shape.columns.some((column) => column.name === assignment.column)) {
             throw new ServerError('42703', `column "${assignment.column}" of relation "${shape.name}" does not exist`);
@@ -2520,6 +2562,7 @@ function propagateParentUpdates(
 
 function deleteRows(database: Database, statement: DeleteStatement, params: SqlValue[]): Outcome {
     const shape = tableShape(database, statement.table);
+    checkGrantOnOid(database, shape.oid, 'DELETE');
     const alias = statement.table.name;
     const columns: Binding[] = shape.columns.map((column) => ({ alias, name: column.name, type: column.type }));
     const rows = database.table(shape.oid);
@@ -2640,4 +2683,236 @@ function renderDefault(value: SqlValue, type: DataType): string {
     }
     const escaped = String(value).replace(/'/g, "''");
     return `'${escaped}'::${name}`;
+}
+
+// ---------------------------------------------------------------------------
+// Roles and privileges
+// ---------------------------------------------------------------------------
+
+function command(tag: string, notices?: { code: string; message: string }[]): Outcome {
+    return notices && notices.length > 0 ? { kind: 'command', tag, notices } : { kind: 'command', tag };
+}
+
+function roleOrThrow(database: Database, name: string): ClusterRole {
+    const role = findRole(database.roles, name);
+    if (!role) throw new ServerError('42704', `role "${name}" does not exist`);
+    return role;
+}
+
+function canCreateRoles(actor: ClusterRole): boolean {
+    return actor.rolsuper || actor.rolcreaterole;
+}
+
+function createRole(database: Database, statement: CreateRoleStatement): Outcome {
+    const actor = currentRole(database);
+    if (!canCreateRoles(actor)) throw new ServerError('42501', 'permission denied to create role');
+    if (statement.options.rolsuper && !actor.rolsuper) throw new ServerError('42501', 'must be superuser to create superusers');
+    if (statement.options.rolreplication && !actor.rolsuper) throw new ServerError('42501', 'must be superuser to create replication users');
+    if (findRole(database.roles, statement.name)) throw new ServerError('42710', `role "${statement.name}" already exists`);
+    const oid = Math.max(database.cluster.nextRoleOid(), ...database.roles.map((role) => role.oid + 1));
+    database.roles.push({
+        oid,
+        rolname: statement.name,
+        rolsuper: statement.options.rolsuper ?? false,
+        rolinherit: statement.options.rolinherit ?? true,
+        rolcreaterole: statement.options.rolcreaterole ?? false,
+        rolcreatedb: statement.options.rolcreatedb ?? false,
+        rolcanlogin: statement.options.rolcanlogin ?? false,
+        rolreplication: statement.options.rolreplication ?? false,
+        rolbypassrls: statement.options.rolbypassrls ?? false,
+        rolconnlimit: statement.options.rolconnlimit ?? -1,
+    });
+    database.markRolesDirty();
+    return command('CREATE ROLE');
+}
+
+/** Rewrites the role name inside every ACL literal that mentions it. */
+function renameAclReferences(database: Database, oldName: string, newName: string): void {
+    const rewrite = (text: string | null | undefined): string | null | undefined => {
+        if (text === null || text === undefined) return text;
+        const entries = parseAcl(text).map((entry) => ({
+            ...entry,
+            grantee: entry.grantee === oldName ? newName : entry.grantee,
+            grantor: entry.grantor === oldName ? newName : entry.grantor,
+        }));
+        return formatAcl(entries);
+    };
+    for (const row of database.databases) {
+        if (row.datacl !== null && parseAcl(row.datacl).some((entry) => entry.grantor === oldName || entry.grantee === oldName)) {
+            row.datacl = rewrite(row.datacl) ?? null;
+            database.markClusterDirty();
+        }
+    }
+    let catalogChanged = false;
+    for (const relation of database.catalog.relations) {
+        if (relation.relacl !== null && relation.relacl !== undefined
+            && parseAcl(relation.relacl).some((entry) => entry.grantor === oldName || entry.grantee === oldName)) {
+            relation.relacl = rewrite(relation.relacl) ?? null;
+            catalogChanged = true;
+        }
+    }
+    for (const [key, text] of Object.entries(database.catalog.namespaceAcls ?? {})) {
+        if (parseAcl(text).some((entry) => entry.grantor === oldName || entry.grantee === oldName)) {
+            database.catalog.namespaceAcls![key] = rewrite(text) ?? '{}';
+            catalogChanged = true;
+        }
+    }
+    if (catalogChanged) database.markCatalogDirty();
+}
+
+function alterRole(database: Database, statement: AlterRoleStatement): Outcome {
+    const actor = currentRole(database);
+    const target = roleOrThrow(database, statement.name);
+    if (!actor.rolsuper && (!actor.rolcreaterole || target.rolsuper)) {
+        throw new ServerError('42501', `permission denied`);
+    }
+    if (statement.options.rolsuper && !actor.rolsuper) throw new ServerError('42501', 'must be superuser to alter superusers');
+    if (statement.rename !== undefined) {
+        if (findRole(database.roles, statement.rename)) throw new ServerError('42710', `role "${statement.rename}" already exists`);
+        renameAclReferences(database, target.rolname, statement.rename);
+        target.rolname = statement.rename;
+    }
+    for (const [key, value] of Object.entries(statement.options) as [keyof ClusterRole, boolean | number][]) {
+        (target[key] as boolean | number) = value;
+    }
+    database.markRolesDirty();
+    return command('ALTER ROLE');
+}
+
+function dropRole(database: Database, statement: DropRoleStatement): Outcome {
+    const actor = currentRole(database);
+    if (!canCreateRoles(actor)) throw new ServerError('42501', 'permission denied');
+    const notices: { code: string; message: string }[] = [];
+    for (const name of statement.names) {
+        const target = findRole(database.roles, name);
+        if (!target) {
+            if (!statement.ifExists) throw new ServerError('42704', `role "${name}" does not exist`);
+            notices.push({ code: '00000', message: `role "${name}" does not exist, skipping` });
+            continue;
+        }
+        const dependency = database.databases.find((row) => row.datdba === target.oid);
+        if (dependency) {
+            throw new ServerError(
+                '2BP01',
+                `role "${name}" cannot be dropped because some objects depend on it`,
+                `owner of database ${dependency.datname}`,
+            );
+        }
+        const ownedRelation = database.catalog.relations.find((relation) => relation.owner === target.oid);
+        if (ownedRelation) {
+            throw new ServerError(
+                '2BP01',
+                `role "${name}" cannot be dropped because some objects depend on it`,
+                `owner of table ${ownedRelation.name}`,
+            );
+        }
+        database.roles = database.roles.filter((role) => role.oid !== target.oid);
+    }
+    database.markRolesDirty();
+    return command('DROP ROLE', notices);
+}
+
+/** Owner name recorded as grantor for `GRANT`/`REVOKE` on one object. */
+function objectOwnerName(database: Database, statement: GrantStatement | RevokeStatement): string {
+    if (statement.objectType === 'database') {
+        const row = database.databases.find((candidate) => candidate.datname === statement.objectName);
+        if (!row) throw new ServerError('3D000', `database "${statement.objectName}" does not exist`);
+        const name = pgGetUserById(row.datdba, database.roles);
+        return typeof name === 'string' ? name : 'postgres';
+    }
+    if (statement.objectType === 'schema') {
+        if (namespaceOid(statement.objectName) === undefined) throw new ServerError('3F000', `schema "${statement.objectName}" does not exist`);
+        return statement.objectName === 'public' ? 'pg_database_owner' : 'postgres';
+    }
+    const relation = relationByName(database.catalog, statement.objectName);
+    if (!relation) throw new ServerError('42P01', `relation "${statement.objectName}" does not exist`);
+    const name = pgGetUserById(relation.owner, database.roles);
+    return typeof name === 'string' ? name : 'postgres';
+}
+
+function authorizeGrant(database: Database, statement: GrantStatement | RevokeStatement, grantor: string): void {
+    const actor = currentRole(database);
+    if (actor.rolsuper || actor.rolname === grantor) return;
+    if (statement.objectType === 'schema' && statement.objectName === 'public') {
+        const row = database.databases.find((candidate) => candidate.datname === database.session.database);
+        if (row && pgGetUserById(row.datdba, database.roles) === actor.rolname) return;
+    }
+    throw new ServerError('42501', `permission denied for ${statement.objectType} ${statement.objectName}`);
+}
+
+function checkGrantees(database: Database, grantees: string[]): void {
+    for (const grantee of grantees) {
+        if (grantee === '') continue;
+        if (!findRole(database.roles, grantee)) throw new ServerError('42704', `role "${grantee}" does not exist`);
+    }
+}
+
+function grantPrivileges(database: Database, statement: GrantStatement): Outcome {
+    const grantor = objectOwnerName(database, statement);
+    authorizeGrant(database, statement, grantor);
+    const letters = privilegeLetters(statement.objectType, statement.privileges);
+    if (letters.length === 0) throw new ServerError('42601', 'syntax error', `unrecognized privilege type: "${statement.privileges.join(', ')}"`);
+    checkGrantees(database, statement.grantees);
+    if (statement.objectType === 'database') {
+        const row = database.databases.find((candidate) => candidate.datname === statement.objectName)!;
+        const entries = row.datacl === null ? defaultAcl('database', grantor) : parseAcl(row.datacl);
+        row.datacl = formatAcl(grantAcl(entries, 'database', statement.grantees, letters, grantor, statement.grantOption));
+        database.markClusterDirty();
+        return command('GRANT');
+    }
+    if (statement.objectType === 'schema') {
+        const namespace = SYSTEM_NAMESPACES.find((candidate) => candidate.name === statement.objectName)!;
+        const text = database.catalog.namespaceAcls?.[String(namespace.oid)] ?? defaultNamespaceAcl(namespace.name);
+        const entries = text === null ? [] : parseAcl(text);
+        database.catalog.namespaceAcls = { ...(database.catalog.namespaceAcls ?? {}) };
+        database.catalog.namespaceAcls[String(namespace.oid)] =
+            formatAcl(grantAcl(entries, 'schema', statement.grantees, letters, grantor, statement.grantOption));
+        database.markCatalogDirty();
+        return command('GRANT');
+    }
+    const relation = relationByName(database.catalog, statement.objectName)!;
+    const entries = relation.relacl === null || relation.relacl === undefined
+        ? defaultAcl('table', grantor)
+        : parseAcl(relation.relacl);
+    relation.relacl = formatAcl(grantAcl(entries, 'table', statement.grantees, letters, grantor, statement.grantOption));
+    database.markCatalogDirty();
+    return command('GRANT');
+}
+
+function revokePrivileges(database: Database, statement: RevokeStatement): Outcome {
+    const grantor = objectOwnerName(database, statement);
+    authorizeGrant(database, statement, grantor);
+    const letters = privilegeLetters(statement.objectType, statement.privileges);
+    if (letters.length === 0) throw new ServerError('42601', 'syntax error', `unrecognized privilege type: "${statement.privileges.join(', ')}"`);
+    checkGrantees(database, statement.grantees);
+    const touched = (existing: string | null | undefined): boolean =>
+        existing !== null && existing !== undefined
+        || statement.grantees.some((grantee) => grantee === '' || grantee === grantor);
+    if (statement.objectType === 'database') {
+        const row = database.databases.find((candidate) => candidate.datname === statement.objectName)!;
+        if (!touched(row.datacl)) return command('REVOKE');
+        const entries = row.datacl === null ? defaultAcl('database', grantor) : parseAcl(row.datacl);
+        row.datacl = formatAcl(revokeAcl(entries, 'database', statement.grantees, letters, statement.grantOptionOnly));
+        database.markClusterDirty();
+        return command('REVOKE');
+    }
+    if (statement.objectType === 'schema') {
+        const namespace = SYSTEM_NAMESPACES.find((candidate) => candidate.name === statement.objectName)!;
+        const text = database.catalog.namespaceAcls?.[String(namespace.oid)] ?? defaultNamespaceAcl(namespace.name);
+        if (!touched(text)) return command('REVOKE');
+        const entries = text === null ? [] : parseAcl(text);
+        database.catalog.namespaceAcls = { ...(database.catalog.namespaceAcls ?? {}) };
+        database.catalog.namespaceAcls[String(namespace.oid)] =
+            formatAcl(revokeAcl(entries, 'schema', statement.grantees, letters, statement.grantOptionOnly));
+        database.markCatalogDirty();
+        return command('REVOKE');
+    }
+    const relation = relationByName(database.catalog, statement.objectName)!;
+    if (!touched(relation.relacl)) return command('REVOKE');
+    const entries = relation.relacl === null || relation.relacl === undefined
+        ? defaultAcl('table', grantor)
+        : parseAcl(relation.relacl);
+    relation.relacl = formatAcl(revokeAcl(entries, 'table', statement.grantees, letters, statement.grantOptionOnly));
+    database.markCatalogDirty();
+    return command('REVOKE');
 }

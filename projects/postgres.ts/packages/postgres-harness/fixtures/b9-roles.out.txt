@@ -1,0 +1,72 @@
+CREATE ROLE
+CREATE ROLE
+CREATE DATABASE
+GRANT
+GRANT
+CREATE TABLE
+ALTER TABLE
+GRANT
+    datname    |                                              datacl                                              
+---------------+--------------------------------------------------------------------------------------------------
+ b9_fixture_db | {=Tc/b9_fixture_alice,b9_fixture_alice=CTc/b9_fixture_alice,b9_fixture_bob=CTc/b9_fixture_alice}
+(1 row)
+
+ nspname |                                              nspacl                                               
+---------+---------------------------------------------------------------------------------------------------
+ public  | {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner,b9_fixture_bob=UC/pg_database_owner}
+(1 row)
+
+   relname    |                                      relacl                                      
+--------------+----------------------------------------------------------------------------------
+ b9_fixture_t | {b9_fixture_alice=arwdDxt/b9_fixture_alice,b9_fixture_bob=arwd/b9_fixture_alice}
+(1 row)
+
+          List of roles
+    Role name     |  Attributes  
+------------------+--------------
+ b9_fixture_alice | 
+ b9_fixture_bob   | Cannot login
+
+      List of schemas
+  Name  |       Owner       
+--------+-------------------
+ public | pg_database_owner
+(1 row)
+
+                                            Access privileges
+ Schema |     Name     | Type  |             Access privileges             | Column privileges | Policies 
+--------+--------------+-------+-------------------------------------------+-------------------+----------
+ public | b9_fixture_t | table | b9_fixture_alice=arwdDxt/b9_fixture_alice+|                   | 
+        |              |       | b9_fixture_bob=arwd/b9_fixture_alice      |                   | 
+(1 row)
+
+                                                                List of databases
+     Name      |      Owner       | Encoding | Locale Provider | Collate | Ctype | ICU Locale | ICU Rules |           Access privileges           
+---------------+------------------+----------+-----------------+---------+-------+------------+-----------+---------------------------------------
+ b9_fixture_db | b9_fixture_alice | UTF8     | libc            | C       | C     |            |           | =Tc/b9_fixture_alice                 +
+               |                  |          |                 |         |       |            |           | b9_fixture_alice=CTc/b9_fixture_alice+
+               |                  |          |                 |         |       |            |           | b9_fixture_bob=CTc/b9_fixture_alice
+(1 row)
+
+REVOKE
+   relname    |                                     relacl                                      
+--------------+---------------------------------------------------------------------------------
+ b9_fixture_t | {b9_fixture_alice=arwdDxt/b9_fixture_alice,b9_fixture_bob=awd/b9_fixture_alice}
+(1 row)
+
+REVOKE
+    datname    |                                             datacl                                              
+---------------+-------------------------------------------------------------------------------------------------
+ b9_fixture_db | {=T/b9_fixture_alice,b9_fixture_alice=CTc/b9_fixture_alice,b9_fixture_bob=CTc/b9_fixture_alice}
+(1 row)
+
+REVOKE
+ nspname |                            nspacl                             
+---------+---------------------------------------------------------------
+ public  | {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}
+(1 row)
+
+DROP TABLE
+DROP DATABASE
+DROP ROLE
+DROP ROLE

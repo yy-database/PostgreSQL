@@ -2,7 +2,7 @@
 
 import { ServerError } from '../errors.ts';
 import { type CatalogDoc, assertCatalog, emptyCatalog } from './catalog.ts';
-import type { ClusterDatabase } from './cluster.ts';
+import { type ClusterRole, ClusterStore } from './cluster.ts';
 import type { SqlValue } from './types.ts';
 
 export interface StoredRow {
@@ -62,34 +62,48 @@ export function loadCatalog(storage: Storage): CatalogDoc {
  */
 /** Per-session state that outlives a single statement. */
 export interface SessionRuntime {
+    /** Role that opened this session, used by privilege checks. */
+    user: string;
+    /** Database this session is connected to, used by ownership checks. */
+    database: string;
     /** `lastval()` in this session, or `null` when no sequence was advanced. */
     lastValue: number | null;
     /** `currval()` per sequence oid in this session. */
     lastBySequence: Map<number, number>;
 }
 
-export function createSessionRuntime(): SessionRuntime {
-    return { lastValue: null, lastBySequence: new Map() };
+export function createSessionRuntime(user = 'postgres', database = 'postgres'): SessionRuntime {
+    return { user, database, lastValue: null, lastBySequence: new Map() };
 }
 
 export class Database {
     catalog: CatalogDoc;
     readonly session: SessionRuntime;
-    /** Cluster-wide `pg_database` rows, shared with every session on the store. */
-    readonly databases: ClusterDatabase[];
+    /** Cluster store shared with every session on the store. */
+    readonly cluster: ClusterStore;
+    /** This message's working copy of `pg_roles`, persisted on commit. */
+    roles: ClusterRole[];
     private readonly storage: Storage;
     private readonly tables = new Map<number, Map<string, SqlValue[]>>();
     private readonly writes = new Map<number, Map<string, SqlValue[] | null>>();
     private catalogDirty = false;
+    private rolesDirty = false;
+    private clusterDirty = false;
 
-    private constructor(storage: Storage, catalog: CatalogDoc, session: SessionRuntime, databases: ClusterDatabase[]) {
+    private constructor(storage: Storage, catalog: CatalogDoc, session: SessionRuntime, cluster: ClusterStore) {
         this.storage = storage;
         this.catalog = catalog;
         this.session = session;
-        this.databases = databases;
+        this.cluster = cluster;
+        this.roles = structuredClone(cluster.doc.roles);
     }
 
-    static open(storage: Storage, session: SessionRuntime = createSessionRuntime(), databases: ClusterDatabase[] = []): Database {
+    /** Cluster-wide `pg_database` rows, shared with every session on the store. */
+    get databases() {
+        return this.cluster.doc.databases;
+    }
+
+    static open(storage: Storage, cluster: ClusterStore, session: SessionRuntime = createSessionRuntime()): Database {
         const catalog = loadCatalog(storage);
         // `nextval` survives statement rollback and separate sessions, so the
         // journal below is authoritative whenever it is ahead of the catalog.
@@ -99,15 +113,18 @@ export class Database {
             const sequence = catalog.sequences.find((candidate) => candidate.oid === oid);
             if (sequence && Number.isFinite(value) && value > sequence.lastValue) sequence.lastValue = value;
         }
-        return new Database(storage, catalog, session, databases);
+        return new Database(storage, catalog, session, cluster);
     }
 
     /** Copies the working set for `SAVEPOINT`/`ROLLBACK TO`; shares row arrays. */
     clone(): Database {
-        const copy = new Database(this.storage, structuredClone(this.catalog), this.session, this.databases);
+        const copy = new Database(this.storage, structuredClone(this.catalog), this.session, this.cluster);
+        copy.roles = structuredClone(this.roles);
         for (const [relOid, rows] of this.tables) copy.tables.set(relOid, new Map(rows));
         for (const [relOid, rows] of this.writes) copy.writes.set(relOid, new Map(rows));
         copy.catalogDirty = this.catalogDirty;
+        copy.rolesDirty = this.rolesDirty;
+        copy.clusterDirty = this.clusterDirty;
         return copy;
     }
 
@@ -152,6 +169,15 @@ export class Database {
         this.catalogDirty = true;
     }
 
+    markRolesDirty(): void {
+        this.rolesDirty = true;
+    }
+
+    /** Marks a `datacl` change carried by the shared cluster document. */
+    markClusterDirty(): void {
+        this.clusterDirty = true;
+    }
+
     private changesFor(relOid: number): Map<string, SqlValue[] | null> {
         const existing = this.writes.get(relOid);
         if (existing) return existing;
@@ -163,11 +189,14 @@ export class Database {
     /** Replaces the working set with another snapshot, used by rollback. */
     restore(other: Database): void {
         this.catalog = other.catalog;
+        this.roles = structuredClone(other.roles);
         this.tables.clear();
         for (const [relOid, rows] of other.tables) this.tables.set(relOid, rows);
         this.writes.clear();
         for (const [relOid, rows] of other.writes) this.writes.set(relOid, rows);
         this.catalogDirty = other.catalogDirty;
+        this.rolesDirty = other.rolesDirty;
+        this.clusterDirty = other.clusterDirty;
         // Sequences are not transactional: a statement that fails still burns
         // the values it handed out, exactly like `nextval` in PostgreSQL.
         for (const sequence of this.catalog.sequences) {
@@ -220,6 +249,8 @@ export class Database {
                 value: encode(JSON.stringify(this.catalog)),
             });
         }
+        if (this.rolesDirty) this.cluster.doc.roles = this.roles;
+        if (this.rolesDirty || this.clusterDirty) changes.push(this.cluster.change());
         if (changes.length === 0) return;
         try {
             this.storage.commitChanges(changes);
@@ -228,5 +259,7 @@ export class Database {
         }
         this.writes.clear();
         this.catalogDirty = false;
+        this.rolesDirty = false;
+        this.clusterDirty = false;
     }
 }

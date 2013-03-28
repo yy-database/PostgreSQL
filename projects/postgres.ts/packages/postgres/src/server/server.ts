@@ -200,7 +200,7 @@ interface SqlPrepared {
  */
 class Session {
     private readonly socket: net.Socket;
-    private readonly user: string;
+    private user: string;
     private database: string;
     private readonly auth: ServerAuth;
     /** The unscoped store, used for cluster-level rows and per-database scoping. */
@@ -349,15 +349,27 @@ class Session {
             this.fail('55000', `database "${database}" is not currently accepting connections`);
             return;
         }
-        if (user !== this.user) {
+        const role = this.cluster.findRole(user);
+        if (!role) {
             this.fail('28000', `role "${user}" does not exist`);
             return;
         }
-        if (!hasDatabasePrivilege(this.cluster.doc.databases, user, database, 'CONNECT')) {
+        if (!role.rolcanlogin) {
+            this.fail('28000', `role "${user}" is not permitted to log in`);
+            return;
+        }
+        if (!hasDatabasePrivilege(this.cluster.doc.databases, this.cluster.doc.roles, user, database, 'CONNECT')) {
             this.fail('42501', `permission denied for database "${database}"`, 'User does not have CONNECT privilege.');
             return;
         }
+        if (!role.rolsuper && target.datconnlimit > 0 && this.otherSessionsOn(database) >= target.datconnlimit) {
+            this.fail('53300', `too many connections for database "${database}"`);
+            return;
+        }
 
+        this.user = user;
+        this.runtime.user = user;
+        this.runtime.database = database;
         this.database = database;
         this.storage = scopedStorage(this.baseStorage, databasePrefix(database));
         this.startupParameters = parameters;
@@ -374,6 +386,7 @@ class Session {
         const parameters = this.startupParameters;
         const user = parameters.get('user') ?? this.user;
         const applicationName = parameters.get('application_name') ?? '';
+        const role = this.cluster.findRole(user);
         this.startupPhase = false;
         this.awaitingPassword = false;
         this.state = {
@@ -387,7 +400,7 @@ class Session {
                 ['integer_datetimes', 'on'],
                 ['standard_conforming_strings', 'on'],
                 ['IntervalStyle', 'postgres'],
-                ['is_superuser', 'on'],
+                ['is_superuser', role?.rolsuper ? 'on' : 'off'],
                 ['session_authorization', user],
                 ['application_name', applicationName],
                 ['default_transaction_read_only', 'off'],
@@ -530,7 +543,7 @@ class Session {
                     outcomes.push(direct);
                     continue;
                 }
-                const database = this.transaction !== null ? this.transaction.database : (implicit ??= Database.open(this.storage, this.runtime, this.cluster.doc.databases));
+                const database = this.transaction !== null ? this.transaction.database : (implicit ??= Database.open(this.storage, this.cluster, this.runtime));
                 const before = database.clone();
                 let parsed: Statement | null = null;
                 try {
@@ -621,7 +634,7 @@ class Session {
                     this.warn('25001', 'there is already a transaction in progress');
                     return { kind: 'command', tag: 'BEGIN' };
                 }
-                this.transaction = { database: Database.open(this.storage, this.runtime, this.cluster.doc.databases), savepoints: [], aborted: false };
+                this.transaction = { database: Database.open(this.storage, this.cluster, this.runtime), savepoints: [], aborted: false };
                 return { kind: 'command', tag: 'BEGIN' };
             case 'commit':
                 if (this.transaction === null) {
@@ -808,11 +821,14 @@ class Session {
                 users === 1 ? 'There is 1 other session using the database.' : `There are ${users} other sessions using the database.`,
             );
         }
+        const owner = statement.owner ?? this.user;
+        const ownerRole = this.cluster.findRole(owner);
+        if (!ownerRole) throw new ServerError('42704', `role "${owner}" does not exist`);
 
         const database: ClusterDatabase = {
             oid: this.cluster.nextOid(),
             datname: name,
-            datdba: template.datdba,
+            datdba: ownerRole.oid,
             encoding: template.encoding,
             datlocprovider: template.datlocprovider,
             datistemplate: false,
@@ -986,7 +1002,7 @@ class Session {
                 throw error;
             }
         }
-        const database = Database.open(this.storage, this.runtime, this.cluster.doc.databases);
+        const database = Database.open(this.storage, this.cluster, this.runtime);
         const before = database.clone();
         try {
             const outcome = this.runParsed(state, database, parseStatement(trimmed), parameters);
@@ -1091,7 +1107,7 @@ class Session {
         const parsed = parseStatement(statement);
         if (parsed.kind !== 'select') return noData();
         const placeholders = Array.from({ length: parameterCount }, () => null);
-        const database = this.transaction?.database ?? Database.open(this.storage, this.runtime, this.cluster.doc.databases);
+        const database = this.transaction?.database ?? Database.open(this.storage, this.cluster, this.runtime);
         return rowDescription(wireFields(describeSelect(database, parsed, placeholders)));
     }
 
@@ -1137,6 +1153,9 @@ class Session {
             return;
         }
         if (outcome.kind === 'command') {
+            for (const notice of outcome.notices ?? []) {
+                this.socket.write(noticeResponse({ severity: 'NOTICE', code: notice.code, message: notice.message }));
+            }
             this.socket.write(commandComplete(outcome.tag));
             return;
         }

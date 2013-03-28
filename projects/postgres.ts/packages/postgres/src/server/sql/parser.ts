@@ -362,6 +362,7 @@ export interface CreateDatabaseStatement {
     kind: 'create-database';
     name: string;
     template: string | undefined;
+    owner: string | undefined;
     connectionLimit: number | undefined;
     allowConnections: boolean | undefined;
 }
@@ -374,10 +375,62 @@ export interface DropDatabaseStatement {
     force: boolean;
 }
 
+/** Attributes accepted by `CREATE ROLE` and `ALTER ROLE`. */
+export interface RoleOptions {
+    rolsuper?: boolean;
+    rolinherit?: boolean;
+    rolcreaterole?: boolean;
+    rolcreatedb?: boolean;
+    rolcanlogin?: boolean;
+    rolreplication?: boolean;
+    rolbypassrls?: boolean;
+    rolconnlimit?: number;
+}
+
+export interface CreateRoleStatement {
+    kind: 'create-role';
+    name: string;
+    options: RoleOptions;
+}
+
+export interface AlterRoleStatement {
+    kind: 'alter-role';
+    name: string;
+    options: RoleOptions;
+    rename: string | undefined;
+}
+
+export interface DropRoleStatement {
+    kind: 'drop-role';
+    names: string[];
+    ifExists: boolean;
+}
+
+export interface GrantStatement {
+    kind: 'grant';
+    objectType: 'database' | 'schema' | 'table';
+    objectName: string;
+    privileges: string[];
+    /** An empty grantee string is `PUBLIC`. */
+    grantees: string[];
+    grantOption: boolean;
+}
+
+export interface RevokeStatement {
+    kind: 'revoke';
+    objectType: 'database' | 'schema' | 'table';
+    objectName: string;
+    privileges: string[];
+    grantees: string[];
+    grantOptionOnly: boolean;
+    cascade: boolean;
+}
+
 export type AlterTableAction =
     | { kind: 'add-check'; name: string | undefined; expr: Expr; source: string; notValid: boolean }
     | { kind: 'add-foreign'; name: string | undefined; columns: string[]; reference: ReferenceClause }
-    | { kind: 'validate'; name: string };
+    | { kind: 'validate'; name: string }
+    | { kind: 'owner'; role: string };
 
 export interface AlterTableStatement {
     kind: 'alter-table';
@@ -473,6 +526,11 @@ export type Statement =
     | DropIndexStatement
     | CreateDatabaseStatement
     | DropDatabaseStatement
+    | CreateRoleStatement
+    | AlterRoleStatement
+    | DropRoleStatement
+    | GrantStatement
+    | RevokeStatement
     | AlterTableStatement
     | TransactionStatement
     | CopyStatement
@@ -804,6 +862,8 @@ class Parser {
         if (token.upper === 'CREATE') return this.parseCreate();
         if (token.upper === 'DROP') return this.parseDrop();
         if (token.upper === 'ALTER') return this.parseAlter();
+        if (token.upper === 'GRANT') return this.parseGrant();
+        if (token.upper === 'REVOKE') return this.parseRevoke();
         if (token.upper === 'BEGIN' || token.upper === 'START') return this.parseBegin();
         if (token.upper === 'COMMIT' || token.upper === 'END') return this.parseTransaction('commit');
         if (token.upper === 'ROLLBACK' || token.upper === 'ABORT') return this.parseRollback();
@@ -1940,6 +2000,7 @@ class Parser {
     private parseCreate(): Statement {
         this.expect('CREATE');
         if (this.at('DATABASE')) return this.parseCreateDatabase();
+        if (this.at('ROLE')) return this.parseCreateRole();
         if (this.at('UNIQUE') || this.at('INDEX')) return this.parseCreateIndex();
         this.expect('TABLE');
         const ifNotExists = this.at('IF') ? (this.next(), this.expect('NOT'), this.expect('EXISTS'), true) : false;
@@ -2005,6 +2066,7 @@ class Parser {
         const name = this.identifier();
         this.accept('WITH');
         let template: string | undefined;
+        let owner: string | undefined;
         let connectionLimit: number | undefined;
         let allowConnections: boolean | undefined;
         for (;;) {
@@ -2012,6 +2074,12 @@ class Parser {
                 this.next();
                 this.accept('=');
                 template = this.identifier();
+                continue;
+            }
+            if (this.at('OWNER')) {
+                this.next();
+                this.accept('=');
+                owner = this.identifier();
                 continue;
             }
             if (this.at('ALLOW_CONNECTIONS')) {
@@ -2029,7 +2097,7 @@ class Parser {
             }
             break;
         }
-        return { kind: 'create-database', name, template, connectionLimit, allowConnections };
+        return { kind: 'create-database', name, template, owner, connectionLimit, allowConnections };
     }
 
     /** Boolean option value, rejected with PostgreSQL's `defGetBoolean` wording. */
@@ -2203,8 +2271,14 @@ class Parser {
 
     private parseAlter(): Statement {
         this.expect('ALTER');
+        if (this.at('ROLE')) return this.parseAlterRole();
         this.expect('TABLE');
         const table = this.parseRelationRef();
+        if (this.at('OWNER')) {
+            this.next();
+            this.expect('TO');
+            return { kind: 'alter-table', table, action: { kind: 'owner', role: this.identifier() } };
+        }
         if (this.at('VALIDATE')) {
             this.next();
             this.expect('CONSTRAINT');
@@ -2283,6 +2357,7 @@ class Parser {
     private parseDrop(): Statement {
         this.expect('DROP');
         if (this.at('DATABASE')) return this.parseDropDatabase();
+        if (this.at('ROLE')) return this.parseDropRole();
         if (this.at('INDEX')) {
             this.next();
             const ifExists = this.at('IF') ? (this.next(), this.expect('EXISTS'), true) : false;
@@ -2314,6 +2389,206 @@ class Parser {
         }
         return { kind: 'drop-database', name, ifExists, force };
     }
+
+    private parseCreateRole(): CreateRoleStatement {
+        this.expect('ROLE');
+        const name = this.identifier();
+        return { kind: 'create-role', name, options: this.parseRoleOptions() };
+    }
+
+    private parseAlterRole(): AlterRoleStatement {
+        this.expect('ROLE');
+        const name = this.identifier();
+        if (this.at('RENAME')) {
+            this.next();
+            this.expect('TO');
+            return { kind: 'alter-role', name, options: {}, rename: this.identifier() };
+        }
+        return { kind: 'alter-role', name, options: this.parseRoleOptions(), rename: undefined };
+    }
+
+    private parseDropRole(): DropRoleStatement {
+        this.expect('ROLE');
+        const ifExists = this.at('IF') ? (this.next(), this.expect('EXISTS'), true) : false;
+        const names: string[] = [];
+        do {
+            names.push(this.identifier());
+        } while (this.accept(','));
+        return { kind: 'drop-role', names, ifExists };
+    }
+
+    /** Parses the attribute list shared by `CREATE ROLE` and `ALTER ROLE`. */
+    private parseRoleOptions(): RoleOptions {
+        const options: RoleOptions = {};
+        for (;;) {
+            if (this.accept('WITH')) continue;
+            if (this.at('SUPERUSER')) {
+                this.next();
+                options.rolsuper = true;
+                continue;
+            }
+            if (this.at('NOSUPERUSER')) {
+                this.next();
+                options.rolsuper = false;
+                continue;
+            }
+            if (this.at('LOGIN')) {
+                this.next();
+                options.rolcanlogin = true;
+                continue;
+            }
+            if (this.at('NOLOGIN')) {
+                this.next();
+                options.rolcanlogin = false;
+                continue;
+            }
+            if (this.at('INHERIT')) {
+                this.next();
+                options.rolinherit = true;
+                continue;
+            }
+            if (this.at('NOINHERIT')) {
+                this.next();
+                options.rolinherit = false;
+                continue;
+            }
+            if (this.at('CREATEDB')) {
+                this.next();
+                options.rolcreatedb = true;
+                continue;
+            }
+            if (this.at('NOCREATEDB')) {
+                this.next();
+                options.rolcreatedb = false;
+                continue;
+            }
+            if (this.at('CREATEROLE')) {
+                this.next();
+                options.rolcreaterole = true;
+                continue;
+            }
+            if (this.at('NOCREATEROLE')) {
+                this.next();
+                options.rolcreaterole = false;
+                continue;
+            }
+            if (this.at('REPLICATION')) {
+                this.next();
+                options.rolreplication = true;
+                continue;
+            }
+            if (this.at('NOREPLICATION')) {
+                this.next();
+                options.rolreplication = false;
+                continue;
+            }
+            if (this.at('BYPASSRLS')) {
+                this.next();
+                options.rolbypassrls = true;
+                continue;
+            }
+            if (this.at('NOBYPASSRLS')) {
+                this.next();
+                options.rolbypassrls = false;
+                continue;
+            }
+            if (this.at('CONNECTION')) {
+                this.next();
+                this.expect('LIMIT');
+                options.rolconnlimit = this.signedInteger();
+                continue;
+            }
+            // Passwords and validity dates are accepted but not stored; this
+            // server authenticates with a single configured password.
+            if (this.at('PASSWORD') || this.at('VALID')) {
+                this.next();
+                if (this.peek().upper === 'UNTIL') this.next();
+                this.next();
+                continue;
+            }
+            break;
+        }
+        return options;
+    }
+
+    private parseGrant(): GrantStatement {
+        this.expect('GRANT');
+        const privileges: string[] = [];
+        do {
+            privileges.push(this.identifier());
+        } while (this.accept(','));
+        this.expect('ON');
+        let objectType: 'database' | 'schema' | 'table' = 'table';
+        if (this.at('DATABASE')) {
+            this.next();
+            objectType = 'database';
+        }
+        else if (this.at('SCHEMA')) {
+            this.next();
+            objectType = 'schema';
+        }
+        else {
+            this.accept('TABLE');
+        }
+        const objectName = this.identifier();
+        this.expect('TO');
+        const grantees = this.parseGrantees();
+        let grantOption = false;
+        if (this.accept('WITH')) {
+            this.expect('GRANT');
+            this.expect('OPTION');
+            grantOption = true;
+        }
+        return { kind: 'grant', objectType, objectName, privileges, grantees, grantOption };
+    }
+
+    private parseRevoke(): RevokeStatement {
+        this.expect('REVOKE');
+        let grantOptionOnly = false;
+        if (this.at('GRANT')) {
+            this.next();
+            this.expect('OPTION');
+            this.expect('FOR');
+            grantOptionOnly = true;
+        }
+        const privileges: string[] = [];
+        do {
+            privileges.push(this.identifier());
+        } while (this.accept(','));
+        this.expect('ON');
+        let objectType: 'database' | 'schema' | 'table' = 'table';
+        if (this.at('DATABASE')) {
+            this.next();
+            objectType = 'database';
+        }
+        else if (this.at('SCHEMA')) {
+            this.next();
+            objectType = 'schema';
+        }
+        else {
+            this.accept('TABLE');
+        }
+        const objectName = this.identifier();
+        this.expect('FROM');
+        const grantees = this.parseGrantees();
+        const cascade = this.accept('CASCADE');
+        if (!cascade) this.accept('RESTRICT');
+        return { kind: 'revoke', objectType, objectName, privileges, grantees, grantOptionOnly, cascade };
+    }
+
+    private parseGrantees(): string[] {
+        const grantees: string[] = [];
+        do {
+            if (this.at('PUBLIC')) {
+                this.next();
+                grantees.push('');
+                continue;
+            }
+            grantees.push(this.identifier());
+        } while (this.accept(','));
+        return grantees;
+    }
+
 
     private parseRelationRef(): RelationRef {
         const startToken = this.peek();

@@ -1,7 +1,8 @@
 /** The single catalog document and its pure `pg_catalog` projections. */
 
 import { ServerError } from '../errors.ts';
-import type { ClusterDatabase } from './cluster.ts';
+import type { ClusterDatabase, ClusterRole } from './cluster.ts';
+import { defaultNamespaceAcl } from './acl.ts';
 import { type DataType, type SqlValue, formatType, typeOf } from './types.ts';
 
 export const CATALOG_VERSION = 2;
@@ -29,6 +30,8 @@ export interface UserRelation {
     relam: number;
     owner: number;
     relhasindex: boolean;
+    /** `relacl` kept as the text-array literal; `null` means the implicit owner-only ACL. */
+    relacl?: string | null;
 }
 
 export interface UserColumn {
@@ -97,6 +100,8 @@ export interface CatalogDoc {
     indexes: UserIndex[];
     constraints: UserConstraint[];
     sequences: UserSequence[];
+    /** `nspacl` literals keyed by namespace oid; a missing key means the seeded default. */
+    namespaceAcls?: Record<string, string>;
 }
 
 export function emptyCatalog(): CatalogDoc {
@@ -109,6 +114,7 @@ export function emptyCatalog(): CatalogDoc {
         indexes: [],
         constraints: [],
         sequences: [],
+        namespaceAcls: {},
     };
 }
 
@@ -594,7 +600,7 @@ export function relationDisplayName(doc: CatalogDoc, oidValue: number): string |
 }
 
 /** Projects the whole `pg_catalog` surface from the single catalog document. */
-export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[]): Map<string, TableData> {
+export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[], roles: ClusterRole[]): Map<string, TableData> {
     const tables = new Map<string, TableData>();
     const push = (relation: string, row: Record<string, SqlValue>): void => {
         const columns = SYSTEM_BY_NAME.get(relation)?.columns;
@@ -613,6 +619,7 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[]): Ma
             oid: namespace.oid,
             nspname: namespace.name,
             nspowner: namespace.name === 'public' ? PG_DATABASE_OWNER_ROLE : POSTGRES_ROLE,
+            nspacl: doc.namespaceAcls?.[String(namespace.oid)] ?? defaultNamespaceAcl(namespace.name),
         });
     }
 
@@ -668,6 +675,7 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[]): Ma
             relowner: relation.owner,
             relam: relation.relam,
             relfilenode: relation.oid,
+            relacl: relation.relacl ?? null,
             reltablespace: 0,
             relpages: 0,
             reltuples: 0,
@@ -866,31 +874,23 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[]): Ma
         });
     });
 
-    push('pg_roles', {
-        oid: POSTGRES_ROLE,
-        rolname: 'postgres',
-        rolsuper: true,
-        rolinherit: true,
-        rolcreaterole: true,
-        rolcreatedb: true,
-        rolcanlogin: true,
-        rolreplication: true,
-        rolbypassrls: true,
-        rolconnlimit: -1,
-    });
-
-    push('pg_roles', {
-        oid: PG_DATABASE_OWNER_ROLE,
-        rolname: 'pg_database_owner',
-        rolsuper: false,
-        rolinherit: true,
-        rolcreaterole: false,
-        rolcreatedb: false,
-        rolcanlogin: false,
-        rolreplication: false,
-        rolbypassrls: false,
-        rolconnlimit: -1,
-    });
+    for (const role of roles) {
+        push('pg_roles', {
+            oid: role.oid,
+            rolname: role.rolname,
+            rolsuper: role.rolsuper,
+            rolinherit: role.rolinherit,
+            rolcreaterole: role.rolcreaterole,
+            rolcreatedb: role.rolcreatedb,
+            rolcanlogin: role.rolcanlogin,
+            rolreplication: role.rolreplication,
+            rolbypassrls: role.rolbypassrls,
+            rolconnlimit: role.rolconnlimit,
+            rolpassword: null,
+            rolvaliduntil: null,
+            rolconfig: null,
+        });
+    }
 
     for (const database of databases) {
         push('pg_database', {
@@ -921,9 +921,12 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[]): Ma
 }
 
 /** `pg_get_userbyid`. */
-export function pgGetUserById(oidValue: SqlValue): SqlValue {
+export function pgGetUserById(oidValue: SqlValue, roles: ClusterRole[] = []): SqlValue {
     if (oidValue === POSTGRES_ROLE) return 'postgres';
     if (oidValue === PG_DATABASE_OWNER_ROLE) return 'pg_database_owner';
+    for (const role of roles) {
+        if (role.oid === oidValue) return role.rolname;
+    }
     return null;
 }
 

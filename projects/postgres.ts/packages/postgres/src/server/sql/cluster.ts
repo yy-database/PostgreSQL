@@ -1,12 +1,57 @@
 /** Cluster-wide database directory shared by every session on one data directory. */
 
 import { ServerError } from '../errors.ts';
-import { FIRST_USER_OID, POSTGRES_ROLE, pgGetUserById } from './catalog.ts';
+import { FIRST_USER_OID, POSTGRES_ROLE, PG_DATABASE_OWNER_ROLE, pgGetUserById } from './catalog.ts';
+import { type AclEntry, aclGrants, defaultAcl, parseAcl, privilegeLetter } from './acl.ts';
 import type { Storage, StoredChange } from './database.ts';
 
 export const CLUSTER_NAMESPACE = 'pg_cluster';
 export const CLUSTER_KEY = 'databases';
-export const CLUSTER_VERSION = 1;
+export const CLUSTER_VERSION = 2;
+
+/** One `pg_roles` row, cluster-wide because roles are shared by every database. */
+export interface ClusterRole {
+    oid: number;
+    rolname: string;
+    rolsuper: boolean;
+    rolinherit: boolean;
+    rolcreaterole: boolean;
+    rolcreatedb: boolean;
+    rolcanlogin: boolean;
+    rolreplication: boolean;
+    rolbypassrls: boolean;
+    rolconnlimit: number;
+}
+
+/** The two roles `initdb` seeds; both exist before any user role is created. */
+export function seedRoles(): ClusterRole[] {
+    return [
+        {
+            oid: POSTGRES_ROLE,
+            rolname: 'postgres',
+            rolsuper: true,
+            rolinherit: true,
+            rolcreaterole: true,
+            rolcreatedb: true,
+            rolcanlogin: true,
+            rolreplication: true,
+            rolbypassrls: true,
+            rolconnlimit: -1,
+        },
+        {
+            oid: PG_DATABASE_OWNER_ROLE,
+            rolname: 'pg_database_owner',
+            rolsuper: false,
+            rolinherit: true,
+            rolcreaterole: false,
+            rolcreatedb: false,
+            rolcanlogin: false,
+            rolreplication: false,
+            rolbypassrls: false,
+            rolconnlimit: -1,
+        },
+    ];
+}
 
 /** One `pg_database` row, stored in the cluster directory rather than per database. */
 export interface ClusterDatabase {
@@ -35,6 +80,9 @@ export interface ClusterDoc {
     /** Next oid handed to a database created at runtime. */
     nextOid: number;
     databases: ClusterDatabase[];
+    /** Next oid handed to a role created at runtime. */
+    nextRoleOid: number;
+    roles: ClusterRole[];
 }
 
 const TEMPLATE_ACL = '{=c/postgres,postgres=CTc/postgres}';
@@ -44,6 +92,8 @@ export function seedCluster(): ClusterDoc {
     return {
         version: CLUSTER_VERSION,
         nextOid: FIRST_USER_OID,
+        nextRoleOid: FIRST_USER_OID,
+        roles: seedRoles(),
         databases: [
             {
                 oid: 5,
@@ -128,6 +178,14 @@ function assertCluster(value: unknown): ClusterDoc {
             throw new Error('cluster directory has an invalid database entry');
         }
     }
+    // Directories written before roles existed keep working: seed the two built-in
+    // roles instead of rejecting the data directory.
+    if (!Array.isArray(doc.roles) || (doc.roles as Partial<ClusterRole>[]).some((role) => typeof role.rolname !== 'string')) {
+        (doc as ClusterDoc).roles = seedRoles();
+    }
+    if (typeof doc.nextRoleOid !== 'number') {
+        (doc as ClusterDoc).nextRoleOid = Math.max(FIRST_USER_OID, ...(doc.roles as ClusterRole[]).map((role) => role.oid + 1));
+    }
     return doc as ClusterDoc;
 }
 
@@ -145,7 +203,10 @@ export class ClusterStore {
         this.storage = storage;
         const stored = storage.scan(CLUSTER_NAMESPACE).find((row) => decode(row.key) === CLUSTER_KEY);
         if (stored) {
-            this.doc = assertCluster(JSON.parse(decode(stored.value)) as unknown);
+            const raw = JSON.parse(decode(stored.value)) as Partial<ClusterDoc>;
+            const needsRoles = !Array.isArray(raw.roles) || typeof raw.nextRoleOid !== 'number';
+            this.doc = assertCluster(raw);
+            if (needsRoles) this.storage.commitChanges([this.change()]);
             return;
         }
         this.doc = seedCluster();
@@ -175,6 +236,28 @@ export class ClusterStore {
         return removed;
     }
 
+    findRole(name: string): ClusterRole | undefined {
+        return this.doc.roles.find((role) => role.rolname === name);
+    }
+
+    /** Oid for the next created role, without advancing the counter. */
+    nextRoleOid(): number {
+        return this.doc.nextRoleOid;
+    }
+
+    appendRole(role: ClusterRole): ClusterRole {
+        this.doc.roles.push(role);
+        this.doc.nextRoleOid = Math.max(this.doc.nextRoleOid, role.oid + 1);
+        return role;
+    }
+
+    removeRole(name: string): ClusterRole | undefined {
+        const index = this.doc.roles.findIndex((role) => role.rolname === name);
+        if (index < 0) return undefined;
+        const [removed] = this.doc.roles.splice(index, 1);
+        return removed;
+    }
+
     /** The single cluster-document row, staged into a statement's commit batch. */
     change(): StoredChange {
         return {
@@ -186,74 +269,21 @@ export class ClusterStore {
     }
 }
 
-/** Database privilege letters PostgreSQL stores in `datacl`. */
-const DATABASE_PRIVILEGES: Record<string, string> = {
-    connect: 'c',
-    create: 'C',
-    temp: 'T',
-    temporary: 'T',
-};
-
-/** PostgreSQL's implicit database ACL: PUBLIC gets TEMP and CONNECT, the owner gets all three. */
-const DEFAULT_PUBLIC_PRIVILEGES = 'Tc';
-const DEFAULT_OWNER_PRIVILEGES = 'CTc';
-
-/** Roles known to the catalogue. `pg_database_owner` is built in and cannot log in. */
-const KNOWN_ROLES = new Set(['postgres', 'pg_database_owner']);
-
-/** One `datacl` element, `grantee=privileges/grantor`; an empty grantee is PUBLIC. */
-interface AclEntry {
-    grantee: string;
-    privileges: string;
+/** Finds one role row by name. */
+export function findRole(roles: ClusterRole[], name: string): ClusterRole | undefined {
+    return roles.find((role) => role.rolname === name);
 }
 
-function parseAclEntry(text: string): AclEntry {
-    const equals = text.indexOf('=');
-    const slash = text.lastIndexOf('/');
-    if (equals < 0 || slash <= equals) return { grantee: text, privileges: '' };
-    return { grantee: text.slice(0, equals), privileges: text.slice(equals + 1, slash) };
-}
-
-/** Splits a `datacl` text-array literal into entries, unquoting role names. */
-function aclEntries(datacl: string): AclEntry[] {
-    const body = datacl.trim().replace(/^\{/, '').replace(/\}$/, '');
-    if (body.length === 0) return [];
-    const entries: AclEntry[] = [];
-    let current = '';
-    let quoted = false;
-    for (let index = 0; index < body.length; index += 1) {
-        const character = body[index]!;
-        if (quoted) {
-            if (character === '\\') {
-                current += body[index + 1] ?? '';
-                index += 1;
-            } else if (character === '"') quoted = false;
-            else current += character;
-            continue;
-        }
-        if (character === '"') {
-            quoted = true;
-            continue;
-        }
-        if (character === ',') {
-            entries.push(parseAclEntry(current));
-            current = '';
-            continue;
-        }
-        current += character;
-    }
-    entries.push(parseAclEntry(current));
-    return entries;
+/** `true` when the role exists and carries `SUPERUSER`. */
+export function roleIsSuperuser(roles: ClusterRole[], name: string): boolean {
+    return findRole(roles, name)?.rolsuper === true;
 }
 
 /** The ACL entries that apply to one database, materialising the default when `datacl` is null. */
-function databaseAcl(database: ClusterDatabase): AclEntry[] {
-    if (database.datacl !== null) return aclEntries(database.datacl);
-    const owner = pgGetUserById(database.datdba);
-    return [
-        { grantee: '', privileges: DEFAULT_PUBLIC_PRIVILEGES },
-        ...(typeof owner === 'string' ? [{ grantee: owner, privileges: DEFAULT_OWNER_PRIVILEGES }] : []),
-    ];
+function databaseAcl(database: ClusterDatabase, roles: ClusterRole[]): AclEntry[] {
+    if (database.datacl !== null) return parseAcl(database.datacl);
+    const owner = pgGetUserById(database.datdba, roles);
+    return typeof owner === 'string' ? defaultAcl('database', owner) : [];
 }
 
 /**
@@ -263,18 +293,21 @@ function databaseAcl(database: ClusterDatabase): AclEntry[] {
  * PostgreSQL. Other roles are resolved through `datacl`, falling back to the
  * default database ACL when the column is null.
  */
-export function hasDatabasePrivilege(databases: ClusterDatabase[], user: string, databaseName: string, privilege: string): boolean {
-    const letter = DATABASE_PRIVILEGES[privilege.toLowerCase()];
+export function hasDatabasePrivilege(
+    databases: ClusterDatabase[],
+    roles: ClusterRole[],
+    user: string,
+    databaseName: string,
+    privilege: string,
+): boolean {
+    const letter = privilegeLetter('database', privilege);
     if (letter === undefined) throw new ServerError('22023', `unrecognized privilege type: "${privilege}"`);
-    if (!KNOWN_ROLES.has(user)) throw new ServerError('42704', `role "${user}" does not exist`);
+    const role = findRole(roles, user);
+    if (!role) throw new ServerError('42704', `role "${user}" does not exist`);
     const database = databases.find((row) => row.datname === databaseName);
     if (!database) throw new ServerError('3D000', `database "${databaseName}" does not exist`);
-    if (user === 'postgres') return true;
-    const owner = pgGetUserById(database.datdba);
+    if (role.rolsuper) return true;
+    const owner = pgGetUserById(database.datdba, roles);
     if (typeof owner === 'string' && owner === user) return true;
-    for (const entry of databaseAcl(database)) {
-        if (entry.grantee !== '' && entry.grantee !== user) continue;
-        if (entry.privileges.includes(letter)) return true;
-    }
-    return false;
+    return aclGrants(databaseAcl(database, roles), user, letter);
 }

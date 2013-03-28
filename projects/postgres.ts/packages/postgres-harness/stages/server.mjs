@@ -228,6 +228,8 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batch5 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch5-')) });
     const batch7 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch7-')) });
     const batch8 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch8-')) });
+    const batch9 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch9-')) });
+    const batch9fixture = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch9-fixture-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -1506,6 +1508,226 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         });
 
+        const connectAs = async (server, user, database) => {
+            const client = new pg.Client({ host: server.host, port: server.port, user, database });
+            await client.connect();
+            return client;
+        };
+
+        await check('roles/ddl', async () => {
+            await withClient(batch9, async (client) => {
+                const created = await client.query('CREATE ROLE b9_alice LOGIN');
+                assert(created.command === 'CREATE', `create role tag is ${created.command}`);
+                const bob = await client.query('CREATE ROLE b9_bob NOLOGIN CONNECTION LIMIT 3');
+                assert(bob.command === 'CREATE', `create bob tag is ${bob.command}`);
+                const duplicate = await failureOf(client.query('CREATE ROLE b9_alice'));
+                assert(
+                    duplicate?.code === '42710' && duplicate.message === 'role "b9_alice" already exists',
+                    `duplicate role is ${duplicate?.code}/${duplicate?.message}`,
+                );
+                const missing = await failureOf(client.query('ALTER ROLE b9_nope NOLOGIN'));
+                assert(missing?.code === '42704' && missing.message === 'role "b9_nope" does not exist', `missing role is ${missing?.code}`);
+                const noticePromise = new Promise((resolve) => client.once('notice', resolve));
+                const skipped = await client.query('DROP ROLE IF EXISTS b9_nope');
+                assert(skipped.command === 'DROP', `drop role if exists tag is ${skipped.command}`);
+                const notice = await noticePromise;
+                assert(
+                    notice.code === '00000' && notice.message === 'role "b9_nope" does not exist, skipping',
+                    `drop role notice is ${notice.code}/${notice.message}`,
+                );
+                await client.query('ALTER ROLE b9_bob LOGIN CONNECTION LIMIT 5');
+                await client.query('CREATE ROLE b9_root SUPERUSER LOGIN');
+                const rows = await client.query(
+                    'SELECT rolname, rolsuper, rolcanlogin, rolconnlimit FROM pg_roles ORDER BY rolname',
+                );
+                const createdRoles = rows.rows.filter((row) => row.rolname.startsWith('b9_'));
+                assert(
+                    JSON.stringify(createdRoles) ===
+                        '[{"rolname":"b9_alice","rolsuper":false,"rolcanlogin":true,"rolconnlimit":-1},' +
+                            '{"rolname":"b9_bob","rolsuper":false,"rolcanlogin":true,"rolconnlimit":5},' +
+                            '{"rolname":"b9_root","rolsuper":true,"rolcanlogin":true,"rolconnlimit":-1}]',
+                    `pg_roles rows are ${JSON.stringify(createdRoles)}`,
+                );
+                await client.query('DROP ROLE b9_root');
+            });
+        });
+
+        await check('roles/startup', async () => {
+            await withClient(batch9, async (client) => {
+                await client.query('CREATE ROLE b9_nologin NOLOGIN');
+                const denied = await failureOf(connectAs(batch9, 'b9_nologin', 'postgres'));
+                assert(
+                    denied?.code === '28000' && denied.message === 'role "b9_nologin" is not permitted to log in',
+                    `nologin startup is ${denied?.code}/${denied?.message}`,
+                );
+                const unknown = await failureOf(connectAs(batch9, 'b9_nobody', 'postgres'));
+                assert(
+                    unknown?.code === '28000' && unknown.message === 'role "b9_nobody" does not exist',
+                    `unknown role startup is ${unknown?.code}/${unknown?.message}`,
+                );
+                const alice = await connectAs(batch9, 'b9_alice', 'postgres');
+                try {
+                    const isSuper = await alice.query('SHOW is_superuser');
+                    assert(isSuper.rows[0].is_superuser === 'off', `alice is_superuser is ${isSuper.rows[0].is_superuser}`);
+                    const forbidden = await failureOf(alice.query('CREATE ROLE b9_forbidden'));
+                    assert(
+                        forbidden?.code === '42501' && forbidden.message === 'permission denied to create role',
+                        `alice create role is ${forbidden?.code}/${forbidden?.message}`,
+                    );
+                } finally {
+                    await alice.end();
+                }
+                const admin = await connectAs(batch9, 'postgres', 'postgres');
+                try {
+                    const isSuper = await admin.query('SHOW is_superuser');
+                    assert(isSuper.rows[0].is_superuser === 'on', `postgres is_superuser is ${isSuper.rows[0].is_superuser}`);
+                } finally {
+                    await admin.end();
+                }
+            });
+        });
+
+        await check('roles/acl-catalog', async () => {
+            await withClient(batch9, async (client) => {
+                await client.query('CREATE DATABASE b9_acl OWNER b9_alice');
+                await client.query('GRANT CONNECT, CREATE, TEMP ON DATABASE b9_acl TO b9_bob');
+                const datacl = await client.query("SELECT datacl::text FROM pg_database WHERE datname = 'b9_acl'");
+                assert(
+                    datacl.rows[0].datacl === '{=Tc/b9_alice,b9_alice=CTc/b9_alice,b9_bob=CTc/b9_alice}',
+                    `datacl is ${datacl.rows[0].datacl}`,
+                );
+                await client.query('GRANT USAGE, CREATE ON SCHEMA public TO b9_bob');
+                const nspacl = await client.query("SELECT nspacl::text FROM pg_namespace WHERE nspname = 'public'");
+                assert(
+                    nspacl.rows[0].nspacl === '{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner,b9_bob=UC/pg_database_owner}',
+                    `nspacl is ${nspacl.rows[0].nspacl}`,
+                );
+                await client.query('CREATE TABLE b9_acl_t (id int, note text)');
+                await client.query('ALTER TABLE b9_acl_t OWNER TO b9_alice');
+                await client.query('GRANT SELECT, INSERT, UPDATE, DELETE ON b9_acl_t TO b9_bob');
+                const relacl = await client.query("SELECT relacl::text FROM pg_class WHERE relname = 'b9_acl_t'");
+                assert(
+                    relacl.rows[0].relacl === '{b9_alice=arwdDxt/b9_alice,b9_bob=arwd/b9_alice}',
+                    `relacl is ${relacl.rows[0].relacl}`,
+                );
+                await client.query('REVOKE SELECT ON b9_acl_t FROM b9_bob');
+                const revoked = await client.query("SELECT relacl::text FROM pg_class WHERE relname = 'b9_acl_t'");
+                assert(
+                    revoked.rows[0].relacl === '{b9_alice=arwdDxt/b9_alice,b9_bob=awd/b9_alice}',
+                    `revoked relacl is ${revoked.rows[0].relacl}`,
+                );
+                await client.query('REVOKE CONNECT ON DATABASE b9_acl FROM PUBLIC');
+                const noConnect = await client.query("SELECT datacl::text FROM pg_database WHERE datname = 'b9_acl'");
+                assert(
+                    noConnect.rows[0].datacl === '{=T/b9_alice,b9_alice=CTc/b9_alice,b9_bob=CTc/b9_alice}',
+                    `revoked datacl is ${noConnect.rows[0].datacl}`,
+                );
+                await client.query('REVOKE ALL ON SCHEMA public FROM b9_bob');
+                const reset = await client.query("SELECT nspacl::text FROM pg_namespace WHERE nspname = 'public'");
+                assert(
+                    reset.rows[0].nspacl === '{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}',
+                    `reset nspacl is ${reset.rows[0].nspacl}`,
+                );
+                await client.query('DROP TABLE b9_acl_t');
+                await client.query('DROP DATABASE b9_acl');
+            });
+        });
+
+        await check('roles/connect-revoked', async () => {
+            await withClient(batch9, async (client) => {
+                await client.query('CREATE DATABASE b9_rev');
+                await client.query('REVOKE CONNECT ON DATABASE b9_rev FROM PUBLIC');
+                const privileges = await client.query(
+                    "SELECT has_database_privilege('postgres','b9_rev','CONNECT') AS owner_connect, " +
+                        "has_database_privilege('b9_alice','b9_rev','CONNECT') AS public_connect",
+                );
+                assert(
+                    JSON.stringify(privileges.rows[0]) === '{"owner_connect":true,"public_connect":false}',
+                    `revoked privileges are ${JSON.stringify(privileges.rows[0])}`,
+                );
+                const denied = await failureOf(connectAs(batch9, 'b9_alice', 'b9_rev'));
+                assert(
+                    denied?.code === '42501' &&
+                        denied.message === 'permission denied for database "b9_rev"' &&
+                        denied.detail === 'User does not have CONNECT privilege.',
+                    `revoked connect is ${denied?.code}/${denied?.message}/${denied?.detail}`,
+                );
+                await client.query('DROP DATABASE b9_rev');
+            });
+        });
+
+        await check('roles/connection-limit', async () => {
+            await withClient(batch9, async (client) => {
+                await client.query('CREATE DATABASE b9_lim OWNER b9_alice CONNECTION LIMIT 1');
+                const first = await connectAs(batch9, 'b9_alice', 'b9_lim');
+                try {
+                    const second = await failureOf(connectAs(batch9, 'b9_alice', 'b9_lim'));
+                    assert(
+                        second?.code === '53300' && second.message === 'too many connections for database "b9_lim"',
+                        `connection limit is ${second?.code}/${second?.message}`,
+                    );
+                    // Superusers are exempt even while another session holds the slot.
+                    const admin = await connectAs(batch9, 'postgres', 'b9_lim');
+                    await admin.end();
+                } finally {
+                    await first.end();
+                }
+                await client.query('DROP DATABASE b9_lim');
+            });
+        });
+
+        await check('roles/enforcement', async () => {
+            await withClient(batch9, async (client) => {
+                await client.query('CREATE DATABASE b9_rw OWNER b9_alice');
+                const alice = await connectAs(batch9, 'b9_alice', 'b9_rw');
+                const bob = await connectAs(batch9, 'b9_bob', 'b9_rw');
+                try {
+                    const schemaDenied = await failureOf(bob.query('CREATE TABLE b9_bob_t (id int)'));
+                    assert(
+                        schemaDenied?.code === '42501' && schemaDenied.message === 'permission denied for schema public',
+                        `schema create is ${schemaDenied?.code}/${schemaDenied?.message}`,
+                    );
+                    await alice.query('GRANT CREATE ON SCHEMA public TO b9_bob');
+                    const created = await bob.query('CREATE TABLE b9_bob_t (id int)');
+                    assert(created.command === 'CREATE', `bob create table tag is ${created.command}`);
+                    await alice.query('CREATE TABLE b9_secret (id int, note text)');
+                    await alice.query("INSERT INTO b9_secret VALUES (1, 'x')");
+                    for (const [sql, privilege] of [
+                        ['SELECT * FROM b9_secret', 'SELECT'],
+                        ["INSERT INTO b9_secret VALUES (2, 'y')", 'INSERT'],
+                        ["UPDATE b9_secret SET note = 'z'", 'UPDATE'],
+                        ['DELETE FROM b9_secret', 'DELETE'],
+                    ]) {
+                        const denied = await failureOf(bob.query(sql));
+                        assert(
+                            denied?.code === '42501' && denied.message === 'permission denied for table b9_secret',
+                            `${privilege} is ${denied?.code}/${denied?.message}`,
+                        );
+                    }
+                    const dropDenied = await failureOf(bob.query('DROP TABLE b9_secret'));
+                    assert(
+                        dropDenied?.code === '42501' && dropDenied.message === 'must be owner of table b9_secret',
+                        `drop table is ${dropDenied?.code}/${dropDenied?.message}`,
+                    );
+                    await alice.query('GRANT SELECT, INSERT, UPDATE, DELETE ON b9_secret TO b9_bob');
+                    const selected = await bob.query('SELECT * FROM b9_secret');
+                    assert(selected.rowCount === 1, `bob select row count is ${selected.rowCount}`);
+                    await bob.query("INSERT INTO b9_secret VALUES (2, 'y')");
+                    await bob.query("UPDATE b9_secret SET note = 'z' WHERE id = 2");
+                    await bob.query('DELETE FROM b9_secret WHERE id = 2');
+                    await alice.query('REVOKE SELECT ON b9_secret FROM b9_bob');
+                    const revoked = await failureOf(bob.query('SELECT * FROM b9_secret'));
+                    assert(
+                        revoked?.code === '42501' && revoked.message === 'permission denied for table b9_secret',
+                        `revoked select is ${revoked?.code}/${revoked?.message}`,
+                    );
+                } finally {
+                    await alice.end();
+                    await bob.end();
+                }
+            });
+        });
+
         // Batch 5: COPY, cursors, SQL-level PREPARE and LISTEN/NOTIFY.
         const setupB5 = fs.readFileSync(path.join(harnessDir, 'fixtures', 'b5-setup.sql'), 'utf8');
         await withClient(batch5, async (client) => {
@@ -1719,13 +1941,14 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             await checkFixture('psql/b6-pg-database', 'b6-pg-database', 'b6-pg-database.sql');
             await checkFixture('psql/b7-database', 'b7-database', 'b7-database.sql', batch7);
             await checkFixture('psql/b8-options', 'b8-options', 'b8-options.sql', batch8);
+            await checkFixture('psql/b9-roles', 'b9-roles', 'b9-roles.sql', batch9fixture);
         }
 
         return {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 82,
+            floor: 89,
         };
     } finally {
         await trust.close();
@@ -1736,5 +1959,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batch5.close();
         await batch7.close();
         await batch8.close();
+        await batch9.close();
+        await batch9fixture.close();
     }
 }
