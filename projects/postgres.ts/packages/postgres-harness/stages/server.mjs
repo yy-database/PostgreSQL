@@ -35,7 +35,7 @@ function passwordPacket(password) {
 }
 
 function errorFields(payload) {
-    const result = { severity: '', code: '', message: '', detail: '' };
+    const result = { severity: '', code: '', message: '', detail: '', schema: '', table: '', column: '', dataType: '', constraint: '', file: '', line: '', routine: '' };
     let offset = 0;
     while (offset < payload.length && payload[offset] !== 0) {
         const kind = String.fromCharCode(payload[offset]);
@@ -46,6 +46,14 @@ function errorFields(payload) {
         if (kind === 'C') result.code = value;
         if (kind === 'M') result.message = value;
         if (kind === 'D') result.detail = value;
+        if (kind === 's') result.schema = value;
+        if (kind === 't') result.table = value;
+        if (kind === 'c') result.column = value;
+        if (kind === 'd') result.dataType = value;
+        if (kind === 'n') result.constraint = value;
+        if (kind === 'F') result.file = value;
+        if (kind === 'L') result.line = value;
+        if (kind === 'R') result.routine = value;
         offset = end + 1;
     }
     return result;
@@ -86,6 +94,66 @@ function dataRowValues(payload) {
         offset += length;
     }
     return values;
+}
+
+/** Builds a `Parse` message with explicit parameter type OIDs. */
+function parseFrame(name, sql, oids = []) {
+    const parts = [Buffer.from(name), Buffer.from([0]), Buffer.from(sql), Buffer.from([0])];
+    const count = Buffer.alloc(2);
+    count.writeInt16BE(oids.length);
+    parts.push(count);
+    for (const oid of oids) {
+        const value = Buffer.alloc(4);
+        value.writeInt32BE(oid);
+        parts.push(value);
+    }
+    return frame('P', Buffer.concat(parts));
+}
+
+/** Builds a `Bind` message whose values are buffers, or `null` for SQL NULL. */
+function bindFrame(portal, statement, formats, values) {
+    const parts = [Buffer.from(portal), Buffer.from([0]), Buffer.from(statement), Buffer.from([0])];
+    const formatCount = Buffer.alloc(2);
+    formatCount.writeInt16BE(formats.length);
+    parts.push(formatCount);
+    for (const format of formats) {
+        const value = Buffer.alloc(2);
+        value.writeInt16BE(format);
+        parts.push(value);
+    }
+    const valueCount = Buffer.alloc(2);
+    valueCount.writeInt16BE(values.length);
+    parts.push(valueCount);
+    for (const value of values) {
+        const length = Buffer.alloc(4);
+        if (value === null) {
+            length.writeInt32BE(-1);
+            parts.push(length);
+        } else {
+            length.writeInt32BE(value.length);
+            parts.push(length, value);
+        }
+    }
+    parts.push(Buffer.from([0, 0]));
+    return frame('B', Buffer.concat(parts));
+}
+
+function int16Buffer(value) {
+    const buffer = Buffer.alloc(2);
+    buffer.writeInt16BE(value);
+    return buffer;
+}
+
+function int32Buffer(value) {
+    const buffer = Buffer.alloc(4);
+    buffer.writeInt32BE(value);
+    return buffer;
+}
+
+function bigintBuffer(value) {
+    const buffer = Buffer.alloc(8);
+    buffer.writeBigInt64BE(value);
+    return buffer;
 }
 
 class Wire {
@@ -257,7 +325,9 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await check('session/set-show', async () => {
             const wire = await openTrustSession(trust.host, trust.port);
             const set = await wire.query("SET application_name = 'batch-one'");
-            requireTags(set, 'CZ');
+            requireTags(set, 'SCZ');
+            const status = set.find((message) => message.tag === 'S');
+            assert(status?.payload.toString('utf8') === 'application_name\0batch-one\0', 'application_name is reported');
             const show = await wire.query('SHOW application_name');
             requireTags(show, 'TDCZ');
             assert(JSON.stringify(firstRow(show)) === '["batch-one"]', `SHOW returned ${JSON.stringify(firstRow(show))}`);
@@ -336,6 +406,184 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             requireTags(messages, '12TDCZ');
             assert(JSON.stringify(firstRow(messages)) === '[null]', `null parameter is ${JSON.stringify(firstRow(messages))}`);
             wire.close();
+        });
+
+        await check('session/guc-canonical', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            const showZone = await wire.query('SHOW TimeZone');
+            requireTags(showZone, 'TDCZ');
+            const [zoneField] = rowFields(showZone[0].payload);
+            assert(zoneField.name === 'TimeZone' && zoneField.typeOid === 25, `SHOW TimeZone field is ${zoneField.name}/${zoneField.typeOid}`);
+            assert(JSON.stringify(firstRow(showZone)) === '["UTC"]', `TimeZone is ${JSON.stringify(firstRow(showZone))}`);
+            const showStyle = await wire.query('SHOW datestyle');
+            const [styleField] = rowFields(showStyle[0].payload);
+            assert(styleField.name === 'DateStyle', `SHOW datestyle field is ${styleField.name}`);
+            assert(JSON.stringify(firstRow(showStyle)) === '["ISO, MDY"]', `DateStyle is ${JSON.stringify(firstRow(showStyle))}`);
+            const set = await wire.query("SET datestyle TO 'German'");
+            requireTags(set, 'SCZ');
+            const status = set.find((message) => message.tag === 'S');
+            assert(status?.payload.toString('utf8') === 'DateStyle\0German, MDY\0', `DateStyle status is ${status?.payload.toString('utf8')}`);
+            const normalized = await wire.query('SHOW DateStyle');
+            assert(JSON.stringify(firstRow(normalized)) === '["German, MDY"]', `normalized DateStyle is ${JSON.stringify(firstRow(normalized))}`);
+            const zone = await wire.query('SET TIME ZONE UTC');
+            requireTags(zone, 'SCZ');
+            const zoneStatus = zone.find((message) => message.tag === 'S');
+            assert(zoneStatus?.payload.toString('utf8') === 'TimeZone\0UTC\0', `TimeZone status is ${zoneStatus?.payload.toString('utf8')}`);
+            wire.close();
+        });
+
+        await check('extended/binary-int4', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            wire.send(parseFrame('s1', 'SELECT $1::int4', [23]));
+            wire.send(bindFrame('p1', 's1', [1], [int32Buffer(42)]));
+            wire.send(frame('D', Buffer.concat([Buffer.from('P'), Buffer.from('p1'), Buffer.from([0])])));
+            wire.send(frame('E', Buffer.concat([Buffer.from('p1'), Buffer.from([0]), Buffer.from([0, 0, 0, 0])])));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12TDCZ');
+            assert(JSON.stringify(firstRow(messages)) === '["42"]', `binary int4 is ${JSON.stringify(firstRow(messages))}`);
+            wire.close();
+        });
+
+        await check('extended/binary-scalars', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            const sql = 'SELECT $1::int2, $2::int8, $3::float4, $4::float8, $5::bool, $6::text, $7::bytea, $8::date, $9::timestamp, $10::uuid';
+            wire.send(parseFrame('s1', sql, [21, 20, 700, 701, 16, 25, 17, 1082, 1114, 2950]));
+            wire.send(
+                bindFrame(
+                    'p1',
+                    's1',
+                    [1],
+                    [
+                        int16Buffer(42),
+                        bigintBuffer(1234567890123n),
+                        Buffer.from([0x3f, 0x00, 0x00, 0x00]),
+                        Buffer.from([0x3f, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+                        Buffer.from([1]),
+                        Buffer.from('hello'),
+                        Buffer.from([0xde, 0xad]),
+                        int32Buffer(0),
+                        bigintBuffer(0n),
+                        Buffer.from('00112233445566778899aabbccddeeff', 'hex'),
+                    ],
+                ),
+            );
+            wire.send(frame('E', Buffer.concat([Buffer.from('p1'), Buffer.from([0]), Buffer.from([0, 0, 0, 0])])));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12TDCZ');
+            const row = firstRow(messages);
+            assert(
+                JSON.stringify(row) === JSON.stringify(['42', '1234567890123', '0.5', '0.25', 't', 'hello', '\\xdead', '2000-01-01', '2000-01-01 00:00:00', '00112233-4455-6677-8899-aabbccddeeff']),
+                `binary scalars are ${JSON.stringify(row)}`,
+            );
+            wire.close();
+        });
+
+        await check('extended/binary-array', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            const payload = Buffer.concat([
+                int32Buffer(1),
+                int32Buffer(0),
+                int32Buffer(23),
+                int32Buffer(3),
+                int32Buffer(1),
+                int32Buffer(4),
+                int32Buffer(1),
+                int32Buffer(4),
+                int32Buffer(2),
+                int32Buffer(4),
+                int32Buffer(3),
+            ]);
+            wire.send(parseFrame('s1', 'SELECT $1::int4[]', [1007]));
+            wire.send(bindFrame('p1', 's1', [1], [payload]));
+            wire.send(frame('E', Buffer.concat([Buffer.from('p1'), Buffer.from([0]), Buffer.from([0, 0, 0, 0])])));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12TDCZ');
+            assert(JSON.stringify(firstRow(messages)) === '["{1,2,3}"]', `binary array is ${JSON.stringify(firstRow(messages))}`);
+            wire.close();
+        });
+
+        await check('extended/binary-numeric', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            const payload = Buffer.concat([int16Buffer(2), int16Buffer(0), int16Buffer(0), int16Buffer(2), int16Buffer(12), int16Buffer(3400)]);
+            wire.send(parseFrame('s1', 'SELECT $1::numeric', [1700]));
+            wire.send(bindFrame('p1', 's1', [1], [payload]));
+            wire.send(frame('E', Buffer.concat([Buffer.from('p1'), Buffer.from([0]), Buffer.from([0, 0, 0, 0])])));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12TDCZ');
+            assert(JSON.stringify(firstRow(messages)) === '["12.34"]', `binary numeric is ${JSON.stringify(firstRow(messages))}`);
+            wire.close();
+        });
+
+        await check('catalog/pg-cursors', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            const begin = await wire.query('BEGIN');
+            requireTags(begin, 'CZ');
+            const declare = await wire.query('DECLARE c11 CURSOR FOR SELECT 1 AS n');
+            requireTags(declare, 'CZ');
+            const rows = await wire.query('SELECT name, statement, is_holdable, is_binary, is_scrollable FROM pg_catalog.pg_cursors');
+            requireTags(rows, 'TDCZ');
+            assert(JSON.stringify(firstRow(rows))?.startsWith('["c11","DECLARE c11 CURSOR FOR SELECT 1 AS n",') ?? false, `pg_cursors row is ${JSON.stringify(firstRow(rows))}`);
+            const commit = await wire.query('COMMIT');
+            requireTags(commit, 'CZ');
+            const after = await wire.query('SELECT count(*) FROM pg_catalog.pg_cursors');
+            assert(JSON.stringify(firstRow(after)) === '["0"]', `pg_cursors after COMMIT is ${JSON.stringify(firstRow(after))}`);
+            wire.close();
+        });
+
+        await check('session/temp-table', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            const create = await wire.query('CREATE TEMP TABLE b11_temp (id int, v text)');
+            assert(create.at(-2)?.payload.subarray(0, -1).toString('utf8') === 'CREATE TABLE', 'CREATE TEMP TABLE tag');
+            const insert = await wire.query("INSERT INTO b11_temp VALUES (1, 'one')");
+            requireTags(insert, 'CZ');
+            const select = await wire.query('SELECT id, v FROM b11_temp');
+            requireTags(select, 'TDCZ');
+            assert(JSON.stringify(firstRow(select)) === '["1","one"]', `temp row is ${JSON.stringify(firstRow(select))}`);
+            const persistence = await wire.query("SELECT relpersistence FROM pg_catalog.pg_class WHERE relname = 'b11_temp'");
+            assert(JSON.stringify(firstRow(persistence)) === '["t"]', `relpersistence is ${JSON.stringify(firstRow(persistence))}`);
+            await wire.query('DROP TABLE b11_temp');
+            wire.close();
+            const second = await openTrustSession(trust.host, trust.port);
+            const survivors = await second.query("SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'b11_temp'");
+            assert(JSON.stringify(firstRow(survivors)) === '["0"]', `temp table survived the session: ${JSON.stringify(firstRow(survivors))}`);
+            second.close();
+        });
+
+        await check('error/structured-fields', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            await wire.query('CREATE TABLE b11_err (id int primary key, v int not null check (v > 0))');
+            const nulls = await wire.query('INSERT INTO b11_err VALUES (1, NULL)');
+            requireTags(nulls, 'EZ');
+            const nullError = onlyError(nulls);
+            assert(nullError.code === '23502', `not-null code is ${nullError.code}`);
+            assert(nullError.schema === 'public' && nullError.table === 'b11_err' && nullError.column === 'v', `not-null fields are ${JSON.stringify(nullError)}`);
+            assert(nullError.file !== '' && nullError.line !== '' && nullError.routine !== '', 'not-null carries source fields');
+            const check = await wire.query('INSERT INTO b11_err VALUES (2, 0)');
+            const checkError = onlyError(check);
+            assert(checkError.code === '23514' && checkError.constraint === 'b11_err_v_check', `check fields are ${JSON.stringify(checkError)}`);
+            assert(checkError.schema === 'public' && checkError.table === 'b11_err', 'check carries schema and table');
+            await wire.query('INSERT INTO b11_err VALUES (1, 1)');
+            const duplicate = await wire.query('INSERT INTO b11_err VALUES (1, 2)');
+            const duplicateError = onlyError(duplicate);
+            assert(duplicateError.code === '23505' && duplicateError.constraint === 'b11_err_pkey', `unique fields are ${JSON.stringify(duplicateError)}`);
+            wire.close();
+        });
+
+        await check('driver/temp-table', async () => {
+            const client = new pg.Client({ host: trust.host, port: trust.port, user: 'postgres', database: 'postgres' });
+            await client.connect();
+            try {
+                await client.query('CREATE TEMP TABLE b11_driver (n int)');
+                await client.query('INSERT INTO b11_driver VALUES ($1)', [7]);
+                const result = await client.query('SELECT n FROM b11_driver');
+                assert(result.rows[0]?.n === 7, `driver temp row is ${JSON.stringify(result.rows)}`);
+            } finally {
+                await client.end();
+            }
         });
 
         await check('auth/password-accepted', async () => {
@@ -2053,9 +2301,9 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            // 90 before batch 10, plus `b10/numeric-special`, `b10/check-fields`,
-            // `b10/identity`, `b10/foreign-keys` and the four `psql/b10-*` fixtures.
-            floor: 98,
+            // 98 before batch 11, plus the GUC, binary, `pg_cursors`, temp-table
+            // and structured-error checks.
+            floor: 107,
         };
     } finally {
         await trust.close();

@@ -336,6 +336,8 @@ export interface CreateTableStatement {
     ifNotExists: boolean;
     columns: ColumnDef[];
     constraints: TableConstraint[];
+    /** `CREATE TEMP` (`t`) and `CREATE UNLOGGED` (`u`) tables, otherwise `p`. */
+    persistence?: 'p' | 't' | 'u';
 }
 
 export interface DropTableStatement {
@@ -488,6 +490,10 @@ export interface CursorStatement {
     all: boolean;
     scroll: 'scroll' | 'no-scroll' | undefined;
     hold: boolean;
+    /** `DECLARE ... BINARY`, reported by `pg_cursors.is_binary`. */
+    binary?: boolean;
+    /** Original `DECLARE` text, reported by `pg_cursors.statement`. */
+    source?: string;
     direction: CursorDirection | undefined;
     select: SelectStatement | undefined;
 }
@@ -1092,12 +1098,17 @@ class Parser {
     }
 
     private parseDeclare(): CursorStatement {
+        const start = this.peek().start;
         this.expect('DECLARE');
         const name = this.identifier();
         let scroll: 'scroll' | 'no-scroll' | undefined;
         let hold = false;
+        let binary = false;
         for (;;) {
-            if (this.accept('BINARY')) continue;
+            if (this.accept('BINARY')) {
+                binary = true;
+                continue;
+            }
             if (this.accept('INSENSITIVE')) continue;
             if (this.accept('SCROLL')) {
                 scroll = 'scroll';
@@ -1123,7 +1134,18 @@ class Parser {
         }
         this.expect('FOR');
         const select = this.parseSelect();
-        return { kind: 'cursor', action: 'declare', name, all: false, scroll, hold, direction: undefined, select };
+        return {
+            kind: 'cursor',
+            action: 'declare',
+            name,
+            all: false,
+            scroll,
+            hold,
+            binary,
+            source: this.sourceSince(start),
+            direction: undefined,
+            select,
+        };
     }
 
     private parseFetchMove(action: 'fetch' | 'move'): CursorStatement {
@@ -2019,6 +2041,15 @@ class Parser {
         if (this.at('DATABASE')) return this.parseCreateDatabase();
         if (this.at('ROLE')) return this.parseCreateRole();
         if (this.at('UNIQUE') || this.at('INDEX')) return this.parseCreateIndex();
+        let persistence: 'p' | 't' | 'u' = 'p';
+        if (this.at('TEMP') || this.at('TEMPORARY')) {
+            this.next();
+            persistence = 't';
+        }
+        else if (this.at('UNLOGGED')) {
+            this.next();
+            persistence = 'u';
+        }
         this.expect('TABLE');
         const ifNotExists = this.at('IF') ? (this.next(), this.expect('NOT'), this.expect('EXISTS'), true) : false;
         const table = this.parseRelationRef();
@@ -2075,7 +2106,7 @@ class Parser {
             columns.push(this.parseColumnDef());
         } while (this.accept(','));
         this.expect(')');
-        return { kind: 'create-table', table, ifNotExists, columns, constraints };
+        return { kind: 'create-table', table, ifNotExists, columns, constraints, persistence };
     }
 
     private parseCreateDatabase(): CreateDatabaseStatement {

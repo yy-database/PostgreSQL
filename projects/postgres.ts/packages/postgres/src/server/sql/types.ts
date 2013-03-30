@@ -27,6 +27,7 @@ export type TypeKey =
     | 'timestamp'
     | 'timestamptz'
     | 'uuid'
+    | 'bytea'
     | 'pg_node_tree'
     | 'int2vector'
     | 'oidvector'
@@ -73,6 +74,7 @@ const TYPE_INFO: Record<TypeKey, TypeInfo> = {
     timestamp: { oid: 1114, typlen: 8 },
     timestamptz: { oid: 1184, typlen: 8 },
     uuid: { oid: 2950, typlen: 16 },
+    bytea: { oid: 17, typlen: -1 },
     pg_node_tree: { oid: 194, typlen: -1 },
     int2vector: { oid: 22, typlen: -1 },
     oidvector: { oid: 30, typlen: -1 },
@@ -99,6 +101,16 @@ export const NAME = typeOf('name');
 
 export function typeOid(type: DataType): number {
     return TYPE_INFO[type.key].oid;
+}
+
+const TYPE_BY_OID = new Map<number, TypeKey>(
+    (Object.entries(TYPE_INFO) as [TypeKey, TypeInfo][]).map(([key, info]) => [info.oid, key]),
+);
+
+/** Resolves a wire type OID back to a value type, or `undefined` when unknown. */
+export function typeFromOid(value: number): DataType | undefined {
+    const key = TYPE_BY_OID.get(value);
+    return key === undefined ? undefined : typeOf(key);
 }
 
 export function typeLength(type: DataType): number {
@@ -180,6 +192,8 @@ export function formatType(type: DataType): string {
             return 'timestamp with time zone';
         case 'uuid':
             return 'uuid';
+        case 'bytea':
+            return 'bytea';
         case 'pg_node_tree':
             return 'pg_node_tree';
         case 'int2vector':
@@ -288,6 +302,8 @@ export function typeFromName(parts: string[], modifiers: number[]): DataType {
             return typeOf('timestamptz');
         case 'uuid':
             return typeOf('uuid');
+        case 'bytea':
+            return typeOf('bytea');
         case 'pg_node_tree':
             return typeOf('pg_node_tree');
         case 'int2vector':
@@ -301,14 +317,28 @@ export function typeFromName(parts: string[], modifiers: number[]): DataType {
 
 /** Error text PostgreSQL uses when a literal does not fit the column type. */
 function invalid(type: DataType, text: string): ServerError {
-    return new ServerError('22P02', `invalid input syntax for type ${formatType(type)}: "${text}"`);
+    return new ServerError(
+        '22P02',
+        `invalid input syntax for type ${formatType(type)}: "${text}"`,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { dataType: formatType(type) },
+    );
+}
+
+/** Error text PostgreSQL uses when a value is outside the type's range. */
+function overflow(type: DataType, message: string, detail?: string): ServerError {
+    return new ServerError('22003', message, detail, undefined, undefined, undefined, undefined, { dataType: formatType(type) });
 }
 
 function integerText(type: DataType, text: string, min: bigint, max: bigint): number {
     const trimmed = text.trim();
     if (!/^[-+]?\d+$/.test(trimmed)) throw invalid(type, text);
     const parsed = BigInt(trimmed);
-    if (parsed < min || parsed > max) throw new ServerError('22003', `value "${text}" is out of range for type ${formatType(type)}`);
+    if (parsed < min || parsed > max) throw overflow(type, `value "${text}" is out of range for type ${formatType(type)}`);
     return Number(parsed);
 }
 
@@ -353,6 +383,13 @@ function uuidText(type: DataType, text: string): string {
     const trimmed = text.trim().toLowerCase();
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(trimmed)) throw invalid(type, text);
     return trimmed;
+}
+
+/** Accepts the hex input form, which is what `bytea_output = hex` renders. */
+function byteaText(type: DataType, text: string): string {
+    const trimmed = text.trim();
+    if (!/^\\x[0-9a-fA-F]*$/.test(trimmed)) throw invalid(type, text);
+    return `\\x${trimmed.slice(2).toLowerCase()}`;
 }
 
 interface DecimalParts {
@@ -408,8 +445,8 @@ function numericText(type: DataType, text: string): string {
     if (special !== null) {
         if (type.typmod > 0 && special !== 'NaN') {
             const { precision, scale } = numericPrecisionScale(type.typmod);
-            throw new ServerError(
-                '22003',
+            throw overflow(
+                type,
                 'numeric field overflow',
                 `A field with precision ${precision}, scale ${scale} cannot hold an infinite value.`,
             );
@@ -432,8 +469,8 @@ function numericText(type: DataType, text: string): string {
         }
         scale = target;
         if (magnitude >= 10n ** BigInt(precision)) {
-            throw new ServerError(
-                '22003',
+            throw overflow(
+                type,
                 'numeric field overflow',
                 `A field with precision ${precision}, scale ${target} must round to an absolute value less than 10^${precision - target}.`,
             );
@@ -473,6 +510,12 @@ export function parseLiteral(text: string, type: DataType): SqlValue {
                 throw new ServerError(
                     '22001',
                     `value too long for type ${formatType(type)}`,
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    { dataType: formatType(type) },
                 );
             }
             return text;
@@ -488,6 +531,8 @@ export function parseLiteral(text: string, type: DataType): SqlValue {
             return timestampText(type, text);
         case 'uuid':
             return uuidText(type, text);
+        case 'bytea':
+            return byteaText(type, text);
         default:
             return text;
     }

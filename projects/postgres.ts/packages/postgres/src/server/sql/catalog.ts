@@ -32,6 +32,8 @@ export interface UserRelation {
     relhasindex: boolean;
     /** `relacl` kept as the text-array literal; `null` means the implicit owner-only ACL. */
     relacl?: string | null;
+    /** `pg_class.relpersistence`: `p` permanent, `t` temporary, `u` unlogged. */
+    persistence?: 'p' | 't' | 'u';
 }
 
 export interface UserColumn {
@@ -138,6 +140,8 @@ interface SystemRelation {
     name: string;
     oid: number;
     columns: ColumnMeta[];
+    /** `pg_cursors` is a view, so its `pg_class` row differs from a real table. */
+    view?: boolean;
 }
 
 const oid = typeOf('oid');
@@ -485,6 +489,21 @@ const SYSTEM_RELATIONS: SystemRelation[] = [
         columns: columns(['oid', oid], ['spcname', name], ['spcowner', oid], ['spcacl', typeOf('text_array')], ['spcoptions', typeOf('text_array')]),
     },
     { name: 'pg_depend', oid: 2608, columns: columns(['classid', oid], ['objid', oid], ['objsubid', int4], ['refclassid', oid], ['refobjid', oid], ['refobjsubid', int4], ['deptype', char]) },
+    {
+        // A view over session portals, so its rows come from the live session
+        // rather than from the catalog document.
+        name: 'pg_cursors',
+        oid: 12077,
+        view: true,
+        columns: columns(
+            ['name', text],
+            ['statement', text],
+            ['is_holdable', bool],
+            ['is_binary', bool],
+            ['is_scrollable', bool],
+            ['creation_time', typeOf('timestamptz')],
+        ),
+    },
 ];
 
 const SYSTEM_BY_NAME = new Map(SYSTEM_RELATIONS.map((relation) => [relation.name, relation]));
@@ -605,8 +624,23 @@ export function relationDisplayName(doc: CatalogDoc, oidValue: number): string |
     return system ? system.name : null;
 }
 
+/** One row of `pg_cursors`, supplied by the live session for its open portals. */
+export interface CursorViewRow {
+    name: string;
+    statement: string;
+    isHoldable: boolean;
+    isBinary: boolean;
+    isScrollable: boolean;
+    creationTime: string;
+}
+
 /** Projects the whole `pg_catalog` surface from the single catalog document. */
-export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[], roles: ClusterRole[]): Map<string, TableData> {
+export function catalogTables(
+    doc: CatalogDoc,
+    databases: ClusterDatabase[],
+    roles: ClusterRole[],
+    cursors: CursorViewRow[] = [],
+): Map<string, TableData> {
     const tables = new Map<string, TableData>();
     const push = (relation: string, row: Record<string, SqlValue>): void => {
         const columns = SYSTEM_BY_NAME.get(relation)?.columns;
@@ -618,6 +652,17 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[], rol
 
     for (const relation of SYSTEM_RELATIONS) {
         if (!tables.has(relation.name)) tables.set(relation.name, { columns: relation.columns, rows: [] });
+    }
+
+    for (const cursor of cursors) {
+        push('pg_cursors', {
+            name: cursor.name,
+            statement: cursor.statement,
+            is_holdable: cursor.isHoldable,
+            is_binary: cursor.isBinary,
+            is_scrollable: cursor.isScrollable,
+            creation_time: cursor.creationTime,
+        });
     }
 
     for (const namespace of SYSTEM_NAMESPACES) {
@@ -636,8 +681,8 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[], rol
         reltype: 0,
         reloftype: 0,
         relowner: POSTGRES_ROLE,
-        relam: 2,
-        relfilenode: relation.oid,
+        relam: relation.view ? 0 : 2,
+        relfilenode: relation.view ? 0 : relation.oid,
         reltablespace: 0,
         relpages: 0,
         reltuples: 0,
@@ -646,7 +691,7 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[], rol
         relhasindex: false,
         relisshared: false,
         relpersistence: 'p',
-        relkind: 'r',
+        relkind: relation.view ? 'v' : 'r',
         relnatts: relation.columns.length,
         relchecks: 0,
         relhasrules: false,
@@ -689,7 +734,7 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[], rol
             reltoastrelid: 0,
             relhasindex: relation.relkind === 'r' ? doc.indexes.some((index) => index.relid === relation.oid) : false,
             relisshared: false,
-            relpersistence: 'p',
+            relpersistence: relation.persistence ?? 'p',
             relkind: relation.relkind,
             relnatts: attributeCount,
             relchecks: checkCount,

@@ -1059,7 +1059,12 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
     }
     const system = ref.schema === 'pg_catalog' ? systemColumns(ref.name) : ref.schema === undefined ? systemColumns(ref.name) : undefined;
     if (system) {
-        const table = catalogTables(database.catalog, database.databases, database.roles).get(ref.name);
+        const table = catalogTables(
+            database.catalog,
+            database.databases,
+            database.roles,
+            database.session.pgCursors?.() ?? [],
+        ).get(ref.name);
         return {
             columns: (table?.columns ?? system).map((column) => ({ alias, name: column.name, type: column.type })),
             rows: table?.rows ?? [],
@@ -1982,7 +1987,9 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         if (statement.ifNotExists) return { kind: 'command', tag: 'CREATE TABLE' };
         throw new ServerError('42P07', `relation "${statement.table.name}" already exists`);
     }
-    checkGrant(database, { type: 'schema', name: 'public' }, 'CREATE');
+    // Temporary tables live in the session's `pg_temp` namespace and do not
+    // require `CREATE` on `public`; they are dropped when the session ends.
+    if (statement.persistence !== 't') checkGrant(database, { type: 'schema', name: 'public' }, 'CREATE');
     const ownerOid = currentRoleOid(database);
 
     const names = new Set<string>();
@@ -2003,6 +2010,7 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         relam: 2,
         owner: ownerOid,
         relhasindex: false,
+        persistence: statement.persistence ?? 'p',
     };
 
     const prepared: {
@@ -2185,6 +2193,11 @@ function createIndex(database: Database, statement: CreateIndexStatement): Outco
                     '23505',
                     `could not create unique index "${statement.name}"`,
                     `Key (${labels})=(${key.map((value) => formatValue(value, TEXT)).join(', ')}) is duplicated.`,
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    { schema: schemaNameOf(relation), table: relation.name },
                 );
             }
             seen.add(rendered);
@@ -2291,6 +2304,7 @@ function dropTable(database: Database, statement: DropTableStatement): Outcome {
 interface TableShape {
     oid: number;
     name: string;
+    namespace: number;
     columns: {
         attnum: number;
         name: string;
@@ -2315,7 +2329,7 @@ interface TableShape {
     }[];
 }
 
-function shapeForRelation(database: Database, relation: { oid: number; name: string }): TableShape {
+function shapeForRelation(database: Database, relation: { oid: number; name: string; namespace: number }): TableShape {
     const catalog = database.catalog;
     const columns = catalog.columns
         .filter((column) => column.relid === relation.oid)
@@ -2352,7 +2366,12 @@ function shapeForRelation(database: Database, relation: { oid: number; name: str
             confdeltype: constraint.confdeltype,
             confmatchtype: constraint.confmatchtype ?? 's',
         }));
-    return { oid: relation.oid, name: relation.name, columns, uniqueIndexes, checks, foreignKeys };
+    return { oid: relation.oid, name: relation.name, namespace: relation.namespace, columns, uniqueIndexes, checks, foreignKeys };
+}
+
+/** The schema name PostgreSQL reports in `s` for a relation-level error. */
+function schemaNameOf(shape: { namespace: number }): string {
+    return SYSTEM_NAMESPACES.find((namespace) => namespace.oid === shape.namespace)?.name ?? 'public';
 }
 
 function shapeForOid(database: Database, oid: number): TableShape {
@@ -2430,6 +2449,7 @@ function enforceChecks(database: Database, shape: TableShape, values: SqlValue[]
                 undefined,
                 undefined,
                 check.name,
+                { schema: schemaNameOf(shape), table: shape.name },
             );
         }
     }
@@ -2459,6 +2479,7 @@ function enforceForeignKeys(database: Database, shape: TableShape, values: SqlVa
                     undefined,
                     undefined,
                     fk.name,
+                    { schema: schemaNameOf(shape), table: shape.name },
                 );
             }
         }
@@ -2475,6 +2496,7 @@ function enforceForeignKeys(database: Database, shape: TableShape, values: SqlVa
             undefined,
             undefined,
             fk.name,
+            { schema: schemaNameOf(shape), table: shape.name },
         );
     }
 }
@@ -2525,7 +2547,11 @@ function insertRows(database: Database, statement: InsertStatement, params: SqlV
         }
         for (const column of shape.columns) {
             if (column.notNull && (values[column.attnum - 1] ?? null) === null) {
-                throw new ServerError('23502', `null value in column "${column.name}" of relation "${shape.name}" violates not-null constraint`);
+                throw new ServerError('23502', `null value in column "${column.name}" of relation "${shape.name}" violates not-null constraint`, undefined, undefined, undefined, undefined, undefined, {
+                    schema: schemaNameOf(shape),
+                    table: shape.name,
+                    column: column.name,
+                });
             }
         }
         enforceChecks(database, shape, values);
@@ -2540,7 +2566,11 @@ function insertRows(database: Database, statement: InsertStatement, params: SqlV
 function validateRowShape(database: Database, shape: TableShape, values: SqlValue[]): void {
     for (const column of shape.columns) {
         if (column.notNull && (values[column.attnum - 1] ?? null) === null) {
-            throw new ServerError('23502', `null value in column "${column.name}" of relation "${shape.name}" violates not-null constraint`);
+            throw new ServerError('23502', `null value in column "${column.name}" of relation "${shape.name}" violates not-null constraint`, undefined, undefined, undefined, undefined, undefined, {
+                schema: schemaNameOf(shape),
+                table: shape.name,
+                column: column.name,
+            });
         }
     }
     enforceChecks(database, shape, values);
@@ -2600,6 +2630,7 @@ function removeRow(database: Database, shape: TableShape, key: string, values: S
             undefined,
             undefined,
             constraint.name,
+            { schema: schemaNameOf(shape), table: shape.name },
         );
     }
     database.deleteRow(shape.oid, key);
@@ -2707,6 +2738,7 @@ function propagateParentUpdates(
                     undefined,
                     undefined,
                     constraint.name,
+                    { schema: schemaNameOf(shape), table: shape.name },
                 );
             }
         }
@@ -2731,20 +2763,26 @@ function deleteRows(database: Database, statement: DeleteStatement, params: SqlV
 }
 
 /** Scans the relation and reports the first row that violates a check. */
-function validateCheck(database: Database, relation: { oid: number; name: string }, name: string, source: string): void {
+function validateCheck(database: Database, relation: { oid: number; name: string; namespace: number }, name: string, source: string): void {
     const expr = parseExpression(source);
     for (const values of database.table(relation.oid).values()) {
         if (evaluate(database, expr, rowContext(relation, database.catalog, values), []) === false) {
             throw new ServerError(
                 '23514',
                 `check constraint "${name}" of relation "${relation.name}" is violated by some row`,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                name,
+                { schema: schemaNameOf(relation), table: relation.name },
             );
         }
     }
 }
 
 /** Scans the relation and reports the first row that violates a foreign key. */
-function validateForeignKeys(database: Database, relation: { oid: number; name: string }, name: string): void {
+function validateForeignKeys(database: Database, relation: { oid: number; name: string; namespace: number }, name: string): void {
     const constraint = database.catalog.constraints.find((candidate) => candidate.relid === relation.oid && candidate.contype === 'f' && candidate.name === name);
     if (!constraint) return;
     const shape = shapeForRelation(database, relation);
@@ -2764,6 +2802,7 @@ function validateForeignKeys(database: Database, relation: { oid: number; name: 
                     undefined,
                     undefined,
                     name,
+                    { schema: schemaNameOf(relation), table: relation.name },
                 );
             }
         }
@@ -2780,11 +2819,12 @@ function validateForeignKeys(database: Database, relation: { oid: number; name: 
             undefined,
             undefined,
             name,
+            { schema: schemaNameOf(relation), table: relation.name },
         );
     }
 }
 
-function validateConstraint(database: Database, relation: { oid: number; name: string }, constraint: { name: string; contype: string; checkSource: string | null }): void {
+function validateConstraint(database: Database, relation: { oid: number; name: string; namespace: number }, constraint: { name: string; contype: string; checkSource: string | null }): void {
     if (constraint.contype === 'c') validateCheck(database, relation, constraint.name, constraint.checkSource ?? '');
     else if (constraint.contype === 'f') validateForeignKeys(database, relation, constraint.name);
 }
@@ -2828,7 +2868,10 @@ function checkUnique(database: Database, shape: TableShape, values: SqlValue[], 
                 .map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`)
                 .join(', ');
             const rendered = candidate.map((value) => formatValue(value, TEXT)).join(', ');
-            throw new ServerError('23505', `duplicate key value violates unique constraint "${index.name}"`, `Key (${labels})=(${rendered}) already exists.`);
+            throw new ServerError('23505', `duplicate key value violates unique constraint "${index.name}"`, `Key (${labels})=(${rendered}) already exists.`, undefined, undefined, undefined, index.name, {
+                schema: schemaNameOf(shape),
+                table: shape.name,
+            });
         }
     }
 }

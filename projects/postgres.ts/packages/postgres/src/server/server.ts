@@ -10,17 +10,19 @@ import { cloneDatabase, databasePrefix, purgeDatabase, scopedStorage, storageFor
 import { createSessionRuntime, Database, type SessionRuntime, type Storage } from './sql/database.ts';
 import { type ClusterDatabase, ClusterStore, hasDatabasePrivilege } from './sql/cluster.ts';
 import { copyColumnCount, copyIn, copyOut } from './sql/copy.ts';
-import type {
-    CopyStatement,
-    CreateDatabaseStatement,
-    CursorDirection,
-    CursorStatement,
-    DropDatabaseStatement,
-    PrepareStatement,
-    Statement,
-    TransactionStatement,
+import {
+    constantValue,
+    parseStatement,
+    type CopyStatement,
+    type CreateDatabaseStatement,
+    type CursorDirection,
+    type CursorStatement,
+    type DropDatabaseStatement,
+    type PrepareStatement,
+    type Statement,
+    type TransactionStatement,
 } from './sql/parser.ts';
-import { constantValue, parseStatement } from './sql/parser.ts';
+import { decodeBinaryParameter } from './sql/binary.ts';
 import { describeSelect, runStatement, type Field, type Outcome } from './sql/engine.ts';
 import { TEXT, formatValue, parseLiteral, typeLength, typeOid, type SqlValue, type DataType } from './sql/types.ts';
 import {
@@ -89,6 +91,128 @@ export interface PostgresServerHandle {
 export { ServerError };
 
 const TEXT_OID = typeOid(TEXT);
+
+/**
+ * GUC names are case-insensitive on input but canonical on the wire, so
+ * `SHOW datestyle`, `SET DATESTYLE` and the startup `DateStyle` all resolve to
+ * the same entry.
+ */
+const GUC_CANONICAL = new Map<string, string>();
+const GUC_DEFAULTS = new Map<string, string>();
+
+function defineGuc(canonical: string, value: string): void {
+    GUC_CANONICAL.set(canonical.toLowerCase(), canonical);
+    GUC_DEFAULTS.set(canonical, value);
+}
+
+/** The `GUC_REPORT` set: every change is echoed as a `ParameterStatus`. */
+const GUC_REPORTED = new Set([
+    'application_name',
+    'client_encoding',
+    'DateStyle',
+    'default_transaction_read_only',
+    'in_hot_standby',
+    'integer_datetimes',
+    'IntervalStyle',
+    'is_superuser',
+    'server_encoding',
+    'server_version',
+    'session_authorization',
+    'standard_conforming_strings',
+    'TimeZone',
+]);
+
+/** Boolean GUCs render `on`/`off` on `SHOW` and in `ParameterStatus`. */
+const GUC_BOOLEAN = new Set([
+    'default_transaction_read_only',
+    'in_hot_standby',
+    'integer_datetimes',
+    'is_superuser',
+    'standard_conforming_strings',
+    'row_security',
+    'check_function_bodies',
+    'data_checksums',
+    'debug_assertions',
+]);
+
+for (const [canonical, value] of [
+    ['server_version', '16.9'],
+    ['server_version_num', '160009'],
+    ['server_encoding', 'UTF8'],
+    ['client_encoding', 'UTF8'],
+    ['DateStyle', 'ISO, MDY'],
+    ['TimeZone', 'UTC'],
+    ['integer_datetimes', 'on'],
+    ['standard_conforming_strings', 'on'],
+    ['IntervalStyle', 'postgres'],
+    ['is_superuser', 'off'],
+    ['session_authorization', 'postgres'],
+    ['application_name', ''],
+    ['default_transaction_read_only', 'off'],
+    ['in_hot_standby', 'off'],
+    ['max_connections', '100'],
+    ['search_path', '"$user", public'],
+    ['extra_float_digits', '1'],
+    ['bytea_output', 'hex'],
+    ['client_min_messages', 'notice'],
+    ['default_transaction_isolation', 'read committed'],
+    ['statement_timeout', '0'],
+    ['lock_timeout', '0'],
+    ['idle_in_transaction_session_timeout', '0'],
+    ['row_security', 'on'],
+    ['check_function_bodies', 'on'],
+    ['max_identifier_length', '63'],
+    ['max_index_keys', '32'],
+    ['block_size', '8192'],
+    ['segment_size', '1GB'],
+    ['wal_block_size', '8192'],
+    ['wal_segment_size', '16MB'],
+    ['data_checksums', 'off'],
+    ['debug_assertions', 'off'],
+] as [string, string][]) {
+    defineGuc(canonical, value);
+}
+
+/** Resolves a GUC spelling to its canonical name, or `undefined` when unknown. */
+function canonicalGuc(name: string): string | undefined {
+    return GUC_CANONICAL.get(name.toLowerCase());
+}
+
+/** Normalizes `DateStyle` to the two-token form PostgreSQL reports. */
+function normalizeDateStyle(value: string, current: string): string {
+    const styles: Record<string, string> = { iso: 'ISO', sql: 'SQL', postgres: 'Postgres', german: 'German' };
+    const orders = new Set(['MDY', 'DMY', 'YMD']);
+    let style = '';
+    let order = '';
+    for (const raw of value.split(',')) {
+        const token = raw.trim().toLowerCase();
+        if (token === '') continue;
+        if (styles[token] !== undefined) style = styles[token] as string;
+        else if (orders.has(token.toUpperCase())) order = token.toUpperCase();
+        else throw new ServerError('22023', `invalid value for parameter "DateStyle": "${value}"`);
+    }
+    const previous = current.split(',').map((part) => part.trim());
+    if (style === '' && previous[0] !== undefined) style = previous[0];
+    if (order === '' && previous[1] !== undefined) order = previous[1];
+    return `${style || 'ISO'}, ${order || 'MDY'}`;
+}
+
+/** Normalizes boolean GUC spellings, rejecting values PostgreSQL rejects. */
+function normalizeBoolean(name: string, value: string): string {
+    const token = value.trim().toLowerCase();
+    if (['on', 'true', 'yes', '1'].includes(token)) return 'on';
+    if (['off', 'false', 'no', '0'].includes(token)) return 'off';
+    throw new ServerError('22023', `invalid value for parameter "${name}": "${value}"`);
+}
+
+/** `pg_cursors.creation_time`, rendered like `timestamp with time zone`. */
+function currentTimestamp(): string {
+    const now = new Date();
+    const fraction = String(now.getUTCMilliseconds()).padStart(3, '0');
+    return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')} ${String(
+        now.getUTCHours(),
+    ).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}.${fraction}+00`;
+}
 
 interface SessionState {
     parameters: Map<string, string>;
@@ -169,7 +293,7 @@ export function splitStatements(sql: string): string[] {
 }
 
 /** An engine result plus the streamed `COPY ... TO STDOUT` payload. */
-type ServerOutcome = Outcome | { kind: 'copy-out'; data: string; rows: number; columns: number };
+type ServerOutcome = (Outcome & { parameters?: { name: string; value: string }[] }) | { kind: 'copy-out'; data: string; rows: number; columns: number };
 
 /** Sessions share one hub so `NOTIFY` reaches connections that `LISTEN`. */
 interface NotificationHub {
@@ -184,6 +308,12 @@ interface CursorState {
     scroll: boolean;
     hold: boolean;
     inTransaction: boolean;
+    /** Original `DECLARE` text, rendered by `pg_cursors.statement`. */
+    statement: string;
+    /** `DECLARE ... BINARY`. */
+    binary: boolean;
+    /** Timestamp rendered for `pg_cursors.creation_time`. */
+    creationTime: string;
 }
 
 interface SqlPrepared {
@@ -216,7 +346,7 @@ class Session {
     private awaitingPassword = false;
     private state: SessionState | null = null;
     private prepared = new Map<string, { sql: string; parameterOids: number[] }>();
-    private portals = new Map<string, { statement: string; parameters: (string | null)[]; described: boolean }>();
+    private portals = new Map<string, { statement: string; parameters: SqlValue[]; described: boolean }>();
     private extendedFailed = false;
     private closing = false;
     private readonly runtime: SessionRuntime = createSessionRuntime();
@@ -227,6 +357,9 @@ class Session {
     /** `NOTIFY` payloads accumulated until the next commit. */
     private pending: { channel: string; payload: string }[] = [];
     private readonly cursors = new Map<string, CursorState>();
+    /** Temporary tables this session created, dropped when the session ends. */
+    private readonly tempTables = new Set<string>();
+    private tempPurged = false;
     private readonly sqlPrepared = new Map<string, SqlPrepared>();
     private copyState:
         | {
@@ -248,6 +381,15 @@ class Session {
         this.storage = scopedStorage(storage, databasePrefix(this.database));
         this.cluster = cluster;
         this.hub = hub;
+        this.runtime.pgCursors = () =>
+            [...this.cursors.entries()].map(([name, cursor]) => ({
+                name,
+                statement: cursor.statement,
+                isHoldable: cursor.hold,
+                isBinary: cursor.binary,
+                isScrollable: cursor.scroll,
+                creationTime: cursor.creationTime,
+            }));
         hub.sessions.add(this);
     }
 
@@ -262,7 +404,35 @@ class Session {
             this.pump();
         });
         this.socket.on('error', () => this.destroy());
-        this.socket.on('close', () => this.hub.sessions.delete(this));
+        this.socket.on('close', () => {
+            this.hub.sessions.delete(this);
+            this.purgeTempTables();
+        });
+    }
+
+    /** Drops the temporary tables this session leaves behind, like session exit. */
+    private purgeTempTables(): void {
+        if (this.tempPurged) return;
+        this.tempPurged = true;
+        if (this.tempTables.size === 0) return;
+        try {
+            const database = Database.open(this.storage, this.cluster, this.runtime);
+            for (const name of this.tempTables) {
+                try {
+                    runStatement(
+                        database,
+                        { kind: 'drop-table', table: { kind: 'relation', schema: undefined, name, alias: undefined, args: undefined }, ifExists: true, cascade: false },
+                        [],
+                    );
+                } catch {
+                    // A temp table inside an uncommitted transaction never reached storage.
+                }
+            }
+            database.commit();
+        } catch {
+            // Closing the socket must not fail because cleanup did.
+        }
+        this.tempTables.clear();
     }
 
     destroy(): void {
@@ -722,20 +892,61 @@ class Session {
     /** Handles `SET`/`SHOW` without the SQL parser; `null` means "parse normally". */
     private sessionCommand(state: SessionState, sql: string): ServerOutcome | null {
         const statement = sql.trim();
-        const set = /^(?:set|set\s+session|set\s+local)\s+([a-z_][a-z0-9_.]*)\s*(?:=|to)\s*([\s\S]+)$/i.exec(statement);
-        if (set && set[1] !== undefined && set[2] !== undefined) {
-            const name = set[1].toLowerCase();
-            state.parameters.set(name, unquote(set[2]));
-            return { kind: 'command', tag: 'SET' };
+        const set = /^(?:set|set\s+session|set\s+local)\s+(?:"([^"]+)"|([a-z_][a-z0-9_.]*))\s*(?:=|to)\s*([\s\S]+)$/i.exec(statement);
+        if (set) {
+            const rawName = set[1] ?? set[2];
+            const rawValue = set[3];
+            if (rawName !== undefined && rawValue !== undefined) return this.setParameter(state, rawName, rawValue);
         }
-        const show = /^show\s+([a-z_][a-z0-9_.]*)$/i.exec(statement);
-        if (show && show[1] !== undefined) {
-            const name = show[1].toLowerCase();
-            const value = state.parameters.get(name);
-            if (value === undefined) throw new ServerError('42704', `unrecognized configuration parameter "${name}"`);
-            return { kind: 'rows', fields: [{ name, type: TEXT }], rows: [[value]], tag: 'SHOW' };
+        const timeZone = /^(?:set|set\s+session|set\s+local)\s+time\s+zone\s+([\s\S]+)$/i.exec(statement);
+        if (timeZone?.[1] !== undefined) {
+            const value = timeZone[1].replace(/^(?:=|to)\s+/i, '');
+            return this.setParameter(state, 'TimeZone', value);
+        }
+        const names = /^(?:set|set\s+session|set\s+local)\s+names\s+([\s\S]+)$/i.exec(statement);
+        if (names?.[1] !== undefined) return this.setParameter(state, 'client_encoding', names[1]);
+        const show = /^show\s+(?:"([^"]+)"|([a-z_][a-z0-9_.]*))$/i.exec(statement);
+        if (show) {
+            const rawName = show[1] ?? show[2];
+            if (rawName !== undefined) {
+                const key = canonicalGuc(rawName) ?? [...state.parameters.keys()].find((name) => name.toLowerCase() === rawName.toLowerCase());
+                const value = key === undefined ? undefined : state.parameters.get(key);
+                if (key === undefined || value === undefined) throw new ServerError('42704', `unrecognized configuration parameter "${rawName.toLowerCase()}"`);
+                return { kind: 'rows', fields: [{ name: key, type: TEXT }], rows: [[value]], tag: 'SHOW' };
+            }
         }
         return null;
+    }
+
+    /** Applies one `SET`, normalizes its value and reports it when it is `GUC_REPORT`. */
+    private setParameter(state: SessionState, rawName: string, rawValue: string): ServerOutcome {
+        const key = canonicalGuc(rawName);
+        if (key === undefined) {
+            if (!rawName.includes('.')) throw new ServerError('42704', `unrecognized configuration parameter "${rawName.toLowerCase()}"`);
+            // Custom GUCs are accepted as written, like PostgreSQL's dotted names.
+            state.parameters.set(rawName.toLowerCase(), unquote(rawValue));
+            return { kind: 'command', tag: 'SET' };
+        }
+        const text = unquote(rawValue);
+        const current = state.parameters.get(key) ?? GUC_DEFAULTS.get(key) ?? '';
+        let value: string;
+        if (/^default$/i.test(text)) {
+            value = GUC_DEFAULTS.get(key) ?? '';
+        } else if (key === 'DateStyle') {
+            value = normalizeDateStyle(text, current);
+        } else if (GUC_BOOLEAN.has(key)) {
+            value = normalizeBoolean(key, text);
+        } else if (key === 'TimeZone' && text.toUpperCase() === 'UTC') {
+            value = 'UTC';
+        } else {
+            value = text;
+        }
+        state.parameters.set(key, value);
+        return {
+            kind: 'command',
+            tag: 'SET',
+            ...(GUC_REPORTED.has(key) ? { parameters: [{ name: key, value }] } : {}),
+        };
     }
 
     /**
@@ -795,6 +1006,16 @@ class Session {
                 return this.runCreateDatabase(statement, topLevel);
             case 'drop-database':
                 return this.runDropDatabase(statement, topLevel);
+            case 'create-table': {
+                const outcome = runStatement(database, statement, parameters);
+                if (statement.persistence === 't') this.tempTables.add(statement.table.name);
+                return outcome;
+            }
+            case 'drop-table': {
+                const outcome = runStatement(database, statement, parameters);
+                this.tempTables.delete(statement.table.name);
+                return outcome;
+            }
             default:
                 return runStatement(database, statement, parameters);
         }
@@ -938,6 +1159,9 @@ class Session {
                 scroll: statement.scroll !== 'no-scroll',
                 hold: statement.hold,
                 inTransaction: this.transaction !== null,
+                statement: statement.source ?? `DECLARE ${statement.name} CURSOR`,
+                binary: statement.binary ?? false,
+                creationTime: currentTimestamp(),
             });
             return { kind: 'command', tag: 'DECLARE CURSOR' };
         }
@@ -1041,14 +1265,16 @@ class Session {
 
             const formatCount = payload.readInt16BE(offset);
             offset += 2;
+            const formats: number[] = [];
             for (let index = 0; index < formatCount; index += 1) {
                 const format = payload.readInt16BE(offset);
                 offset += 2;
-                if (format !== 0) throw new ServerError('0A000', 'feature not supported', 'binary parameters are not implemented');
+                if (format !== 0 && format !== 1) throw new ServerError('08P01', `invalid parameter format code ${format}`);
+                formats.push(format);
             }
             const valueCount = payload.readInt16BE(offset);
             offset += 2;
-            const parameters: (string | null)[] = [];
+            const parameters: SqlValue[] = [];
             for (let index = 0; index < valueCount; index += 1) {
                 const length = payload.readInt32BE(offset);
                 offset += 4;
@@ -1056,8 +1282,18 @@ class Session {
                     parameters.push(null);
                     continue;
                 }
-                parameters.push(payload.subarray(offset, offset + length).toString('utf8'));
+                const buffer = payload.subarray(offset, offset + length);
                 offset += length;
+                const format = formats.length === 0 ? 0 : formats.length === 1 ? formats[0] : formats[index] ?? 0;
+                if (format === 0) {
+                    parameters.push(buffer.toString('utf8'));
+                    continue;
+                }
+                const oid = prepared.parameterOids[index];
+                if (oid === undefined || oid === 0) {
+                    throw new ServerError('0A000', 'feature not supported', 'binary parameter requires a declared type');
+                }
+                parameters.push(decodeBinaryParameter(buffer, oid));
             }
             this.portals.set(portal.value, { statement: statement.value, parameters, described: false });
             this.socket.write(bindComplete());
@@ -1084,7 +1320,14 @@ class Session {
             }
             if (kind === 'P') {
                 const portal = this.portals.get(name);
-                if (!portal) throw new ServerError('34000', `portal "${name}" does not exist`);
+                if (!portal) {
+                    // A SQL cursor is a portal from the client's point of view:
+                    // libpq's `PQdescribePortal` addresses the DECLARE name.
+                    const cursor = this.cursors.get(name);
+                    if (cursor === undefined) throw new ServerError('34000', `portal "${name}" does not exist`);
+                    this.socket.write(rowDescription(wireFields(cursor.fields)));
+                    return;
+                }
                 const prepared = this.prepared.get(portal.statement);
                 if (!prepared) throw new ServerError('26000', `prepared statement "${portal.statement}" does not exist`);
                 portal.described = true;
@@ -1100,9 +1343,11 @@ class Session {
     private describeSql(sql: string, parameterCount: number): Buffer {
         const statement = sql.trim();
         if (statement.length === 0) return noData();
-        const show = /^show\s+([a-z_][a-z0-9_.]*)$/i.exec(statement);
-        if (show && show[1] !== undefined) {
-            return rowDescription([{ name: show[1].toLowerCase(), typeOid: TEXT_OID, typeLength: -1 }]);
+        const show = /^show\s+(?:"([^"]+)"|([a-z_][a-z0-9_.]*))$/i.exec(statement);
+        const showName = show?.[1] ?? show?.[2];
+        if (showName !== undefined) {
+            const name = canonicalGuc(showName) ?? showName.toLowerCase();
+            return rowDescription([{ name, typeOid: TEXT_OID, typeLength: -1 }]);
         }
         const parsed = parseStatement(statement);
         if (parsed.kind !== 'select') return noData();
@@ -1153,6 +1398,9 @@ class Session {
             return;
         }
         if (outcome.kind === 'command') {
+            for (const parameter of outcome.parameters ?? []) {
+                this.socket.write(parameterStatus(parameter.name, parameter.value));
+            }
             for (const notice of outcome.notices ?? []) {
                 this.socket.write(noticeResponse({ severity: 'NOTICE', code: notice.code, message: notice.message }));
             }
@@ -1174,8 +1422,15 @@ class Session {
                       ...(error.detail ? { detail: error.detail } : {}),
                       ...(error.hint ? { hint: error.hint } : {}),
                       ...(error.constraint ? { constraint: error.constraint } : {}),
+                      ...(error.schema ? { schema: error.schema } : {}),
+                      ...(error.table ? { table: error.table } : {}),
+                      ...(error.column ? { column: error.column } : {}),
+                      ...(error.dataType ? { dataType: error.dataType } : {}),
                       ...(error.position !== undefined ? { position: String(error.position + 1) } : {}),
                       ...(error.context ? { where: error.context } : {}),
+                      ...(error.sourceFile ? { file: error.sourceFile } : {}),
+                      ...(error.sourceLine ? { line: error.sourceLine } : {}),
+                      ...(error.sourceRoutine ? { routine: error.sourceRoutine } : {}),
                   }
                 : { severity: 'ERROR', code: 'XX000', message: error instanceof Error ? error.message : String(error) };
         this.socket.write(errorResponse(fields));

@@ -1,7 +1,7 @@
 /** Storage adapter and the per-message catalog/table working set. */
 
 import { ServerError } from '../errors.ts';
-import { type CatalogDoc, assertCatalog, emptyCatalog } from './catalog.ts';
+import { type CatalogDoc, type CursorViewRow, assertCatalog, emptyCatalog } from './catalog.ts';
 import { type ClusterDatabase, type ClusterRole, ClusterStore } from './cluster.ts';
 import type { SqlValue } from './types.ts';
 
@@ -75,6 +75,8 @@ export interface SessionRuntime {
     lastValue: number | null;
     /** `currval()` per sequence oid in this session. */
     lastBySequence: Map<number, number>;
+    /** Live `pg_cursors` rows for the portals this session has open. */
+    pgCursors?: () => CursorViewRow[];
 }
 
 export function createSessionRuntime(user = 'postgres', database = 'postgres'): SessionRuntime {
