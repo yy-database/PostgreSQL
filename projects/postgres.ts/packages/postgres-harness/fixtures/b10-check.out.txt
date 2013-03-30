@@ -1,0 +1,39 @@
+CREATE TABLE
+INSERT 0 1
+ALTER TABLE
+               Table "public.b10_ck"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ id     | integer |           | not null | 
+ v      | integer |           |          | 
+ w      | integer |           |          | 
+Indexes:
+    "b10_ck_pkey" PRIMARY KEY, btree (id)
+Check constraints:
+    "b10_ck_v_check" CHECK (v > 0)
+    "ck_nv" CHECK (v < 100) NOT VALID
+    "ck_w" CHECK (w < v)
+
+INSERT 0 1
+    conname     | contype | convalidated |   pg_get_constraintdef    
+----------------+---------+--------------+---------------------------
+ b10_ck_pkey    | p       | t            | PRIMARY KEY (id)
+ b10_ck_v_check | c       | t            | CHECK (v > 0)
+ ck_nv          | c       | f            | CHECK (v < 100) NOT VALID
+ ck_w           | c       | t            | CHECK (w < v)
+(4 rows)
+
+ALTER TABLE
+               Table "public.b10_ck"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ id     | integer |           | not null | 
+ v      | integer |           |          | 
+ w      | integer |           |          | 
+Indexes:
+    "b10_ck_pkey" PRIMARY KEY, btree (id)
+Check constraints:
+    "b10_ck_v_check" CHECK (v > 0)
+    "ck_nv" CHECK (v < 100)
+    "ck_w" CHECK (w < v)
+

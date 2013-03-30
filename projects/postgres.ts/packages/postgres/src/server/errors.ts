@@ -8,13 +8,16 @@ export class ServerError extends Error {
     context: string | undefined;
     /** Zero-based byte offset into the statement, surfaced as `P` on the wire. */
     position: number | undefined;
+    /** Constraint name, surfaced as `n` on the wire and read by drivers. */
+    constraint: string | undefined;
 
-    constructor(code: string, message: string, detail?: string, position?: number, hint?: string, context?: string) {
+    constructor(code: string, message: string, detail?: string, position?: number, hint?: string, context?: string, constraint?: string) {
         super(message);
         this.code = code;
         this.detail = detail;
         this.position = position;
         this.hint = hint;
         this.context = context;
+        this.constraint = constraint;
     }
 }

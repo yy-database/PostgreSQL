@@ -1,0 +1,18 @@
+CREATE TABLE b10_num (id serial, n numeric, nps numeric(10,2), f float8);
+INSERT INTO b10_num (n, nps, f) VALUES ('NaN', 'NaN', 'NaN');
+INSERT INTO b10_num (n, nps, f) VALUES ('Infinity', NULL, 'Infinity');
+INSERT INTO b10_num (n, nps, f) VALUES ('-Infinity', '-2.345', 1.5);
+INSERT INTO b10_num (n, nps, f) VALUES ('2.345', '2.345', -1.25);
+SELECT id, n, nps, f FROM b10_num ORDER BY id;
+SELECT 2.344::numeric(10,2) AS down, 2.355::numeric(10,2) AS up, -2.345::numeric(10,2) AS neg;
+SELECT COUNT(*) FROM b10_num WHERE n > 1000;
+SELECT n = 'NaN'::numeric AS nan_eq, n < 'Infinity'::numeric AS nan_lt_inf, n > 1::float8 AS nan_gt_f8 FROM b10_num WHERE id = 1;
+SELECT 'NaN'::numeric + 1 AS nan_plus, 'Infinity'::numeric - 'Infinity'::numeric AS inf_minus;
+SELECT 1.5::numeric = 1.5::float8 AS eq_f8, 1::numeric = 1.0000000000000002::float8 AS neq_f8, '1.234567890123456789'::numeric = 1.2345678901234567::float8 AS lossy;
+SELECT (1.234567890123456789::numeric)::float8 AS to_f8;
+SELECT 'NaN'::numeric(10,2) AS nan_typmod;
+SELECT 'Infinity'::numeric(10,2);
+INSERT INTO b10_num (nps) VALUES ('Infinity');
+INSERT INTO b10_num (nps) VALUES (99999999.995);
+UPDATE b10_num SET nps = -2.345 WHERE id = 3;
+SELECT id, nps FROM b10_num WHERE id = 3;

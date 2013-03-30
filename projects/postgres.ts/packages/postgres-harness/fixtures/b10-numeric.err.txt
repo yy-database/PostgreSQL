@@ -1,0 +1,6 @@
+psql:b10-numeric.sql:14: ERROR:  numeric field overflow
+DETAIL:  A field with precision 10, scale 2 cannot hold an infinite value.
+psql:b10-numeric.sql:15: ERROR:  numeric field overflow
+DETAIL:  A field with precision 10, scale 2 cannot hold an infinite value.
+psql:b10-numeric.sql:16: ERROR:  numeric field overflow
+DETAIL:  A field with precision 10, scale 2 must round to an absolute value less than 10^8.

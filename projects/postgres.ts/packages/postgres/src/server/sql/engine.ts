@@ -81,6 +81,7 @@ import {
     compareValues,
     formatType,
     formatValue,
+    numericSpecial,
     parseLiteral,
     type DataType,
     type SqlValue,
@@ -735,6 +736,7 @@ function fieldType(database: Database, expr: Expr, scope: Scope | undefined, par
             const left = fieldType(database, binary.left, scope, params);
             const right = fieldType(database, binary.right, scope, params);
             if (left.key === 'float8' || right.key === 'float8' || left.key === 'float4' || right.key === 'float4') return typeOf('float8');
+            if (left.key === 'numeric' || right.key === 'numeric') return typeOf('numeric');
             return left.key === 'text' || left.key === 'varchar' ? left : INT4;
         }
         case 'unary':
@@ -1098,7 +1100,12 @@ function evaluate(database: Database, expr: Expr, context: Context, params: SqlV
             const unary = expr as UnaryExpr;
             const value = evaluate(database, unary.expr, context, params);
             if (unary.op === 'not') return value === null ? null : value !== true;
-            if (typeof value !== 'number') return value === null ? null : value;
+            if (value === null) return null;
+            if (unary.op === '-' && typeof value === 'string') {
+                // Unquoted numeric literals keep their scale as strings.
+                return negateNumericText(value);
+            }
+            if (typeof value !== 'number') return value;
             return unary.op === '-' ? -value : value;
         }
         case 'binary':
@@ -1187,7 +1194,8 @@ function evaluateCast(database: Database, expr: CastExpr, context: Context, para
         return castValue(value, expr.type, { relationName: (oid) => relationDisplayName(database.catalog, oid) });
     }
     catch (error) {
-        if (error instanceof ServerError && error.position === undefined) error.position = expr.expr.start;
+        // Range errors surface from the executor without a source position.
+        if (error instanceof ServerError && error.position === undefined && error.code !== '22003') error.position = expr.expr.start;
         throw error;
     }
 }
@@ -1219,7 +1227,14 @@ function evaluateBinary(database: Database, expr: BinaryExpr, context: Context, 
         if (left === null || right === null) return null;
         return `${formatValue(left, TEXT)}${formatValue(right, TEXT)}`;
     }
-    if (['=', '<>', '<', '>', '<=', '>='].includes(expr.op)) return compareOperation(expr.op, left, right);
+    if (['=', '<>', '<', '>', '<=', '>='].includes(expr.op)) {
+        // Cross-type comparisons between `numeric` and a floating point type
+        // resolve to the float operator in PostgreSQL, so compare as doubles.
+        const scope: Scope = { columns: context.columns, outer: context.outer };
+        const leftType = fieldType(database, expr.left, scope, params);
+        const rightType = fieldType(database, expr.right, scope, params);
+        return compareOperation(expr.op, left, right, leftType, rightType);
+    }
     if (['~', '!~', '~*', '!~*'].includes(expr.op)) {
         if (left === null || right === null) return null;
         const flags = expr.op.includes('*') ? 'i' : '';
@@ -1247,14 +1262,46 @@ function evaluateBinary(database: Database, expr: BinaryExpr, context: Context, 
     }
 }
 
-function compareOperation(op: string, left: SqlValue, right: SqlValue): SqlValue {
+/** Flips the sign of a numeric spelling without losing its scale. */
+function negateNumericText(text: string): string {
+    const special = numericSpecial(text);
+    if (special === 'NaN') return 'NaN';
+    if (special === 'Infinity') return '-Infinity';
+    if (special === '-Infinity') return 'Infinity';
+    const bare = text.trim().replace(/^[-+]/, '');
+    if (/^0*(\.0*)?$/.test(bare)) return bare;
+    return `-${bare}`;
+}
+
+/** Converts one numeric value to the double PostgreSQL's float operators use. */
+function toDouble(value: SqlValue): number {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'boolean') return value ? 1 : 0;
+    const special = numericSpecial(String(value));
+    if (special === 'NaN') return Number.NaN;
+    if (special === 'Infinity') return Infinity;
+    if (special === '-Infinity') return -Infinity;
+    return Number(value);
+}
+
+/** Orders two doubles with PostgreSQL's `NaN`-last rule. */
+function compareDoubles(left: number, right: number): number {
+    if (Number.isNaN(left) && Number.isNaN(right)) return 0;
+    if (Number.isNaN(left)) return 1;
+    if (Number.isNaN(right)) return -1;
+    if (left === Infinity && right === Infinity) return 0;
+    if (left === Infinity) return 1;
+    if (right === Infinity) return -1;
+    if (left === -Infinity && right === -Infinity) return 0;
+    if (left === -Infinity) return -1;
+    if (right === -Infinity) return 1;
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareOperation(op: string, left: SqlValue, right: SqlValue, leftType?: DataType, rightType?: DataType): SqlValue {
     if (left === null || right === null) return null;
-    let a = left;
-    let b = right;
-    if (typeof a === 'number' && typeof b === 'string' && /^[-+]?\d+$/.test(b)) b = Number(b);
-    if (typeof b === 'number' && typeof a === 'string' && /^[-+]?\d+$/.test(a)) a = Number(a);
-    if (typeof a === 'string' && typeof b === 'number') b = Number(b);
-    const compared = compareValues(a, b);
+    const floating = [leftType?.key, rightType?.key].some((key) => key === 'float4' || key === 'float8');
+    const compared = floating ? compareDoubles(toDouble(left), toDouble(right)) : compareValues(left, right);
     switch (op) {
         case '=':
             return compared === 0;
@@ -1276,6 +1323,10 @@ function compareOperation(op: string, left: SqlValue, right: SqlValue): SqlValue
 function numeric(value: SqlValue): number {
     if (typeof value === 'number') return value;
     if (typeof value === 'boolean') return value ? 1 : 0;
+    const special = numericSpecial(String(value));
+    if (special === 'NaN') return Number.NaN;
+    if (special === 'Infinity') return Infinity;
+    if (special === '-Infinity') return -Infinity;
     const parsed = Number(value);
     if (Number.isNaN(parsed)) throw new ServerError('22P02', `invalid input syntax for type numeric: "${value}"`);
     return parsed;
@@ -1910,8 +1961,11 @@ function addForeignKey(
         conkey,
         confrelid: resolved.confrelid,
         confkey: resolved.confkey,
-        confupdtype: reference.onUpdate ?? ' ',
-        confdeltype: reference.onDelete ?? ' ',
+        confupdtype: reference.onUpdate ?? 'a',
+        confdeltype: reference.onDelete ?? 'a',
+        confmatchtype: reference.match,
+        condeferrable: reference.condeferrable,
+        condeferred: reference.condeferred,
         convalidated: true,
         checkSource: null,
     });
@@ -1965,7 +2019,14 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         let defaultValue: SqlValue = null;
         let defaultKind: 'value' | 'sequence' | null = null;
         let sequenceOid: number | null = null;
-        if (column.serial !== undefined) {
+        if (column.identity !== undefined) {
+            const sequenceName = `${statement.table.name}_${column.name}_seq`.slice(0, 63);
+            sequenceOid = addSequence(catalog, tableOid, sequenceName, ownerOid);
+            // Identity columns have no `pg_attrdef` entry, so `atthasdef` stays false.
+            defaultKind = 'sequence';
+            column.notNull = true;
+        }
+        else if (column.serial !== undefined) {
             const sequenceName = `${statement.table.name}_${column.name}_seq`.slice(0, 63);
             sequenceOid = addSequence(catalog, tableOid, sequenceName, ownerOid);
             defaultText = `nextval('${sequenceName}'::regclass)`;
@@ -2003,11 +2064,11 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
             defaultKind: entry.defaultKind,
             sequenceOid: entry.sequenceOid,
             defaultOid,
+            identity: entry.column.identity === 'always' ? 'a' : entry.column.identity === 'default' ? 'd' : '',
         });
     });
 
-    // Column-level checks precede table constraints in `pg_constraint`, and
-    // that is the order PostgreSQL evaluates them in.
+    // Column-level checks are registered before table constraints in `pg_constraint`.
     for (const column of statement.columns) {
         if (!column.check) continue;
         addCheckConstraint(
@@ -2239,6 +2300,7 @@ interface TableShape {
         defaultValue: SqlValue;
         defaultKind: 'value' | 'sequence' | null;
         sequenceOid: number | null;
+        identity: string;
     }[];
     uniqueIndexes: { name: string; attnums: number[]; predicate: Expr | null }[];
     checks: { name: string; expr: Expr }[];
@@ -2249,6 +2311,7 @@ interface TableShape {
         confkey: number[];
         confupdtype: string;
         confdeltype: string;
+        confmatchtype: string;
     }[];
 }
 
@@ -2266,6 +2329,7 @@ function shapeForRelation(database: Database, relation: { oid: number; name: str
             defaultValue: column.defaultValue,
             defaultKind: column.defaultKind,
             sequenceOid: column.sequenceOid,
+            identity: column.identity ?? '',
         }));
     const uniqueIndexes = catalog.indexes
         .filter((index) => index.relid === relation.oid && index.unique)
@@ -2286,6 +2350,7 @@ function shapeForRelation(database: Database, relation: { oid: number; name: str
             confkey: constraint.confkey,
             confupdtype: constraint.confupdtype,
             confdeltype: constraint.confdeltype,
+            confmatchtype: constraint.confmatchtype ?? 's',
         }));
     return { oid: relation.oid, name: relation.name, columns, uniqueIndexes, checks, foreignKeys };
 }
@@ -2352,12 +2417,19 @@ function renderRow(values: SqlValue[], shape: TableShape): string {
 }
 
 function enforceChecks(database: Database, shape: TableShape, values: SqlValue[]): void {
-    for (const check of shape.checks) {
-        if (evaluate(database, check.expr, rowContext(shape, database.catalog, values), []) !== true) {
+    // PostgreSQL evaluates CHECK constraints in name order, not creation order.
+    const checks = [...shape.checks].sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    for (const check of checks) {
+        // A CHECK passes when it evaluates to NULL, only FALSE fails.
+        if (evaluate(database, check.expr, rowContext(shape, database.catalog, values), []) === false) {
             throw new ServerError(
                 '23514',
                 `new row for relation "${shape.name}" violates check constraint "${check.name}"`,
                 `Failing row contains (${renderRow(values, shape)}).`,
+                undefined,
+                undefined,
+                undefined,
+                check.name,
             );
         }
     }
@@ -2375,7 +2447,22 @@ function parentHasKey(database: Database, fk: TableShape['foreignKeys'][number],
 function enforceForeignKeys(database: Database, shape: TableShape, values: SqlValue[]): void {
     for (const fk of shape.foreignKeys) {
         const key = fk.conkey.map((attnum) => values[attnum - 1] ?? null);
-        if (key.some((value) => value === null)) continue;
+        const nulls = key.filter((value) => value === null).length;
+        if (fk.confmatchtype === 'f') {
+            if (nulls === key.length) continue;
+            if (nulls > 0) {
+                throw new ServerError(
+                    '23503',
+                    `insert or update on table "${shape.name}" violates foreign key constraint "${fk.name}"`,
+                    'MATCH FULL does not allow mixing of null and nonnull key values.',
+                    undefined,
+                    undefined,
+                    undefined,
+                    fk.name,
+                );
+            }
+        }
+        else if (nulls > 0) continue;
         if (parentHasKey(database, fk, key)) continue;
         const parent = database.catalog.relations.find((candidate) => candidate.oid === fk.confrelid);
         const labels = fk.conkey.map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
@@ -2384,6 +2471,10 @@ function enforceForeignKeys(database: Database, shape: TableShape, values: SqlVa
             '23503',
             `insert or update on table "${shape.name}" violates foreign key constraint "${fk.name}"`,
             `Key (${labels})=(${rendered}) is not present in table "${parent?.name ?? fk.confrelid}".`,
+            undefined,
+            undefined,
+            undefined,
+            fk.name,
         );
     }
 }
@@ -2411,7 +2502,22 @@ function insertRows(database: Database, statement: InsertStatement, params: SqlV
             const column = targetColumns[index];
             if (!column) return;
             provided.add(column.attnum);
-            const raw = expr.kind === 'default' ? columnDefault(database, column) : evaluate(database, expr, emptyContext(), params);
+            let raw: SqlValue;
+            if (column.identity !== '' && statement.overriding === 'user') {
+                raw = columnDefault(database, column);
+            }
+            else {
+                if (column.identity === 'a' && expr.kind !== 'default' && statement.overriding !== 'system') {
+                    throw new ServerError(
+                        '428C9',
+                        `cannot insert a non-DEFAULT value into column "${column.name}"`,
+                        `Column "${column.name}" is an identity column defined as GENERATED ALWAYS.`,
+                        undefined,
+                        'Use OVERRIDING SYSTEM VALUE to override.',
+                    );
+                }
+                raw = expr.kind === 'default' ? columnDefault(database, column) : evaluate(database, expr, emptyContext(), params);
+            }
             values[column.attnum - 1] = coerce(raw, column.type);
         });
         for (const column of shape.columns) {
@@ -2451,6 +2557,8 @@ function removeRow(database: Database, shape: TableShape, key: string, values: S
         if (constraint.contype !== 'f' || constraint.confrelid !== shape.oid) continue;
         const child = shapeForOid(database, constraint.relid);
         const parentKey = constraint.confkey.map((attnum) => values[attnum - 1] ?? null);
+        // A null parent key never identifies a referenced row.
+        if (parentKey.some((value) => value === null)) continue;
         const matches = [...database.table(child.oid).entries()].filter(([, childValues]) =>
             constraint.conkey.every((attnum, position) => compareValues(childValues[attnum - 1] ?? null, parentKey[position] ?? null) === 0),
         );
@@ -2469,12 +2577,29 @@ function removeRow(database: Database, shape: TableShape, key: string, values: S
             }
             continue;
         }
+        if (constraint.confdeltype === 'd') {
+            for (const [childKey, childValues] of matches) {
+                const next = [...childValues];
+                for (const attnum of constraint.conkey) {
+                    const column = child.columns.find((candidate) => candidate.attnum === attnum);
+                    next[attnum - 1] = column ? columnDefault(database, column) : null;
+                }
+                validateRowShape(database, child, next);
+                database.updateRow(child.oid, childKey, next);
+                checkUnique(database, child, next, new Set([childKey]));
+            }
+            continue;
+        }
         const labels = constraint.confkey.map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
         const rendered = parentKey.map((value) => (value === null ? 'null' : formatValue(value, TEXT))).join(', ');
         throw new ServerError(
             '23503',
             `update or delete on table "${shape.name}" violates foreign key constraint "${constraint.name}" on table "${child.name}"`,
             `Key (${labels})=(${rendered}) is still referenced from table "${child.name}".`,
+            undefined,
+            undefined,
+            undefined,
+            constraint.name,
         );
     }
     database.deleteRow(shape.oid, key);
@@ -2491,6 +2616,8 @@ function updateRows(database: Database, statement: UpdateStatement, params: SqlV
     const alias = statement.table.name;
     const columns: Binding[] = shape.columns.map((column) => ({ alias, name: column.name, type: column.type }));
     const rows = database.table(shape.oid);
+    // Snapshot the old arrays: `updateRow` replaces them before ON UPDATE runs.
+    const original = new Map(rows);
     const updated: { key: string; values: SqlValue[] }[] = [];
     for (const [key, values] of [...rows.entries()]) {
         const context: Context = { columns, row: values, outer: undefined };
@@ -2498,13 +2625,23 @@ function updateRows(database: Database, statement: UpdateStatement, params: SqlV
         const next = [...values];
         for (const assignment of statement.assignments) {
             const column = shape.columns.find((candidate) => candidate.name === assignment.column)!;
-            next[column.attnum - 1] = coerce(evaluate(database, assignment.value, context, params), column.type);
+            if (column.identity === 'a' && assignment.value.kind !== 'default') {
+                throw new ServerError(
+                    '428C9',
+                    `column "${column.name}" can only be updated to DEFAULT`,
+                    `Column "${column.name}" is an identity column defined as GENERATED ALWAYS.`,
+                );
+            }
+            const raw = assignment.value.kind === 'default'
+                ? columnDefault(database, column)
+                : evaluate(database, assignment.value, context, params);
+            next[column.attnum - 1] = coerce(raw, column.type);
         }
         validateRowShape(database, shape, next);
         updated.push({ key, values: next });
     }
     for (const row of updated) database.updateRow(shape.oid, row.key, row.values);
-    propagateParentUpdates(database, shape, updated, rows);
+    propagateParentUpdates(database, shape, updated, original);
     for (const row of updated) checkUnique(database, shape, row.values, new Set([row.key]));
     return returningOutcome(database, statement.returning, shape, updated, params, `UPDATE ${updated.length}`);
 }
@@ -2525,6 +2662,7 @@ function propagateParentUpdates(
             if (!before) continue;
             const oldKey = constraint.confkey.map((attnum) => before[attnum - 1] ?? null);
             const newKey = constraint.confkey.map((attnum) => row.values[attnum - 1] ?? null);
+            if (oldKey.some((value) => value === null)) continue;
             if (oldKey.every((value, position) => compareValues(value, newKey[position] ?? null) === 0)) continue;
             const matches = [...database.table(child.oid).entries()].filter(([, childValues]) =>
                 constraint.conkey.every((attnum, position) => compareValues(childValues[attnum - 1] ?? null, oldKey[position] ?? null) === 0),
@@ -2548,12 +2686,27 @@ function propagateParentUpdates(
                     checkUnique(database, child, next, new Set([childKey]));
                     continue;
                 }
+                if (constraint.confupdtype === 'd') {
+                    const next = [...childValues];
+                    for (const attnum of constraint.conkey) {
+                        const column = child.columns.find((candidate) => candidate.attnum === attnum);
+                        next[attnum - 1] = column ? columnDefault(database, column) : null;
+                    }
+                    validateRowShape(database, child, next);
+                    database.updateRow(child.oid, childKey, next);
+                    checkUnique(database, child, next, new Set([childKey]));
+                    continue;
+                }
                 const labels = constraint.confkey.map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
                 const rendered = oldKey.map((value) => (value === null ? 'null' : formatValue(value, TEXT))).join(', ');
                 throw new ServerError(
                     '23503',
                     `update or delete on table "${shape.name}" violates foreign key constraint "${constraint.name}" on table "${child.name}"`,
                     `Key (${labels})=(${rendered}) is still referenced from table "${child.name}".`,
+                    undefined,
+                    undefined,
+                    undefined,
+                    constraint.name,
                 );
             }
         }
@@ -2581,7 +2734,7 @@ function deleteRows(database: Database, statement: DeleteStatement, params: SqlV
 function validateCheck(database: Database, relation: { oid: number; name: string }, name: string, source: string): void {
     const expr = parseExpression(source);
     for (const values of database.table(relation.oid).values()) {
-        if (evaluate(database, expr, rowContext(relation, database.catalog, values), []) !== true) {
+        if (evaluate(database, expr, rowContext(relation, database.catalog, values), []) === false) {
             throw new ServerError(
                 '23514',
                 `check constraint "${name}" of relation "${relation.name}" is violated by some row`,
@@ -2599,7 +2752,22 @@ function validateForeignKeys(database: Database, relation: { oid: number; name: 
     if (!fk) return;
     for (const values of database.table(relation.oid).values()) {
         const key = fk.conkey.map((attnum) => values[attnum - 1] ?? null);
-        if (key.some((value) => value === null)) continue;
+        const nulls = key.filter((value) => value === null).length;
+        if (fk.confmatchtype === 'f') {
+            if (nulls === key.length) continue;
+            if (nulls > 0) {
+                throw new ServerError(
+                    '23503',
+                    `insert or update on table "${relation.name}" violates foreign key constraint "${name}"`,
+                    'MATCH FULL does not allow mixing of null and nonnull key values.',
+                    undefined,
+                    undefined,
+                    undefined,
+                    name,
+                );
+            }
+        }
+        else if (nulls > 0) continue;
         if (parentHasKey(database, fk, key)) continue;
         const parent = database.catalog.relations.find((candidate) => candidate.oid === fk.confrelid);
         const labels = fk.conkey.map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
@@ -2608,6 +2776,10 @@ function validateForeignKeys(database: Database, relation: { oid: number; name: 
             '23503',
             `insert or update on table "${relation.name}" violates foreign key constraint "${name}"`,
             `Key (${labels})=(${rendered}) is not present in table "${parent?.name ?? fk.confrelid}".`,
+            undefined,
+            undefined,
+            undefined,
+            name,
         );
     }
 }

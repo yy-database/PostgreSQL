@@ -368,6 +368,7 @@ export function copyIn(database: Database, statement: CopyStatement, input: stri
             columns,
             rows: [values],
             defaultValues: false,
+            overriding: undefined,
             returning: undefined,
         };
         try {

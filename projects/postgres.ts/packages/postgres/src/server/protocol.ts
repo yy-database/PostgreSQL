@@ -32,6 +32,8 @@ export interface MessageFields {
     message: string;
     detail?: string;
     hint?: string;
+    /** `n` field, the violated constraint's name. */
+    constraint?: string;
     position?: string;
     /** `W` field, printed by psql as `CONTEXT:  ...`. */
     where?: string;
@@ -172,6 +174,7 @@ export function messageFieldsResponse(tag: string, fields: MessageFields): Buffe
     ];
     if (fields.detail !== undefined) parts.push(field('D', fields.detail));
     if (fields.hint !== undefined) parts.push(field('H', fields.hint));
+    if (fields.constraint !== undefined) parts.push(field('n', fields.constraint));
     if (fields.position !== undefined) parts.push(field('P', fields.position));
     if (fields.where !== undefined) parts.push(field('W', fields.where));
     if (fields.file !== undefined) parts.push(field('F', fields.file));

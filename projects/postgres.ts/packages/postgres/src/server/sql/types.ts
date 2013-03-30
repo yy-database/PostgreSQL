@@ -387,13 +387,35 @@ function renderNumeric(sign: string, magnitude: bigint, scale: number): string {
     return `${magnitude === 0n ? '' : sign}${padded.slice(0, split)}.${padded.slice(split)}`;
 }
 
+/** Recognizes `NaN` and the two infinities that unconstrained `numeric` accepts. */
+export function numericSpecial(text: string): 'NaN' | 'Infinity' | '-Infinity' | null {
+    const trimmed = text.trim().toLowerCase();
+    if (trimmed === 'nan') return 'NaN';
+    if (/^[-+]?inf(inity)?$/.test(trimmed)) return trimmed.startsWith('-') ? '-Infinity' : 'Infinity';
+    return null;
+}
+
 /**
  * Normalizes a numeric literal, applying the column's precision and scale.
  *
  * Rounding is half away from zero, like PostgreSQL. A value that rounds to an
- * absolute value of `10^precision` or more is a `22003` overflow.
+ * absolute value of `10^precision` or more is a `22003` overflow. `NaN` is
+ * storable at any precision while the infinities only fit an unconstrained
+ * `numeric`.
  */
 function numericText(type: DataType, text: string): string {
+    const special = numericSpecial(text);
+    if (special !== null) {
+        if (type.typmod > 0 && special !== 'NaN') {
+            const { precision, scale } = numericPrecisionScale(type.typmod);
+            throw new ServerError(
+                '22003',
+                'numeric field overflow',
+                `A field with precision ${precision}, scale ${scale} cannot hold an infinite value.`,
+            );
+        }
+        return special;
+    }
     const parts = decimalParts(text);
     if (!parts) throw invalid(type, text);
     let { magnitude, scale } = parts;
@@ -504,32 +526,61 @@ export function formatValue(value: SqlValue, type: DataType): string | null {
     return value;
 }
 
+/** Ranks `NaN` above `Infinity`, which sits above every finite decimal. */
+function specialRank(text: string): number | null {
+    switch (numericSpecial(text)) {
+        case '-Infinity':
+            return -1;
+        case 'Infinity':
+            return 1;
+        case 'NaN':
+            return 2;
+        default:
+            return null;
+    }
+}
+
+function compareNumbers(left: number, right: number): number {
+    if (Number.isNaN(left) && Number.isNaN(right)) return 0;
+    if (Number.isNaN(left)) return 1;
+    if (Number.isNaN(right)) return -1;
+    if (left === Infinity && right === Infinity) return 0;
+    if (left === Infinity) return 1;
+    if (right === Infinity) return -1;
+    if (left === -Infinity && right === -Infinity) return 0;
+    if (left === -Infinity) return -1;
+    if (right === -Infinity) return 1;
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** Compares two decimal spellings exactly, `NaN` and infinities included. */
+function compareDecimalText(left: string, right: string): number | null {
+    const leftSpecial = specialRank(left);
+    const rightSpecial = specialRank(right);
+    const leftDecimal = decimalParts(left);
+    const rightDecimal = decimalParts(right);
+    if (leftSpecial === null && !leftDecimal) return null;
+    if (rightSpecial === null && !rightDecimal) return null;
+    if (leftSpecial !== null || rightSpecial !== null) {
+        const leftRank = leftSpecial ?? 0;
+        const rightRank = rightSpecial ?? 0;
+        return leftRank < rightRank ? -1 : leftRank > rightRank ? 1 : 0;
+    }
+    const scale = Math.max(leftDecimal!.scale, rightDecimal!.scale);
+    const magnitude = (parts: DecimalParts): bigint =>
+        (parts.negative ? -1n : 1n) * parts.magnitude * 10n ** BigInt(scale - parts.scale);
+    const leftValue = magnitude(leftDecimal!);
+    const rightValue = magnitude(rightDecimal!);
+    return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+}
+
 /** Compares two non-null values; `null` sorts last in ascending order. */
 export function compareValues(left: SqlValue, right: SqlValue): number {
     if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
-    if (typeof left === 'number' && typeof right === 'number') {
-        if (Number.isNaN(left) && Number.isNaN(right)) return 0;
-        if (Number.isNaN(left)) return 1;
-        if (Number.isNaN(right)) return -1;
-        if (left === Infinity && right === Infinity) return 0;
-        if (left === Infinity) return 1;
-        if (right === Infinity) return -1;
-        if (left === -Infinity && right === -Infinity) return 0;
-        if (left === -Infinity) return -1;
-        if (right === -Infinity) return 1;
-        return left < right ? -1 : left > right ? 1 : 0;
-    }
+    if (typeof left === 'number' && typeof right === 'number') return compareNumbers(left, right);
     const a = String(left);
     const b = String(right);
-    const leftDecimal = decimalParts(a);
-    const rightDecimal = decimalParts(b);
-    if (leftDecimal && rightDecimal) {
-        const scale = Math.max(leftDecimal.scale, rightDecimal.scale);
-        const magnitude = (parts: DecimalParts): bigint =>
-            (parts.negative ? -1n : 1n) * parts.magnitude * 10n ** BigInt(scale - parts.scale);
-        const leftValue = magnitude(leftDecimal);
-        const rightValue = magnitude(rightDecimal);
-        return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
-    }
+    const compared = compareDecimalText(a, b);
+    if (compared !== null) return compared;
     return a < b ? -1 : a > b ? 1 : 0;
 }

@@ -1,0 +1,35 @@
+CREATE TABLE b10_p (id int PRIMARY KEY, a int, b int, UNIQUE (a, b));
+CREATE TABLE b10_c (id int PRIMARY KEY, pid int REFERENCES b10_p(id) ON DELETE CASCADE ON UPDATE CASCADE);
+CREATE TABLE b10_u (id int PRIMARY KEY, pid int REFERENCES b10_p(id) ON DELETE SET NULL ON UPDATE SET NULL);
+CREATE TABLE b10_d (id int PRIMARY KEY, pid int DEFAULT 2 REFERENCES b10_p(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT);
+CREATE TABLE b10_r (id int PRIMARY KEY, pid int REFERENCES b10_p(id) ON DELETE RESTRICT ON UPDATE RESTRICT);
+CREATE TABLE b10_n (id int PRIMARY KEY, pid int REFERENCES b10_p(id) ON DELETE NO ACTION ON UPDATE NO ACTION);
+CREATE TABLE b10_m (id int PRIMARY KEY, aid int, bid int, FOREIGN KEY (aid, bid) REFERENCES b10_p(a, b) MATCH FULL DEFERRABLE INITIALLY DEFERRED);
+\d b10_p
+\d b10_m
+SELECT conname, confupdtype, confdeltype, confmatchtype, condeferrable, condeferred FROM pg_constraint WHERE contype = 'f' AND conrelid::regclass::text IN ('b10_c', 'b10_u', 'b10_d', 'b10_r', 'b10_n', 'b10_m') ORDER BY conname;
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'b10_m_aid_bid_fkey';
+INSERT INTO b10_p VALUES (1, 1, 1), (2, 2, 2);
+INSERT INTO b10_c VALUES (10, 1), (11, 2);
+INSERT INTO b10_u VALUES (12, 1);
+INSERT INTO b10_d VALUES (15, 1);
+INSERT INTO b10_c VALUES (16, 99);
+INSERT INTO b10_m VALUES (20, 1, NULL);
+INSERT INTO b10_m VALUES (21, 2, 2);
+INSERT INTO b10_m VALUES (22, NULL, NULL);
+UPDATE b10_p SET id = 5 WHERE id = 1;
+SELECT id, pid FROM b10_c ORDER BY id;
+SELECT id, pid FROM b10_u ORDER BY id;
+SELECT id, pid FROM b10_d ORDER BY id;
+INSERT INTO b10_u VALUES (18, 5);
+INSERT INTO b10_d VALUES (17, 5);
+INSERT INTO b10_r VALUES (13, 5);
+INSERT INTO b10_n VALUES (14, 5);
+DELETE FROM b10_p WHERE id = 5;
+DELETE FROM b10_r WHERE id = 13;
+DELETE FROM b10_p WHERE id = 5;
+DELETE FROM b10_n WHERE id = 14;
+DELETE FROM b10_p WHERE id = 5;
+SELECT id, pid FROM b10_c ORDER BY id;
+SELECT id, pid FROM b10_u ORDER BY id;
+SELECT id, pid FROM b10_d ORDER BY id;

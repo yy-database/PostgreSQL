@@ -1,0 +1,97 @@
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+               Table "public.b10_p"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ id     | integer |           | not null | 
+ a      | integer |           |          | 
+ b      | integer |           |          | 
+Indexes:
+    "b10_p_pkey" PRIMARY KEY, btree (id)
+    "b10_p_a_b_key" UNIQUE CONSTRAINT, btree (a, b)
+Referenced by:
+    TABLE "b10_c" CONSTRAINT "b10_c_pid_fkey" FOREIGN KEY (pid) REFERENCES b10_p(id) ON UPDATE CASCADE ON DELETE CASCADE
+    TABLE "b10_d" CONSTRAINT "b10_d_pid_fkey" FOREIGN KEY (pid) REFERENCES b10_p(id) ON UPDATE SET DEFAULT ON DELETE SET DEFAULT
+    TABLE "b10_m" CONSTRAINT "b10_m_aid_bid_fkey" FOREIGN KEY (aid, bid) REFERENCES b10_p(a, b) MATCH FULL DEFERRABLE INITIALLY DEFERRED
+    TABLE "b10_n" CONSTRAINT "b10_n_pid_fkey" FOREIGN KEY (pid) REFERENCES b10_p(id)
+    TABLE "b10_r" CONSTRAINT "b10_r_pid_fkey" FOREIGN KEY (pid) REFERENCES b10_p(id) ON UPDATE RESTRICT ON DELETE RESTRICT
+    TABLE "b10_u" CONSTRAINT "b10_u_pid_fkey" FOREIGN KEY (pid) REFERENCES b10_p(id) ON UPDATE SET NULL ON DELETE SET NULL
+
+               Table "public.b10_m"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ id     | integer |           | not null | 
+ aid    | integer |           |          | 
+ bid    | integer |           |          | 
+Indexes:
+    "b10_m_pkey" PRIMARY KEY, btree (id)
+Foreign-key constraints:
+    "b10_m_aid_bid_fkey" FOREIGN KEY (aid, bid) REFERENCES b10_p(a, b) MATCH FULL DEFERRABLE INITIALLY DEFERRED
+
+      conname       | confupdtype | confdeltype | confmatchtype | condeferrable | condeferred 
+--------------------+-------------+-------------+---------------+---------------+-------------
+ b10_c_pid_fkey     | c           | c           | s             | f             | f
+ b10_d_pid_fkey     | d           | d           | s             | f             | f
+ b10_m_aid_bid_fkey | a           | a           | f             | t             | t
+ b10_n_pid_fkey     | a           | a           | s             | f             | f
+ b10_r_pid_fkey     | r           | r           | s             | f             | f
+ b10_u_pid_fkey     | n           | n           | s             | f             | f
+(6 rows)
+
+                                  pg_get_constraintdef                                  
+----------------------------------------------------------------------------------------
+ FOREIGN KEY (aid, bid) REFERENCES b10_p(a, b) MATCH FULL DEFERRABLE INITIALLY DEFERRED
+(1 row)
+
+INSERT 0 2
+INSERT 0 2
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+UPDATE 1
+ id | pid 
+----+-----
+ 10 |   5
+ 11 |   2
+(2 rows)
+
+ id | pid 
+----+-----
+ 12 |    
+(1 row)
+
+ id | pid 
+----+-----
+ 15 |   2
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+DELETE 1
+DELETE 1
+DELETE 1
+ id | pid 
+----+-----
+ 11 |   2
+(1 row)
+
+ id | pid 
+----+-----
+ 12 |    
+ 18 |    
+(2 rows)
+
+ id | pid 
+----+-----
+ 15 |   2
+ 17 |   2
+(2 rows)
+

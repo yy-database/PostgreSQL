@@ -1,0 +1,6 @@
+psql:b10-check.sql:5: ERROR:  new row for relation "b10_ck" violates check constraint "b10_ck_v_check"
+DETAIL:  Failing row contains (2, -1, 0).
+psql:b10-check.sql:6: ERROR:  new row for relation "b10_ck" violates check constraint "ck_nv"
+DETAIL:  Failing row contains (3, 150, 10).
+psql:b10-check.sql:7: ERROR:  new row for relation "b10_ck" violates check constraint "ck_w"
+DETAIL:  Failing row contains (4, 5, 6).

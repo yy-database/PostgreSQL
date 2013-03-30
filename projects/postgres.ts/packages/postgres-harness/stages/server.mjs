@@ -230,6 +230,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batch8 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch8-')) });
     const batch9 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch9-')) });
     const batch9fixture = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch9-fixture-')) });
+    const batch10 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch10-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -1913,6 +1914,88 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         });
 
+        await check('b10/numeric-special', async () => {
+            await withClient(batch10, async (client) => {
+                const values = await client.query(
+                    "SELECT 'NaN'::numeric > 'Infinity'::numeric AS nan_gt_inf, 'NaN'::numeric = 'NaN'::float8 AS nan_eq_f8, '1.234567890123456789'::numeric = 1.2345678901234567::float8 AS lossy, 'NaN'::numeric + 1 AS nan_plus",
+                );
+                assert(
+                    JSON.stringify(values.rows) === '[{"nan_gt_inf":true,"nan_eq_f8":true,"lossy":true,"nan_plus":"NaN"}]',
+                    `numeric specials are ${JSON.stringify(values.rows)}`,
+                );
+                const invalid = await capture(client.query("SELECT 'abc'::numeric"));
+                assert(invalid?.code === '22P02', `invalid numeric is ${invalid?.code}`);
+                assert(invalid.message === 'invalid input syntax for type numeric: "abc"', `invalid numeric message is ${invalid?.message}`);
+                const overflow = await capture(client.query("SELECT 'Infinity'::numeric(10,2)"));
+                assert(overflow?.code === '22003' && overflow.message === 'numeric field overflow', `numeric overflow is ${overflow?.code}/${overflow?.message}`);
+                assert(overflow.detail === 'A field with precision 10, scale 2 cannot hold an infinite value.', `overflow detail is ${overflow?.detail}`);
+            });
+        });
+
+        await check('b10/check-fields', async () => {
+            await withClient(batch10, async (client) => {
+                await client.query('CREATE TABLE b10e_ck (id int, v int CHECK (v > 0), w int, CONSTRAINT ck_w CHECK (w < v))');
+                const first = await capture(client.query('INSERT INTO b10e_ck VALUES (1, -1, 0)'));
+                assert(first?.code === '23514', `check code is ${first?.code}`);
+                assert(first.constraint === 'b10e_ck_v_check', `check constraint is ${first?.constraint}`);
+                assert(first.detail === 'Failing row contains (1, -1, 0).', `check detail is ${first?.detail}`);
+                const table = await capture(client.query('INSERT INTO b10e_ck VALUES (2, 1, 2)'));
+                assert(table?.code === '23514' && table.constraint === 'ck_w', `table check is ${table?.code}/${table?.constraint}`);
+            });
+        });
+
+        await check('b10/identity', async () => {
+            await withClient(batch10, async (client) => {
+                await client.query('CREATE TABLE b10e_id (id int GENERATED ALWAYS AS IDENTITY, v text)');
+                const inserted = await client.query("INSERT INTO b10e_id (v) VALUES ('a') RETURNING id");
+                assert(inserted.rows[0].id === 1, `identity first is ${inserted.rows[0].id}`);
+                const explicit = await capture(client.query("INSERT INTO b10e_id (id, v) VALUES (5, 'b')"));
+                assert(explicit?.code === '428C9', `identity code is ${explicit?.code}`);
+                assert(explicit.message === 'cannot insert a non-DEFAULT value into column "id"', `identity message is ${explicit?.message}`);
+                assert(explicit.detail === 'Column "id" is an identity column defined as GENERATED ALWAYS.', `identity detail is ${explicit?.detail}`);
+                assert(explicit.hint === 'Use OVERRIDING SYSTEM VALUE to override.', `identity hint is ${explicit?.hint}`);
+                const overridden = await client.query("INSERT INTO b10e_id (id, v) OVERRIDING SYSTEM VALUE VALUES (5, 'b') RETURNING id");
+                assert(overridden.rows[0].id === 5, `overriding id is ${overridden.rows[0].id}`);
+                const next = await client.query("INSERT INTO b10e_id (v) VALUES ('c') RETURNING id");
+                assert(next.rows[0].id === 2, `identity next is ${next.rows[0].id}`);
+                const updated = await capture(client.query('UPDATE b10e_id SET id = 7 WHERE id = 1'));
+                assert(updated?.code === '428C9' && updated.message === 'column "id" can only be updated to DEFAULT', `identity update is ${updated?.code}/${updated?.message}`);
+            });
+        });
+
+        await check('b10/foreign-keys', async () => {
+            await withClient(batch10, async (client) => {
+                await client.query('CREATE TABLE b10e_p (id int PRIMARY KEY)');
+                await client.query('CREATE TABLE b10e_c (id int PRIMARY KEY, pid int REFERENCES b10e_p(id))');
+                const inserted = await client.query('INSERT INTO b10e_p VALUES (1), (2)');
+                assert(inserted.rowCount === 2, `parent rows are ${inserted.rowCount}`);
+                const missing = await capture(client.query('INSERT INTO b10e_c VALUES (10, 9)'));
+                assert(missing?.code === '23503', `foreign key code is ${missing?.code}`);
+                assert(missing.constraint === 'b10e_c_pid_fkey', `foreign key constraint is ${missing?.constraint}`);
+                assert(missing.detail === 'Key (pid)=(9) is not present in table "b10e_p".', `foreign key detail is ${missing?.detail}`);
+                await client.query('INSERT INTO b10e_c VALUES (10, 1)');
+                const restrict = await capture(client.query('DELETE FROM b10e_p WHERE id = 1'));
+                assert(restrict?.code === '23503', `restrict code is ${restrict?.code}`);
+                assert(restrict.message === 'update or delete on table "b10e_p" violates foreign key constraint "b10e_c_pid_fkey" on table "b10e_c"');
+                assert(restrict.detail === 'Key (id)=(1) is still referenced from table "b10e_c".', `restrict detail is ${restrict?.detail}`);
+                await client.query('CREATE TABLE b10e_pp (a int, b int, UNIQUE (a, b))');
+                await client.query(
+                    'CREATE TABLE b10e_m (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES b10e_pp(a, b) MATCH FULL DEFERRABLE INITIALLY DEFERRED)',
+                );
+                const match = await capture(client.query('INSERT INTO b10e_m VALUES (20, 1, NULL)'));
+                assert(match?.code === '23503', `match full code is ${match?.code}`);
+                assert(match.detail === 'MATCH FULL does not allow mixing of null and nonnull key values.', `match full detail is ${match?.detail}`);
+                assert(match.constraint === 'b10e_m_a_b_fkey', `match full constraint is ${match?.constraint}`);
+                const stored = await client.query(
+                    "SELECT confmatchtype, condeferrable, condeferred FROM pg_constraint WHERE conname = 'b10e_m_a_b_fkey'",
+                );
+                assert(
+                    JSON.stringify(stored.rows) === '[{"confmatchtype":"f","condeferrable":true,"condeferred":true}]',
+                    `stored foreign key is ${JSON.stringify(stored.rows)}`,
+                );
+            });
+        });
+
         if (process.env.PSQL_BIN) {
             const runFixture = (server, file) =>
                 new Promise((resolve, reject) => {
@@ -1960,13 +2043,19 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             await checkFixture('psql/b7-database', 'b7-database', 'b7-database.sql', batch7);
             await checkFixture('psql/b8-options', 'b8-options', 'b8-options.sql', batch8);
             await checkFixture('psql/b9-roles', 'b9-roles', 'b9-roles.sql', batch9fixture);
+            await checkFixture('psql/b10-numeric', 'b10-numeric', 'b10-numeric.sql', batch10);
+            await checkFixture('psql/b10-identity', 'b10-identity', 'b10-identity.sql', batch10);
+            await checkFixture('psql/b10-check', 'b10-check', 'b10-check.sql', batch10);
+            await checkFixture('psql/b10-foreign', 'b10-foreign', 'b10-foreign.sql', batch10);
         }
 
         return {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 90,
+            // 90 before batch 10, plus `b10/numeric-special`, `b10/check-fields`,
+            // `b10/identity`, `b10/foreign-keys` and the four `psql/b10-*` fixtures.
+            floor: 98,
         };
     } finally {
         await trust.close();
@@ -1979,5 +2068,6 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batch8.close();
         await batch9.close();
         await batch9fixture.close();
+        await batch10.close();
     }
 }

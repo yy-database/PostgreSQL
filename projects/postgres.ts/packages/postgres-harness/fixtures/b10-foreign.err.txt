@@ -1,0 +1,8 @@
+psql:b10-foreign.sql:16: ERROR:  insert or update on table "b10_c" violates foreign key constraint "b10_c_pid_fkey"
+DETAIL:  Key (pid)=(99) is not present in table "b10_p".
+psql:b10-foreign.sql:17: ERROR:  insert or update on table "b10_m" violates foreign key constraint "b10_m_aid_bid_fkey"
+DETAIL:  MATCH FULL does not allow mixing of null and nonnull key values.
+psql:b10-foreign.sql:28: ERROR:  update or delete on table "b10_p" violates foreign key constraint "b10_r_pid_fkey" on table "b10_r"
+DETAIL:  Key (id)=(5) is still referenced from table "b10_r".
+psql:b10-foreign.sql:30: ERROR:  update or delete on table "b10_p" violates foreign key constraint "b10_n_pid_fkey" on table "b10_n"
+DETAIL:  Key (id)=(5) is still referenced from table "b10_n".

@@ -1,0 +1,54 @@
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ id |     n     |  nps  |    f     
+----+-----------+-------+----------
+  1 |       NaN |   NaN |      NaN
+  2 |  Infinity |       | Infinity
+  3 | -Infinity | -2.35 |      1.5
+  4 |     2.345 |  2.35 |    -1.25
+(4 rows)
+
+ down |  up  |  neg  
+------+------+-------
+ 2.34 | 2.36 | -2.35
+(1 row)
+
+ count 
+-------
+     2
+(1 row)
+
+ nan_eq | nan_lt_inf | nan_gt_f8 
+--------+------------+-----------
+ t      | f          | t
+(1 row)
+
+ nan_plus | inf_minus 
+----------+-----------
+      NaN |       NaN
+(1 row)
+
+ eq_f8 | neq_f8 | lossy 
+-------+--------+-------
+ t     | f      | t
+(1 row)
+
+       to_f8        
+--------------------
+ 1.2345678901234567
+(1 row)
+
+ nan_typmod 
+------------
+        NaN
+(1 row)
+
+UPDATE 1
+ id |  nps  
+----+-------
+  3 | -2.35
+(1 row)
+

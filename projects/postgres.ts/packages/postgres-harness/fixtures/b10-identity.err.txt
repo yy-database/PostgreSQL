@@ -1,0 +1,5 @@
+psql:b10-identity.sql:9: ERROR:  cannot insert a non-DEFAULT value into column "id"
+DETAIL:  Column "id" is an identity column defined as GENERATED ALWAYS.
+HINT:  Use OVERRIDING SYSTEM VALUE to override.
+psql:b10-identity.sql:19: ERROR:  column "id" can only be updated to DEFAULT
+DETAIL:  Column "id" is an identity column defined as GENERATED ALWAYS.

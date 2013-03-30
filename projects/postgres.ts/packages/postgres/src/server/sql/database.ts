@@ -5,6 +5,11 @@ import { type CatalogDoc, assertCatalog, emptyCatalog } from './catalog.ts';
 import { type ClusterDatabase, type ClusterRole, ClusterStore } from './cluster.ts';
 import type { SqlValue } from './types.ts';
 
+/** Keeps `NaN` and the infinities intact, since JSON would turn them into null. */
+function serializeRow(values: SqlValue[]): string {
+    return JSON.stringify(values, (_key, value) => (typeof value === 'number' && !Number.isFinite(value) ? String(value) : value));
+}
+
 export interface StoredRow {
     key: Uint8Array;
     value: Uint8Array;
@@ -252,7 +257,7 @@ export class Database {
                     kind: values === null ? 'delete' : 'put',
                     namespace: dataNamespace(relOid),
                     key: encode(key),
-                    value: values === null ? undefined : encode(JSON.stringify(values)),
+                    value: values === null ? undefined : encode(serializeRow(values)),
                 });
             }
         }

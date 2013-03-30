@@ -50,6 +50,8 @@ export interface UserColumn {
     /** Sequence oid when `defaultKind` is `sequence`. */
     sequenceOid: number | null;
     defaultOid: number | null;
+    /** `pg_attribute.attidentity`: `a` always, `d` by default, empty otherwise. */
+    identity: string;
 }
 
 export interface UserIndex {
@@ -77,6 +79,10 @@ export interface UserConstraint {
     /** `a` no action, `r` restrict, `c` cascade, `n` set null, `d` set default. */
     confupdtype: string;
     confdeltype: string;
+    /** `s` simple, `f` full, `p` partial. */
+    confmatchtype?: string;
+    condeferrable?: boolean;
+    condeferred?: boolean;
     convalidated: boolean;
     /** Pretty expression text for `CHECK`, or `null`. */
     checkSource: string | null;
@@ -750,7 +756,7 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[], rol
             attnotnull: column.notNull,
             atthasdef: column.defaultText !== null,
             atthasmissing: false,
-            attidentity: '',
+            attidentity: column.identity ?? '',
             attgenerated: '',
             attisdropped: false,
             attislocal: true,
@@ -844,8 +850,8 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[], rol
             conname: constraint.name,
             connamespace: PUBLIC_NAMESPACE,
             contype: constraint.contype,
-            condeferrable: false,
-            condeferred: false,
+            condeferrable: constraint.condeferrable ?? false,
+            condeferred: constraint.condeferred ?? false,
             convalidated: constraint.convalidated,
             conrelid: constraint.relid,
             contypid: 0,
@@ -854,7 +860,7 @@ export function catalogTables(doc: CatalogDoc, databases: ClusterDatabase[], rol
             confrelid: constraint.confrelid,
             confupdtype: constraint.confupdtype,
             confdeltype: constraint.confdeltype,
-            confmatchtype: ' ',
+            confmatchtype: constraint.confmatchtype ?? 's',
             conislocal: true,
             coninhcount: 0,
             connoinherit: true,
@@ -993,12 +999,14 @@ export function pgGetConstraintDef(doc: CatalogDoc, constraintOid: SqlValue, pre
             const referencedNames = columnNames(doc, constraint.confrelid, constraint.confkey);
             const target = `${referenced?.name ?? `oid${constraint.confrelid}`}(${referencedNames.join(', ')})`;
             let definition = `FOREIGN KEY (${names.join(', ')}) REFERENCES ${target}`;
-            if (constraint.confupdtype !== ' ' && constraint.confupdtype !== 'a') {
+            if (constraint.confmatchtype === 'f') definition += ' MATCH FULL';
+            if (constraint.confupdtype !== 'a') {
                 definition += ` ON UPDATE ${REFERENCE_ACTIONS[constraint.confupdtype] ?? constraint.confupdtype}`;
             }
-            if (constraint.confdeltype !== ' ' && constraint.confdeltype !== 'a') {
+            if (constraint.confdeltype !== 'a') {
                 definition += ` ON DELETE ${REFERENCE_ACTIONS[constraint.confdeltype] ?? constraint.confdeltype}`;
             }
+            if (constraint.condeferrable) definition += constraint.condeferred ? ' DEFERRABLE INITIALLY DEFERRED' : ' DEFERRABLE';
             return definition;
         }
     }

@@ -1173,6 +1173,7 @@ class Session {
                       message: error.message,
                       ...(error.detail ? { detail: error.detail } : {}),
                       ...(error.hint ? { hint: error.hint } : {}),
+                      ...(error.constraint ? { constraint: error.constraint } : {}),
                       ...(error.position !== undefined ? { position: String(error.position + 1) } : {}),
                       ...(error.context ? { where: error.context } : {}),
                   }
