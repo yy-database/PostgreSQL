@@ -162,7 +162,7 @@ remaining 5 seconds and 25 crates.
 
 ## SQL compatibility gaps
 
-[`docs/sql-compatibility-gaps.md`](./docs/sql-compatibility-gaps.md) is the
+[`projects/postgres.ts/packages/postgres-harness/gaps`](projects/postgres.ts/packages/postgres-harness/gaps/sql-compatibility-gaps.md) is the
 current gap list. It is regenerated from a seeded corpus by
 
 ```shell
