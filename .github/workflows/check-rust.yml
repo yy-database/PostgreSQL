@@ -1,0 +1,49 @@
+name: Check Rust
+
+# Rust workspace fmt / build / test. TypeScript: check-typescript.yml
+# Python: check-python.yml. Publish: publish-npm.yml on v* tags.
+on:
+  push:
+    branches: [dev, master]
+  pull_request:
+    branches: [dev, master]
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-20
+          components: rustfmt
+      - name: Format check
+        run: cargo fmt --manifest-path projects/postgres.rs/Cargo.toml --all --check
+
+  rust-test:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-20
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: projects/postgres.rs
+      - name: Build
+        run: cargo build --release --manifest-path projects/postgres.rs/Cargo.toml --workspace
+      - name: Tests
+        run: cargo test --release --manifest-path projects/postgres.rs/Cargo.toml -p postgres-client -- --test-threads=1

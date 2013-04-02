@@ -1,0 +1,72 @@
+name: Check TypeScript
+
+# pnpm install, TypeScript build, native binding, harness and corpus.
+# Python wheel: check-python.yml. Rust workspace: check-rust.yml.
+# Publish: publish-npm.yml on v* tags.
+on:
+  push:
+    branches: [dev, master]
+  pull_request:
+    branches: [dev, master]
+  workflow_call:
+
+jobs:
+  typescript:
+    name: pnpm packages
+    runs-on: ubuntu-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.3
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: projects/postgres.rs
+      - name: Install the wheel build tool
+        run: python3 -m pip install --quiet "maturin>=1.7,<2.0"
+      - name: Assert the checkout has no native artifact
+        run: test ! -e projects/postgres.ts/platforms/postgres-linux-x64/lib/postgres-linux-x64-gnu.node
+      - name: Install PostgreSQL test dependencies
+        run: pnpm install --no-frozen-lockfile
+      - name: Build the TypeScript packages
+        run: pnpm run build:ts
+      - name: Build the native binding
+        run: node scripts/build-napi.mjs
+      - name: Acceptance harness
+        run: pnpm test
+      - name: Downstream TypeScript example
+        run: pnpm examples:ts
+
+  corpus:
+    name: differential corpus
+    runs-on: ubuntu-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.3
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: projects/postgres.rs
+      - name: Install PostgreSQL test dependencies
+        run: pnpm install --no-frozen-lockfile
+      - name: Build the TypeScript packages
+        run: pnpm run build:ts
+      - name: Build the native binding
+        run: node scripts/build-napi.mjs
+      - name: Differential corpus gate
+        run: pnpm corpus -- --seed 20261106 --count 295 --check
