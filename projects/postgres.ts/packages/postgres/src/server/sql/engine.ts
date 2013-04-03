@@ -197,6 +197,41 @@ export function describeSelect(database: Database, statement: SelectStatement, p
     return result.fields;
 }
 
+/** Parameter types PostgreSQL infers from the `INSERT` / `UPDATE` target columns. */
+export function inferParameterTypes(database: Database, statement: Statement, count: number): (DataType | undefined)[] {
+    const types = new Array<DataType | undefined>(count).fill(undefined);
+    const record = (expr: Expr, type: DataType): void => {
+        if (expr.kind === 'param') {
+            const index = (expr as ParamExpr).index;
+            if (index >= 1 && index <= count) types[index - 1] = type;
+            return;
+        }
+        if (expr.kind === 'cast' && (expr as CastExpr).expr.kind === 'param') {
+            const index = ((expr as CastExpr).expr as ParamExpr).index;
+            if (index >= 1 && index <= count) types[index - 1] = (expr as CastExpr).type;
+        }
+    };
+    if (statement.kind === 'insert') {
+        const shape = tableShape(database, statement.table);
+        const targets = statement.columns
+            ? statement.columns.map((name) => shape.columns.find((column) => column.name === name))
+            : shape.columns;
+        for (const row of statement.rows) {
+            row.forEach((expr, index) => {
+                const column = targets[index];
+                if (column) record(expr, column.type);
+            });
+        }
+    } else if (statement.kind === 'update') {
+        const shape = tableShape(database, statement.table);
+        for (const assignment of statement.assignments) {
+            const column = shape.columns.find((candidate) => candidate.name === assignment.column);
+            if (column) record(assignment.value, column.type);
+        }
+    }
+    return types;
+}
+
 // ---------------------------------------------------------------------------
 // SELECT
 // ---------------------------------------------------------------------------

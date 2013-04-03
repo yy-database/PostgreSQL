@@ -206,9 +206,11 @@ export function decodeBinaryParameter(buffer: Buffer, typeOidValue: number): Sql
         case 1042:
         case 1043:
             return buffer.toString('utf8');
-        case 20:
+        case 20: {
             expectLength(buffer, 8);
-            return Number(buffer.readBigInt64BE(0));
+            const value = buffer.readBigInt64BE(0);
+            return value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString();
+        }
         case 21:
             expectLength(buffer, 2);
             return buffer.readInt16BE(0);

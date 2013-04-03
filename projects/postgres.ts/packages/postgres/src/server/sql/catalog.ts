@@ -590,6 +590,26 @@ export function typeByOid(typeOidValue: number, typmod: number): DataType {
             return typeOf('timestamptz');
         case 2950:
             return typeOf('uuid');
+        case 17:
+            return typeOf('bytea');
+        case 1000:
+            return typeOf('bool_array');
+        case 1002:
+            return typeOf('char_array');
+        case 1005:
+            return typeOf('int2_array');
+        case 1007:
+            return typeOf('int4_array');
+        case 1009:
+            return typeOf('text_array');
+        case 1016:
+            return typeOf('int8_array');
+        case 1021:
+            return typeOf('float4_array');
+        case 1022:
+            return typeOf('float8_array');
+        case 1028:
+            return typeOf('oid_array');
         case 194:
             return typeOf('pg_node_tree');
         case 22:

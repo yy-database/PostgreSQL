@@ -334,12 +334,13 @@ function overflow(type: DataType, message: string, detail?: string): ServerError
     return new ServerError('22003', message, detail, undefined, undefined, undefined, undefined, { dataType: formatType(type) });
 }
 
-function integerText(type: DataType, text: string, min: bigint, max: bigint): number {
+function integerText(type: DataType, text: string, min: bigint, max: bigint): number | string {
     const trimmed = text.trim();
     if (!/^[-+]?\d+$/.test(trimmed)) throw invalid(type, text);
     const parsed = BigInt(trimmed);
     if (parsed < min || parsed > max) throw overflow(type, `value "${text}" is out of range for type ${formatType(type)}`);
-    return Number(parsed);
+    if (parsed >= BigInt(Number.MIN_SAFE_INTEGER) && parsed <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(parsed);
+    return parsed.toString();
 }
 
 const INT2_MIN = -32768n;
@@ -533,9 +534,96 @@ export function parseLiteral(text: string, type: DataType): SqlValue {
             return uuidText(type, text);
         case 'bytea':
             return byteaText(type, text);
+        case 'int2_array':
+        case 'int4_array':
+        case 'int8_array':
+        case 'oid_array':
+        case 'text_array':
+        case 'char_array':
+        case 'bool_array':
+        case 'float4_array':
+        case 'float8_array':
+            return arrayText(type, text);
         default:
             return text;
     }
+}
+
+/** Element type of a one-dimensional array type, or `undefined` when unknown. */
+function arrayElement(type: DataType): DataType | undefined {
+    switch (type.key) {
+        case 'int2_array':
+            return typeOf('int2');
+        case 'int4_array':
+            return typeOf('int4');
+        case 'int8_array':
+            return typeOf('int8');
+        case 'oid_array':
+            return typeOf('oid');
+        case 'text_array':
+            return typeOf('text');
+        case 'char_array':
+            return typeOf('char');
+        case 'bool_array':
+            return typeOf('bool');
+        case 'float4_array':
+            return typeOf('float4');
+        case 'float8_array':
+            return typeOf('float8');
+        default:
+            return undefined;
+    }
+}
+
+function splitArrayLiteral(body: string): (string | null)[] {
+    if (body.length === 0) return [];
+    const values: (string | null)[] = [];
+    let current = '';
+    let quoted = false;
+    let wasQuoted = false;
+    for (let index = 0; index < body.length; index += 1) {
+        const character = body[index]!;
+        if (character === '\\') {
+            current += body[index + 1] ?? '';
+            index += 1;
+        } else if (character === '"') {
+            if (quoted && body[index + 1] === '"') {
+                current += '"';
+                index += 1;
+            } else {
+                quoted = !quoted;
+                wasQuoted = true;
+            }
+        } else if (character === ',' && !quoted) {
+            values.push(wasQuoted ? current : current.toUpperCase() === 'NULL' ? null : current);
+            current = '';
+            wasQuoted = false;
+        } else {
+            current += character;
+        }
+    }
+    values.push(wasQuoted ? current : current.toUpperCase() === 'NULL' ? null : current);
+    return values;
+}
+
+function quoteArrayElement(text: string): string {
+    return /[{},"\\\s]/.test(text) || text === '' || text.toUpperCase() === 'NULL' ? `"${text.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"` : text;
+}
+
+/** Coerces every element of an array literal to its element type. */
+function arrayText(type: DataType, text: string): string {
+    const element = arrayElement(type);
+    const trimmed = text.trim();
+    if (element === undefined || !trimmed.startsWith('{') || !trimmed.endsWith('}')) return text;
+    const items = splitArrayLiteral(trimmed.slice(1, -1));
+    const rendered = items.map((item) => {
+        if (item === null) return 'NULL';
+        const value = parseLiteral(item, element);
+        if (value === null) return 'NULL';
+        const output = formatValue(value, element) ?? '';
+        return typeof value === 'boolean' || typeof value === 'number' ? output : quoteArrayElement(output);
+    });
+    return `{${rendered.join(',')}}`;
 }
 
 export interface CastHooks {
@@ -553,7 +641,11 @@ export function castValue(value: SqlValue, to: DataType, hooks: CastHooks): SqlV
         return typeof value === 'number' ? value : parseLiteral(String(value), to);
     }
     if (to.key === 'text' || to.key === 'name' || to.key === 'pg_node_tree' || to.key === 'int2vector' || to.key === 'oidvector') {
+        if (typeof value === 'boolean') return value ? 'true' : 'false';
         return formatValue(value, typeOf('text'));
+    }
+    if (typeof value === 'boolean') {
+        return parseLiteral(value ? 'true' : 'false', to);
     }
     return parseLiteral(formatValue(value, typeOf('text')) ?? '', to);
 }

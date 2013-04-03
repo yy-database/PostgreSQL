@@ -23,7 +23,7 @@ import {
     type TransactionStatement,
 } from './sql/parser.ts';
 import { decodeBinaryParameter } from './sql/binary.ts';
-import { describeSelect, runStatement, type Field, type Outcome } from './sql/engine.ts';
+import { describeSelect, inferParameterTypes, runStatement, type Field, type Outcome } from './sql/engine.ts';
 import { TEXT, formatValue, parseLiteral, typeLength, typeOid, type SqlValue, type DataType } from './sql/types.ts';
 import {
     authenticationCleartextPassword,
@@ -1275,6 +1275,7 @@ class Session {
             const valueCount = payload.readInt16BE(offset);
             offset += 2;
             const parameters: SqlValue[] = [];
+            let inferred: (DataType | undefined)[] | undefined;
             for (let index = 0; index < valueCount; index += 1) {
                 const length = payload.readInt32BE(offset);
                 offset += 4;
@@ -1289,9 +1290,17 @@ class Session {
                     parameters.push(buffer.toString('utf8'));
                     continue;
                 }
-                const oid = prepared.parameterOids[index];
+                let oid = prepared.parameterOids[index];
                 if (oid === undefined || oid === 0) {
-                    throw new ServerError('0A000', 'feature not supported', 'binary parameter requires a declared type');
+                    if (inferred === undefined) {
+                        const state = this.state;
+                        if (!state) throw new ServerError('08006', 'session is not authenticated');
+                        const database = this.transaction?.database ?? Database.open(this.storage, this.cluster, this.runtime);
+                        inferred = inferParameterTypes(database, parseStatement(prepared.sql), valueCount);
+                    }
+                    const type = inferred[index];
+                    if (type === undefined) throw new ServerError('0A000', 'feature not supported', 'binary parameter requires a declared type');
+                    oid = typeOid(type);
                 }
                 parameters.push(decodeBinaryParameter(buffer, oid));
             }
