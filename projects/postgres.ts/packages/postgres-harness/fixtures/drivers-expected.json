@@ -1,0 +1,97 @@
+{
+    "psycopg": {
+        "crud/after": [
+            [
+                2,
+                "gamma"
+            ]
+        ],
+        "crud/select": [
+            [
+                1,
+                "alpha"
+            ],
+            [
+                2,
+                "beta"
+            ]
+        ],
+        "cursor/rows": [
+            1,
+            2,
+            3
+        ],
+        "error": {
+            "code": "23514",
+            "constraint": "driver_err_n_check",
+            "detail": "Failing row contains (1, -1).",
+            "schema": "public",
+            "table": "driver_err"
+        },
+        "fidelity/row": {
+            "c_bool": "true",
+            "c_bpchar": "abc",
+            "c_bytea": "\\x00ff10",
+            "c_date": "2024-02-29",
+            "c_float4": "1.25",
+            "c_float8": "-2.5",
+            "c_int2": "-32768",
+            "c_int4": "-2147483648",
+            "c_int4_array": "{1,-2,3}",
+            "c_int8": "9007199254740993",
+            "c_numeric": "1234567890.123456789",
+            "c_text": "héllo",
+            "c_text_array": "{a,\"b c\",NULL}",
+            "c_timestamp": "2024-02-29 12:34:56.789012",
+            "c_timestamptz": "2024-02-29 12:34:56.789012+00",
+            "c_uuid": "123e4567-e89b-12d3-a456-426614174000",
+            "c_varchar": "abc"
+        },
+        "transaction/count": 0
+    },
+    "node_postgres": {
+        "fidelity/row": {
+            "c_bool": "true",
+            "c_int2": "-32768",
+            "c_int4": "-2147483648",
+            "c_int8": "9007199254740993",
+            "c_float4": "1.25",
+            "c_float8": "-2.5",
+            "c_numeric": "1234567890.123456789",
+            "c_text": "héllo",
+            "c_varchar": "abc",
+            "c_bpchar": "abc",
+            "c_date": "2024-02-29",
+            "c_timestamp": "2024-02-29 12:34:56.789012",
+            "c_timestamptz": "2024-02-29 12:34:56.789012+00",
+            "c_uuid": "123e4567-e89b-12d3-a456-426614174000",
+            "c_bytea": "\\x00ff10",
+            "c_int4_array": "{1,-2,3}",
+            "c_text_array": "{a,\"b c\",NULL}"
+        },
+        "crud/select": [
+            [
+                1,
+                "alpha"
+            ],
+            [
+                2,
+                "beta"
+            ]
+        ],
+        "crud/after": [
+            [
+                2,
+                "gamma"
+            ]
+        ],
+        "transaction/count": 0,
+        "error": {
+            "code": "23514",
+            "detail": "Failing row contains (1, -1).",
+            "constraint": "driver_err_n_check",
+            "schema": "public",
+            "table": "driver_err"
+        }
+    }
+}
