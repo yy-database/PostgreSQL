@@ -18,6 +18,7 @@
         "examples:ts": "node projects/postgres.ts/examples/roundtrip.ts",
         "examples:py": "python projects/postgres.py/examples/roundtrip.py"
     },
+    "packageManager": "pnpm@10.18.3",
     "engines": {
         "node": ">=24.0.0"
     },
