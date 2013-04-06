@@ -8,18 +8,6 @@
   },
   "entries": [
     {
-      "id": "boundary/binary-result-format",
-      "cluster": "boundary",
-      "name": "binary-result-format",
-      "statement": null,
-      "kind": "boundary",
-      "reason": "not-implemented",
-      "detail": "outside the declared surface: binary result format",
-      "signal": [
-        "repo error unsupported: binary-result-format"
-      ]
-    },
-    {
       "id": "boundary/copy-in",
       "cluster": "boundary",
       "name": "copy-in",
@@ -65,18 +53,6 @@
       "detail": "outside the declared surface: query larger than 16MiB",
       "signal": [
         "repo error query exceeds the byte limit"
-      ]
-    },
-    {
-      "id": "boundary/portal-row-limit",
-      "cluster": "boundary",
-      "name": "portal-row-limit",
-      "statement": null,
-      "kind": "boundary",
-      "reason": "not-implemented",
-      "detail": "outside the declared surface: portal row limit",
-      "signal": [
-        "repo error unsupported: execute-row-limit"
       ]
     },
     {
