@@ -1713,7 +1713,14 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             await withClient(batch8, async (client) => {
                 await client.query('CREATE DATABASE b8_force');
                 const victim = await connectDatabase(batch8, 'b8_force');
-                const terminated = new Promise((resolve) => victim.once('error', (error) => resolve(error)));
+                // A forced drop sends FATAL 57P01 and then closes the socket. node-postgres
+                // reports the FATAL error first and the trailing socket close as a second
+                // "Connection terminated unexpectedly" error. Keep the listener attached for
+                // the whole session so the late report cannot crash the harness as an
+                // unhandled 'error' event, and assert the first report.
+                const terminated = new Promise((resolve) => {
+                    victim.on('error', (error) => resolve(error));
+                });
                 try {
                     const busy = await failureOf(client.query('DROP DATABASE b8_force'));
                     assert(busy?.code === '55006', `drop without force is ${busy?.code}`);
