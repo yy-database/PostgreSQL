@@ -1,23 +1,21 @@
 {
     "name": "@yydb/postgres-win32-x64",
-    "version": "0.1.0",
-    "private": true,
-    "description": "PostgreSQL native binding for win32 x64; installed automatically by @yydb/postgres",
+    "version": "0.0.0",
     "license": "MPL-2.0",
-    "type": "module",
-    "main": "./index.js",
-    "exports": {
-        ".": "./index.js"
-    },
-    "os": [
-        "win32"
-    ],
-    "cpu": [
-        "x64"
-    ],
+    "description": "Native binding for @yydb/postgres on win32-x64",
+    "os": ["win32"],
+    "cpu": ["x64"],
+    "main": "postgres.win32-x64.node",
     "files": [
-        "index.js",
-        "lib",
+        "postgres.win32-x64.node",
         "readme.md"
-    ]
+    ],
+    "engines": {
+        "node": ">=24.0.0"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/yy-database/PostgreSQL.git",
+        "directory": "projects/postgres.ts/platforms/postgres-win32-x64"
+    }
 }
