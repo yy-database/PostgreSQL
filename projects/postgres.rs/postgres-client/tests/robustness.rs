@@ -5,11 +5,13 @@
 //! The fixtures speak only framing. They are not an engine, and their replies
 //! are fixed byte scripts.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 use postgres_client::{ClientConfig, Connection, PostgresError};
 
@@ -254,9 +256,7 @@ fn copy_in_streams_every_chunk_and_reports_the_tag() {
     });
 
     let mut connection = Connection::open(&config(port)).expect("open");
-    let report = connection
-        .copy_in("COPY t FROM STDIN", &[b"1\ta\n".as_slice(), b"2\tb\n".as_slice()])
-        .expect("copy in");
+    let report = connection.copy_in("COPY t FROM STDIN", &[b"1\ta\n".as_slice(), b"2\tb\n".as_slice()]).expect("copy in");
     assert_eq!(report.tag, "COPY 2");
     assert!(report.error.is_none(), "unexpected {:?}", report.error);
 
@@ -414,15 +414,10 @@ fn copy_in_transport_loss_poisons_the_connection() {
     });
 
     let mut connection = Connection::open(&config(port)).expect("open");
-    let error = connection
-        .copy_in("COPY t FROM STDIN", &[b"1\ta\n".as_slice()])
-        .expect_err("a closed peer must throw");
+    let error = connection.copy_in("COPY t FROM STDIN", &[b"1\ta\n".as_slice()]).expect_err("a closed peer must throw");
     assert!(matches!(error, PostgresError::Io(_)), "unexpected {error:?}");
     let second = connection.execute("SELECT 1").expect_err("poisoned connection");
-    assert!(
-        second.to_string().starts_with("connection is unusable after"),
-        "unexpected {second}"
-    );
+    assert!(second.to_string().starts_with("connection is unusable after"), "unexpected {second}");
     handle.join().expect("server thread");
 }
 
@@ -437,9 +432,7 @@ fn copy_out_error_keeps_the_prefix_and_the_connection_usable() {
         assert_eq!(tag, b'Q');
         server.write_all(&frame(b'H', &copy_response_payload())).expect("CopyOutResponse");
         server.write_all(&frame(b'd', b"1\ta\n")).expect("CopyData");
-        server
-            .write_all(&frame(b'E', b"SERROR\0VERROR\0C22025\0Minvalid escape sequence\0\0"))
-            .expect("ErrorResponse");
+        server.write_all(&frame(b'E', b"SERROR\0VERROR\0C22025\0Minvalid escape sequence\0\0")).expect("ErrorResponse");
         server.write_all(&frame(b'Z', b"I")).expect("ReadyForQuery");
 
         let (_tag, _payload) = read_tagged(&mut server);
@@ -530,9 +523,8 @@ fn binary_decode_errors_drain_to_ready_for_query() {
     });
 
     let mut connection = Connection::open(&config(port)).expect("open");
-    let error = connection
-        .execute_with_param_formats("SELECT 1::float8", &[], &[], &[1])
-        .expect_err("float8 binary is unsupported");
+    let error =
+        connection.execute_with_param_formats("SELECT 1::float8", &[], &[], &[1]).expect_err("float8 binary is unsupported");
     assert_eq!(error.feature(), Some("binary-result-type-701"));
     connection.execute("SELECT 1").expect("the session survives a decode error");
     handle.join().expect("server thread");

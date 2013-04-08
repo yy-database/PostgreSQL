@@ -8,12 +8,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use pyo3::create_exception;
-use pyo3::exceptions::PyException;
-use pyo3::prelude::*;
+use pyo3::{create_exception, exceptions::PyException, prelude::*};
 
-use postgres_client::psql::{format_results, parse_arguments, PsqlOptions as CoreOptions};
-use postgres_client::{Column, MessageField, Notice, Param as CoreParam, PostgresError as CoreError, QueryResult};
+use postgres_client::{
+    Column, MessageField, Notice, Param as CoreParam, PostgresError as CoreError, QueryResult,
+    psql::{PsqlOptions as CoreOptions, format_results, parse_arguments},
+};
 
 create_exception!(postgres_pyo3, PostgresError, PyException);
 
@@ -334,7 +334,8 @@ impl Connection {
     /// Runs one statement and returns every result set it produced.
     fn execute(&self, sql: &str) -> PyResult<Vec<StatementResult>> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         connection.execute(sql).map(|results| results.into_iter().map(statement).collect()).map_err(native)
@@ -346,7 +347,8 @@ impl Connection {
     /// results: the report carries results, error and notices in server order.
     fn execute_report(&self, sql: &str) -> PyResult<ExecutionReport> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         let report = connection.execute_report(sql).map_err(native)?;
@@ -360,7 +362,8 @@ impl Connection {
     /// Drains every notice received by `execute` calls so far, in wire order.
     fn take_notices(&self) -> PyResult<Vec<NoticeInfo>> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         Ok(connection.take_notices().iter().map(notice_info).collect())
@@ -369,7 +372,8 @@ impl Connection {
     /// The `BackendKeyData` from startup as `(process_id, secret_key)`.
     fn backend_key_data(&self) -> PyResult<Option<(i32, i32)>> {
         let guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_ref() else {
+        let Some(connection) = guard.as_ref()
+        else {
             return Err(closed_error());
         };
         Ok(connection.backend_key_data().map(|key| (key.process_id, key.secret_key)))
@@ -381,7 +385,8 @@ impl Connection {
     /// this process. The main socket is untouched.
     fn cancel(&self) -> PyResult<()> {
         let guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_ref() else {
+        let Some(connection) = guard.as_ref()
+        else {
             return Err(closed_error());
         };
         connection.cancel().map_err(native)
@@ -389,15 +394,11 @@ impl Connection {
 
     /// Runs one parameterised statement through an unnamed prepared statement.
     /// `types` lists parameter OIDs; pass an empty list to let the server infer.
-    fn execute_with_params(
-        &self,
-        sql: &str,
-        params: Vec<Option<String>>,
-        types: Vec<u32>,
-    ) -> PyResult<Vec<StatementResult>> {
+    fn execute_with_params(&self, sql: &str, params: Vec<Option<String>>, types: Vec<u32>) -> PyResult<Vec<StatementResult>> {
         let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         connection
@@ -409,7 +410,8 @@ impl Connection {
     /// Prepares a named statement and describes its parameters and columns.
     fn prepare(&self, sql: &str, types: Vec<u32>) -> PyResult<PreparedStatement> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         let prepared = connection.prepare(sql, &types).map_err(native)?;
@@ -427,19 +429,18 @@ impl Connection {
     fn execute_prepared(&self, name: &str, params: Vec<Option<String>>) -> PyResult<Vec<StatementResult>> {
         let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
-        connection
-            .execute_prepared(name, &values)
-            .map(|results| results.into_iter().map(statement).collect())
-            .map_err(native)
+        connection.execute_prepared(name, &values).map(|results| results.into_iter().map(statement).collect()).map_err(native)
     }
 
     /// Closes a prepared statement by server-side name.
     fn close_prepared(&self, name: &str) -> PyResult<()> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         connection.close_prepared(name).map_err(native)
@@ -460,13 +461,12 @@ impl Connection {
         result_formats: Vec<u32>,
     ) -> PyResult<Vec<StatementResult>> {
         let owned = param_buffers(&params)?;
-        let values: Vec<CoreParam<'_>> = owned
-            .iter()
-            .map(|(format, value)| CoreParam { format: *format, value: value.as_deref() })
-            .collect();
+        let values: Vec<CoreParam<'_>> =
+            owned.iter().map(|(format, value)| CoreParam { format: *format, value: value.as_deref() }).collect();
         let formats = result_formats_u16(&result_formats)?;
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         connection
@@ -484,13 +484,12 @@ impl Connection {
         result_formats: Vec<u32>,
     ) -> PyResult<Vec<StatementResult>> {
         let owned = param_buffers(&params)?;
-        let values: Vec<CoreParam<'_>> = owned
-            .iter()
-            .map(|(format, value)| CoreParam { format: *format, value: value.as_deref() })
-            .collect();
+        let values: Vec<CoreParam<'_>> =
+            owned.iter().map(|(format, value)| CoreParam { format: *format, value: value.as_deref() }).collect();
         let formats = result_formats_u16(&result_formats)?;
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         connection
@@ -509,13 +508,12 @@ impl Connection {
         result_formats: Vec<u32>,
     ) -> PyResult<PortalInfo> {
         let owned = param_buffers(&params)?;
-        let values: Vec<CoreParam<'_>> = owned
-            .iter()
-            .map(|(format, value)| CoreParam { format: *format, value: value.as_deref() })
-            .collect();
+        let values: Vec<CoreParam<'_>> =
+            owned.iter().map(|(format, value)| CoreParam { format: *format, value: value.as_deref() }).collect();
         let formats = result_formats_u16(&result_formats)?;
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         let portal = connection.bind_portal(statement, portal, &values, &formats).map_err(native)?;
@@ -529,20 +527,19 @@ impl Connection {
     /// Executes an open portal. `max_rows` of `0` runs it to completion.
     fn execute_portal(&self, portal: &str, max_rows: i32) -> PyResult<PortalExecReport> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         let report = connection.execute_portal(portal, max_rows).map_err(native)?;
-        Ok(PortalExecReport {
-            results: report.results.into_iter().map(statement).collect(),
-            suspended: report.suspended,
-        })
+        Ok(PortalExecReport { results: report.results.into_iter().map(statement).collect(), suspended: report.suspended })
     }
 
     /// Closes a portal by server-side name.
     fn close_portal(&self, name: &str) -> PyResult<()> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         connection.close_portal(name).map_err(native)
@@ -555,7 +552,8 @@ impl Connection {
     /// caller can tell how many rows the server accepted.
     fn copy_in(&self, sql: &str, chunks: Vec<Vec<u8>>) -> PyResult<CopyInReport> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         let slices: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_slice()).collect();
@@ -572,7 +570,8 @@ impl Connection {
     /// A failure keeps the bytes that already arrived instead of discarding them.
     fn copy_out(&self, sql: &str) -> PyResult<CopyOutReport> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         let report = connection.copy_out(sql).map_err(native)?;
@@ -587,7 +586,8 @@ impl Connection {
     /// Shuts the socket down on the wire.
     fn close(&self) -> PyResult<()> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(mut connection) = guard.take() else {
+        let Some(mut connection) = guard.take()
+        else {
             return Err(closed_error());
         };
         connection.disconnect().map_err(native)
@@ -637,7 +637,8 @@ impl PreparedStatement {
         }
         let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
         let mut guard = self.connection.lock().map_err(|_| lock_error())?;
-        let Some(connection) = guard.as_mut() else {
+        let Some(connection) = guard.as_mut()
+        else {
             return Err(closed_error());
         };
         connection
@@ -761,12 +762,7 @@ fn encode_parse_message(name: &str, sql: &str, param_types: Vec<u32>) -> PyResul
 /// `None` is SQL `NULL`. `result_format` is `0` for text columns and `1` for
 /// binary ones.
 #[pyfunction]
-fn encode_bind_message(
-    portal: &str,
-    statement: &str,
-    params: Vec<Option<String>>,
-    result_format: u16,
-) -> PyResult<Vec<u8>> {
+fn encode_bind_message(portal: &str, statement: &str, params: Vec<Option<String>>, result_format: u16) -> PyResult<Vec<u8>> {
     let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
     postgres_client::protocol::bind_packet(portal, statement, &values, result_format).map_err(native)
 }
@@ -785,8 +781,7 @@ fn encode_bind_message_with_formats(
     let values: Vec<Option<&[u8]>> = owned.iter().map(|(_, value)| value.as_deref()).collect();
     let param_codes = result_formats_u16(&param_formats)?;
     let result_codes = result_formats_u16(&result_formats)?;
-    postgres_client::protocol::bind_packet_with_formats(portal, statement, &values, &param_codes, &result_codes)
-        .map_err(native)
+    postgres_client::protocol::bind_packet_with_formats(portal, statement, &values, &param_codes, &result_codes).map_err(native)
 }
 
 /// Builds one extended-protocol `Describe` message for a statement or portal.
@@ -911,11 +906,7 @@ impl Store {
 
     /// Key/value pairs of one namespace with the byte prefix.
     fn scan(&self, namespace: String, prefix: Vec<u8>) -> Vec<StoreRow> {
-        self.inner
-            .scan(&namespace, &prefix)
-            .into_iter()
-            .map(|(key, value)| StoreRow { key, value })
-            .collect()
+        self.inner.scan(&namespace, &prefix).into_iter().map(|(key, value)| StoreRow { key, value }).collect()
     }
 
     /// Distinct namespaces holding at least one row.
@@ -983,9 +974,7 @@ pub struct ServerStore {
 impl ServerStore {
     #[new]
     fn new(data_dir: String) -> PyResult<Self> {
-        postgres_client::ServerStore::open(&data_dir)
-            .map(|inner| Self { inner: Mutex::new(Some(inner)) })
-            .map_err(native)
+        postgres_client::ServerStore::open(&data_dir).map(|inner| Self { inner: Mutex::new(Some(inner)) }).map_err(native)
     }
 
     /// Ordered prefix scan inside one namespace.
@@ -1136,8 +1125,7 @@ fn describe_target(target: &str) -> PyResult<u8> {
 fn param_buffers(params: &[(u32, Option<Vec<u8>>)]) -> PyResult<Vec<(u16, Option<Vec<u8>>)>> {
     let mut owned = Vec::with_capacity(params.len());
     for (format, value) in params {
-        let format = u16::try_from(*format)
-            .map_err(|_| PostgresError::new_err("parameter format does not fit 16 bits"))?;
+        let format = u16::try_from(*format).map_err(|_| PostgresError::new_err("parameter format does not fit 16 bits"))?;
         if format > 1 {
             return Err(PostgresError::new_err("parameter format is 0 for text and 1 for binary"));
         }
@@ -1149,8 +1137,7 @@ fn param_buffers(params: &[(u32, Option<Vec<u8>>)]) -> PyResult<Vec<(u16, Option
 fn result_formats_u16(formats: &[u32]) -> PyResult<Vec<u16>> {
     let mut codes = Vec::with_capacity(formats.len());
     for format in formats {
-        let code = u16::try_from(*format)
-            .map_err(|_| PostgresError::new_err("result format does not fit 16 bits"))?;
+        let code = u16::try_from(*format).map_err(|_| PostgresError::new_err("result format does not fit 16 bits"))?;
         if code > 1 {
             return Err(PostgresError::new_err("result format is 0 for text and 1 for binary"));
         }
