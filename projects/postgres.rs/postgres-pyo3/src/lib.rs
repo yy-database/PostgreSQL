@@ -270,6 +270,7 @@ impl PsqlOptions {
         separator = "|".to_owned(),
         null_value = String::new()
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
         port: u16,
@@ -861,7 +862,7 @@ fn encode_bytea(bytes: Vec<u8>) -> String {
 /// Parses the supported `psql` flags.
 #[pyfunction]
 fn parse_psql_arguments(args: Vec<String>) -> PyResult<PsqlOptions> {
-    parse_arguments(&args).map(PsqlOptions::from).map_err(|message| PostgresError::new_err(message))
+    parse_arguments(&args).map(PsqlOptions::from).map_err(PostgresError::new_err)
 }
 
 /// Turns result sets into the lines `psql` prints.

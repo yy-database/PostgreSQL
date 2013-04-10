@@ -215,7 +215,9 @@ fn persist(path: &Path, inner: &Inner) -> Result<(), PostgresError> {
     write_atomic(path, &[KV_MAGIC, &checksum.to_le_bytes(), &inner.body])
 }
 
-fn decode_shard(bytes: &[u8]) -> Result<(BTreeMap<(String, Vec<u8>), Record>, u64), PostgresError> {
+type DecodedShard = (BTreeMap<(String, Vec<u8>), Record>, u64);
+
+fn decode_shard(bytes: &[u8]) -> Result<DecodedShard, PostgresError> {
     // Header checks stay here so the shared decoder's generic EOF/legacy
     // classification keeps mapping onto the messages PostgreSQL has always
     // returned for these shard shapes.
@@ -692,7 +694,8 @@ mod tests {
         let store = Store::open(&dir).unwrap();
         let big = [9_u8; 257];
         let long_key = [3_u8; 40];
-        let steps: Vec<(&str, &[u8], Option<&[u8]>)> = vec![
+        type Step<'a> = (&'a str, &'a [u8], Option<&'a [u8]>);
+        let steps: Vec<Step<'_>> = vec![
             ("public.users", b"u2", Some(b"bob")),
             ("public.users", b"u1", Some(b"alice")),
             ("public.users", b"u3", Some(big.as_slice())),

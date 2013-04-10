@@ -685,7 +685,7 @@ pub fn encode_bytea(bytes: Buffer) -> String {
 /// Parses the supported `psql` flags.
 #[napi]
 pub fn parse_psql_arguments(args: Vec<String>) -> Result<CommandOptions> {
-    parse_arguments(&args).map(CommandOptions::from).map_err(|message| Error::from_reason(message))
+    parse_arguments(&args).map(CommandOptions::from).map_err(Error::from_reason)
 }
 
 /// Turns result sets into the lines `psql` prints.

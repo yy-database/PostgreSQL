@@ -118,7 +118,7 @@ fn cancel_request_uses_a_fresh_connection_and_the_backend_key() {
     connection.cancel().expect("cancel");
     let packet = receiver.recv_timeout(WAIT).expect("cancel packet arrived");
     assert_eq!(packet.len(), 16, "CancelRequest is exactly sixteen bytes");
-    assert_eq!(u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]), 808_771_02);
+    assert_eq!(u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]), 80_877_102);
     assert_eq!(i32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]), 1234);
     assert_eq!(i32::from_be_bytes([packet[12], packet[13], packet[14], packet[15]]), 5678);
 
