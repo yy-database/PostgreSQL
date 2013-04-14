@@ -1,6 +1,6 @@
 {
     "name": "@yydb/postgres-darwin-x64",
-    "version": "0.0.0",
+    "version": "0.0.1",
     "license": "MPL-2.0",
     "description": "Native binding for @yydb/postgres on macOS x64",
     "os": ["darwin"],
