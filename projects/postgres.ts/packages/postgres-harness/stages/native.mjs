@@ -26,7 +26,10 @@ export async function runNative(repositoryRoot) {
 
     const key = process.env.POSTGRES_NATIVE_PLATFORM?.trim() ?? `${process.platform}-${process.arch}`;
     const require = createRequire(import.meta.url);
-    const binding = require(path.join(repositoryRoot, 'projects', 'postgres.ts', 'platforms', `postgres-${key}`, 'index.js')).default;
+    const packageDir = path.join(repositoryRoot, 'projects', 'postgres.ts', 'platforms', `postgres-${key}`);
+    // `package.json#main` names the `.node` addon, so resolving the package
+    // directory keeps this probe in step with the platform package layout.
+    const binding = require(packageDir);
 
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-native-store-'));
     const store = new binding.ServerStore(dataDir);
