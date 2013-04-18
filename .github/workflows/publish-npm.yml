@@ -125,4 +125,4 @@ jobs:
           done
       - run: pnpm run build:ts
       - name: Publish packages to npm
-        run: pnpm exec nifty publish --access public --version="${RELEASE_TAG#v}"
+        run: pnpm exec nifty publish --access public --tag latest --version="${RELEASE_TAG#v}"
