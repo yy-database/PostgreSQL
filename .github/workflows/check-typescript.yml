@@ -37,7 +37,7 @@ jobs:
           version: 10.18.3
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: projects/postgres.rs
@@ -74,7 +74,7 @@ jobs:
           version: 10.18.3
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: projects/postgres.rs
