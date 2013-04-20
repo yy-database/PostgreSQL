@@ -1,22 +1,28 @@
 //! `.yyds` catalog plus `.yykv` shard persistence.
 //!
-//! Both byte formats are owned by `database-formats`: the catalog is the shared
-//! contract-layout codec (the same bytes Redis and MongoDB write: magic
-//! `YYDS\x01`, little-endian version, schema slot, routing slot, shard
-//! registrations, resolved contract and owners), and the shard is the shared
-//! `.yykv` snapshot codec (magic `YYKV\x03`, FNV-1a body checksum, then
-//! `next_revision u64`, record count `u32`, and records made of namespace, key,
-//! revision `u64`, deadline `u64`, value tag `u8` and value bytes).
+//! Both byte formats are owned by `database-formats`, and the shard write path
+//! is owned by `database-storage`: [`Store`] is only the PostgreSQL-facing
+//! adapter around [`database_storage::cluster_kv::FileShard`]. The snapshot
+//! bytes are the shared `.yykv` codec (magic `YYKV\x03`, FNV-1a body checksum,
+//! then `next_revision u64`, record count `u32`, and records made of namespace,
+//! key, revision `u64`, deadline `u64`, value tag `u8` and value bytes), which
+//! `FileShard` writes through a temp file and an atomic replace on every
+//! mutation.
 //!
-//! This module only keeps the PostgreSQL-specific mapping: the catalog owns the
-//! shard id (`<id>.yykv` next to it), the record model stays inline-only, and
-//! every shared-codec failure is re-worded to the message PostgreSQL users
-//! already see. Legacy big-endian PostgreSQL catalogs (`postgres-0.yyds`) are
-//! rejected explicitly; they are never sniffed or guessed. Writes go through a
-//! temp file and a rename, so a crash leaves the previous shard intact.
+//! This module only keeps what PostgreSQL owns:
+//!
+//! - the catalog file (`local-0.yyds`) itself, written as the shared
+//!   contract-layout document (magic `YYDS\x01`, little-endian version, schema
+//!   slot, routing slot, shard registrations, resolved contract and owners);
+//! - the catalog shard id (`<id>.yykv` next to it) and the explicit rejection
+//!   of legacy big-endian catalogs (`postgres-0.yyds`), which are never sniffed
+//!   or guessed;
+//! - namespace validation, because `database-formats`' `Key::new` accepts any
+//!   namespace string and the empty/NUL checks are this crate's contract;
+//! - the exact error wording PostgreSQL users already see for shard and
+//!   catalog failures, mapped from the shared codec's reasons.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -24,14 +30,12 @@ use std::{
 
 use database_formats::yy::{
     yyds::{CATALOG_MAGIC, decode_catalog_shard_id as shared_catalog_shard_id, encode_catalog},
-    yykv::{
-        InlineValue, KV_LEGACY_MAGIC, KV_MAGIC, Key, Record as ShardRecord, Snapshot, StoredValue, decode_snapshot_strict,
-        encode_snapshot, kv_format::checksum as shard_checksum,
-    },
+    yykv::{KV_LEGACY_MAGIC, KV_MAGIC, Snapshot, decode_snapshot_strict},
 };
+use database_storage::cluster_kv::{FileShard, InlineValue, Key, KvStore, StoredValue};
 use database_types::{
     ReasonCode,
-    cluster::{Error as ClusterError, ShardId},
+    cluster::{Error as ClusterError, Namespace, ShardId},
 };
 
 use crate::PostgresError;
@@ -46,6 +50,13 @@ fn io_error(error: impl std::fmt::Display) -> PostgresError {
 
 fn protocol(message: &str) -> PostgresError {
     PostgresError::Protocol(message.to_owned())
+}
+
+fn storage_error(error: ClusterError) -> PostgresError {
+    match error {
+        ClusterError::Io(error) => io_error(error),
+        other => protocol(&other.to_string()),
+    }
 }
 
 /// Re-words a shared `.yykv` codec failure as the PostgreSQL-facing message.
@@ -81,143 +92,11 @@ fn shard_message(message: &'static str) -> &'static str {
     }
 }
 
-/// Byte length of the shard body header: `next_revision u64` plus count `u32`.
-const SHARD_HEADER_LEN: usize = 12;
-
-/// Fixed prefix the shared snapshot encoder writes before its first record:
-/// magic `5`, checksum `8`, `next_revision` `8` and count `4`.
-const SNAPSHOT_PREFIX_LEN: usize = KV_MAGIC.len() + 8 + 8 + 4;
-
-/// One stored row: the shard-assigned revision, its inline bytes, and where the
-/// encoded record sits inside [`Inner::body`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Record {
-    revision: u64,
-    value: Vec<u8>,
-    start: usize,
-}
-
-struct Inner {
-    records: BTreeMap<(String, Vec<u8>), Record>,
-    next_revision: u64,
-    /// Canonical shard body: the 12-byte header followed by every encoded record
-    /// in `records` order. A mutation splices only the affected record, so the
-    /// shard is never re-encoded as a whole.
-    body: Vec<u8>,
-}
-
-impl Inner {
-    fn empty() -> Self {
-        let mut inner = Self { records: BTreeMap::new(), next_revision: 1, body: vec![0; SHARD_HEADER_LEN] };
-        inner.sync_header();
-        inner
-    }
-
-    fn from_decoded(records: BTreeMap<(String, Vec<u8>), Record>, next_revision: u64) -> Result<Self, PostgresError> {
-        let mut inner = Self { records, next_revision, body: Vec::new() };
-        inner.rebuild_body()?;
-        Ok(inner)
-    }
-
-    fn sync_header(&mut self) {
-        self.body[..8].copy_from_slice(&self.next_revision.to_le_bytes());
-        self.body[8..SHARD_HEADER_LEN].copy_from_slice(&(self.records.len() as u32).to_le_bytes());
-    }
-
-    /// Re-encodes every record. Used at open and for namespace-wide removals;
-    /// the steady-state write path never calls it.
-    fn rebuild_body(&mut self) -> Result<(), PostgresError> {
-        let mut body = vec![0_u8; SHARD_HEADER_LEN];
-        for ((namespace, key), record) in &mut self.records {
-            let bytes = encode_record(namespace, key, record.revision, &record.value)?;
-            record.start = body.len();
-            body.extend_from_slice(&bytes);
-        }
-        self.body = body;
-        self.sync_header();
-        Ok(())
-    }
-
-    /// Inserts or overwrites one row and splices only that record into the body.
-    fn write_row(&mut self, namespace: &str, key: &[u8], revision: u64, value: &[u8]) -> Result<(), PostgresError> {
-        let bytes = encode_record(namespace, key, revision, value)?;
-        let lookup = (namespace.to_owned(), key.to_vec());
-        let (offset, replaced) = match self.records.get(&lookup) {
-            Some(record) => {
-                let start = record.start;
-                (start, self.span_end(&lookup) - start)
-            }
-            None => (self.insert_offset(&lookup), 0),
-        };
-        self.body.splice(offset..offset + replaced, bytes.iter().copied());
-        let delta = bytes.len() as isize - replaced as isize;
-        self.shift_starts(&lookup, offset + replaced, delta);
-        self.records.insert(lookup, Record { revision, value: value.to_vec(), start: offset });
-        self.next_revision = revision.saturating_add(1);
-        self.sync_header();
-        Ok(())
-    }
-
-    /// Removes one row and splices its bytes out of the body.
-    fn remove_row(&mut self, key: &(String, Vec<u8>)) -> bool {
-        let (start, end) = match self.records.get(key) {
-            Some(record) => {
-                let start = record.start;
-                (start, self.span_end(key))
-            }
-            None => return false,
-        };
-        self.body.drain(start..end);
-        self.records.remove(key);
-        self.shift_starts(key, end, -((end - start) as isize));
-        self.sync_header();
-        true
-    }
-
-    /// Byte offset where the next record after `key` starts, or the body end.
-    fn span_end(&self, key: &(String, Vec<u8>)) -> usize {
-        self.records.range(key.clone()..).nth(1).map(|(_, record)| record.start).unwrap_or(self.body.len())
-    }
-
-    /// Byte offset a record inserted at `key` would occupy.
-    fn insert_offset(&self, key: &(String, Vec<u8>)) -> usize {
-        self.records.range(key.clone()..).next().map(|(_, record)| record.start).unwrap_or(self.body.len())
-    }
-
-    /// Shifts the cached offsets of every record at or after `threshold`.
-    fn shift_starts(&mut self, key: &(String, Vec<u8>), threshold: usize, delta: isize) {
-        if delta == 0 {
-            return;
-        }
-        for (_, record) in self.records.range_mut(key.clone()..) {
-            if record.start >= threshold {
-                record.start = (record.start as isize + delta) as usize;
-            }
-        }
-    }
-}
-
-/// Encodes one record by asking the shared codec for a one-record snapshot and
-/// dropping its fixed prefix, so the record layout stays in `database-formats`.
-fn encode_record(namespace: &str, key: &[u8], revision: u64, value: &[u8]) -> Result<Vec<u8>, PostgresError> {
-    let key = Key::new(namespace, key.to_vec());
-    let record =
-        ShardRecord { key: key.clone(), value: StoredValue::Inline(InlineValue(value.to_vec())), revision, expires_at: None };
-    let snapshot = BTreeMap::from([(key, record)]);
-    // `revision + 1` satisfies the shared guard that every record sits below
-    // `next_revision`.
-    let bytes = encode_snapshot(&snapshot, revision.saturating_add(1)).map_err(shard_error)?;
-    Ok(bytes[SNAPSHOT_PREFIX_LEN..].to_vec())
-}
-
-fn persist(path: &Path, inner: &Inner) -> Result<(), PostgresError> {
-    let checksum = shard_checksum(&inner.body);
-    write_atomic(path, &[KV_MAGIC, &checksum.to_le_bytes(), &inner.body])
-}
-
-type DecodedShard = (BTreeMap<(String, Vec<u8>), Record>, u64);
-
-fn decode_shard(bytes: &[u8]) -> Result<DecodedShard, PostgresError> {
+/// Validates a `.yykv` snapshot and reports its record count and next revision.
+///
+/// The bytes are decoded by the shared codec; only the PostgreSQL-facing
+/// classification and the inline-only record model stay here.
+fn decode_shard(bytes: &[u8]) -> Result<(usize, u64), PostgresError> {
     // Header checks stay here so the shared decoder's generic EOF/legacy
     // classification keeps mapping onto the messages PostgreSQL has always
     // returned for these shard shapes.
@@ -242,18 +121,15 @@ fn decode_shard(bytes: &[u8]) -> Result<DecodedShard, PostgresError> {
         }
         shard_error(error)
     })?;
-    let mut shard = BTreeMap::new();
-    for (key, record) in records {
+    for record in records.values() {
         if record.expires_at.is_some() {
             return Err(protocol("expired shard records are unsupported"));
         }
-        let StoredValue::Inline(value) = record.value
-        else {
+        if !matches!(record.value, StoredValue::Inline(_)) {
             return Err(protocol("unknown shard record tag"));
-        };
-        shard.insert((key.namespace.0, key.bytes), Record { revision: record.revision, value: value.0, start: 0 });
+        }
     }
-    Ok((shard, next_revision))
+    Ok((records.len(), next_revision))
 }
 
 pub(crate) fn encode_catalog_bytes(shard_id: &str) -> Result<Vec<u8>, PostgresError> {
@@ -313,71 +189,37 @@ fn legacy_catalog_bytes(bytes: &[u8]) -> bool {
         && bytes[13..17] == [0, 0, 0, 1]
 }
 
-/// Test-only fault points inside [`write_atomic`], so crash safety can be
-/// exercised without killing the process.
-#[cfg(test)]
-mod fault {
-    use std::cell::Cell;
-
-    pub const NONE: u8 = 0;
-    pub const BEFORE_RENAME: u8 = 1;
-    pub const AFTER_RENAME: u8 = 2;
-
-    // Thread-local so parallel unit tests never share an armed fault point.
-    thread_local! {
-        static POINT: Cell<u8> = const { Cell::new(NONE) };
-    }
-
-    pub fn arm(point: u8) {
-        POINT.with(|slot| slot.set(point));
-    }
-
-    pub fn disarm() {
-        POINT.with(|slot| slot.set(NONE));
-    }
-
-    pub fn armed(point: u8) -> bool {
-        POINT.with(|slot| slot.get() == point)
-    }
-}
-
-fn write_atomic(path: &Path, parts: &[&[u8]]) -> Result<(), PostgresError> {
+/// Writes the catalog through a temp file and a rename.
+///
+/// The shard write path no longer lives here: mutations go through
+/// `FileShard`, which fsyncs its own temp snapshot and replaces the shard
+/// atomically.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PostgresError> {
     use std::io::Write;
 
     let mut temp = path.as_os_str().to_owned();
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
     let mut file = fs::File::create(&temp).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
-    for part in parts {
-        file.write_all(part).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
-    }
+    file.write_all(bytes).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
     file.sync_all().map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
     drop(file);
-    // The temp file is complete and durable, but the shard is still untouched.
-    #[cfg(test)]
-    if fault::armed(fault::BEFORE_RENAME) {
-        return Err(io_error(format!("{}: injected failure before rename", temp.display())));
-    }
-    fs::rename(&temp, path).map_err(|error| io_error(format!("{} -> {}: {error}", temp.display(), path.display())))?;
-    // The swap already happened, so the new shard is live even though the call
-    // reports failure.
-    #[cfg(test)]
-    if fault::armed(fault::AFTER_RENAME) {
-        return Err(io_error(format!("{}: injected failure after rename", path.display())));
-    }
-    Ok(())
+    fs::rename(&temp, path).map_err(|error| io_error(format!("{} -> {}: {error}", temp.display(), path.display())))
 }
 
 /// A durable namespace/key store backed by one `.yyds` catalog and one `.yykv` shard.
+///
+/// Every mutation is delegated to the shard's own durable write path, so the
+/// bytes on disk are exactly what `FileShard` writes.
 pub struct Store {
     dir: PathBuf,
     catalog: PathBuf,
-    shard: PathBuf,
-    inner: Mutex<Inner>,
+    shard_path: PathBuf,
+    shard: Mutex<FileShard>,
 }
 
 impl Store {
-    /// Opens or creates the store. Missing files are written; corrupt files are rejected.
+    /// Opens or creates the store directory.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PostgresError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(io_error)?;
@@ -393,22 +235,19 @@ impl Store {
         else {
             DEFAULT_SHARD_ID.to_owned()
         };
-        let shard = dir.join(format!("{shard_id}.yykv"));
+        let shard_path = dir.join(format!("{shard_id}.yykv"));
         if !catalog.exists() {
-            write_atomic(&catalog, &[&encode_catalog_bytes(&shard_id)?])?;
+            write_atomic(&catalog, &encode_catalog_bytes(&shard_id)?)?;
         }
-        let inner = if shard.exists() {
-            let bytes = fs::read(&shard).map_err(io_error)?;
-            let (records, next_revision) = decode_shard(&bytes)?;
-            Inner::from_decoded(records, next_revision)?
+        // Validate the on-disk bytes with the PostgreSQL-facing wording before
+        // handing the file to the shared shard implementation, which reports
+        // its own generic reasons.
+        if shard_path.exists() {
+            let bytes = fs::read(&shard_path).map_err(io_error)?;
+            decode_shard(&bytes)?;
         }
-        else {
-            Inner::empty()
-        };
-        if !shard.exists() {
-            persist(&shard, &inner)?;
-        }
-        Ok(Self { dir, catalog, shard, inner: Mutex::new(inner) })
+        let shard = FileShard::open(&shard_path).map_err(storage_error)?;
+        Ok(Self { dir, catalog, shard_path, shard: Mutex::new(shard) })
     }
 
     /// Absolute directory the store lives in.
@@ -418,7 +257,7 @@ impl Store {
 
     /// Absolute `.yykv` shard path.
     pub fn shard_path(&self) -> String {
-        self.shard.display().to_string()
+        self.shard_path.display().to_string()
     }
 
     /// Absolute `.yyds` catalog path.
@@ -429,60 +268,61 @@ impl Store {
     /// Writes one row, assigning the next revision.
     pub fn put(&self, namespace: &str, key: &[u8], value: &[u8]) -> Result<(), PostgresError> {
         validate_namespace(namespace)?;
-        let mut inner = self.inner.lock().expect("store lock");
-        let revision = inner.next_revision;
-        inner.write_row(namespace, key, revision, value)?;
-        persist(&self.shard, &inner)
+        let mut shard = self.shard.lock().expect("store lock");
+        shard
+            .put(Key::new(namespace, key.to_vec()), StoredValue::Inline(InlineValue(value.to_vec())))
+            .map(|_| ())
+            .map_err(storage_error)
     }
 
     /// Reads one row, or `None` when the key is absent.
     pub fn get(&self, namespace: &str, key: &[u8]) -> Option<Vec<u8>> {
-        let inner = self.inner.lock().expect("store lock");
-        inner.records.get(&(namespace.to_owned(), key.to_vec())).map(|record| record.value.clone())
+        let shard = self.shard.lock().expect("store lock");
+        let record = shard.get(&Key::new(namespace, key.to_vec())).ok().flatten()?;
+        match record.value {
+            StoredValue::Inline(value) => Some(value.0),
+            _ => None,
+        }
     }
 
     /// Removes one row and reports whether it existed.
     pub fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, PostgresError> {
-        let mut inner = self.inner.lock().expect("store lock");
-        let removed = inner.remove_row(&(namespace.to_owned(), key.to_vec()));
-        if removed {
-            persist(&self.shard, &inner)?;
-        }
-        Ok(removed)
+        let mut shard = self.shard.lock().expect("store lock");
+        shard.delete(&Key::new(namespace, key.to_vec())).map_err(storage_error)
     }
 
     /// Keys of one namespace with the given byte prefix, ordered by key.
     pub fn keys(&self, namespace: &str, prefix: &[u8]) -> Vec<Vec<u8>> {
-        let inner = self.inner.lock().expect("store lock");
-        inner
-            .records
-            .keys()
-            .filter(|(name, key)| name == namespace && key.starts_with(prefix))
-            .map(|(_, key)| key.clone())
-            .collect()
+        self.rows(namespace, prefix).into_iter().map(|(key, _)| key).collect()
     }
 
     /// Key/value pairs of one namespace with the given byte prefix.
     pub fn scan(&self, namespace: &str, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let inner = self.inner.lock().expect("store lock");
-        inner
-            .records
-            .iter()
-            .filter(|((name, key), _)| name == namespace && key.starts_with(prefix))
-            .map(|((_, key), record)| (key.clone(), record.value.clone()))
+        self.rows(namespace, prefix)
+    }
+
+    fn rows(&self, namespace: &str, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let shard = self.shard.lock().expect("store lock");
+        let records = shard.scan(&Namespace(namespace.to_owned()), prefix, None, None, 0).unwrap_or_default();
+        records
+            .into_iter()
+            .filter_map(|record| match record.value {
+                StoredValue::Inline(value) => Some((record.key.bytes, value.0)),
+                _ => None,
+            })
             .collect()
     }
 
     /// Distinct namespaces that currently hold at least one row.
     pub fn namespaces(&self) -> Vec<String> {
-        let inner = self.inner.lock().expect("store lock");
-        inner.records.keys().map(|(namespace, _)| namespace.clone()).collect::<BTreeSet<_>>().into_iter().collect()
+        let shard = self.shard.lock().expect("store lock");
+        shard.namespaces().unwrap_or_default().into_iter().map(|namespace| namespace.0).collect()
     }
 
     /// Number of rows in one namespace.
     pub fn len(&self, namespace: &str) -> usize {
-        let inner = self.inner.lock().expect("store lock");
-        inner.records.keys().filter(|(name, _)| name == namespace).count()
+        let shard = self.shard.lock().expect("store lock");
+        shard.len(&Namespace(namespace.to_owned())).unwrap_or_default()
     }
 
     /// Whether the namespace holds no rows.
@@ -492,15 +332,10 @@ impl Store {
 
     /// Removes every row of one namespace and returns how many were removed.
     pub fn flush(&self, namespace: &str) -> Result<usize, PostgresError> {
-        let mut inner = self.inner.lock().expect("store lock");
-        let before = inner.records.len();
-        inner.records.retain(|(name, _), _| name != namespace);
-        let removed = before - inner.records.len();
-        if removed > 0 {
-            inner.rebuild_body()?;
-            persist(&self.shard, &inner)?;
-        }
-        Ok(removed)
+        let mut shard = self.shard.lock().expect("store lock");
+        // `FileShard::flush()` is the inherent "persist now" helper, so the
+        // namespace flush must be called through the trait explicitly.
+        KvStore::flush(&mut *shard, &Namespace(namespace.to_owned())).map_err(storage_error)
     }
 }
 
@@ -517,7 +352,12 @@ fn validate_namespace(namespace: &str) -> Result<(), PostgresError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
+    use database_formats::yy::yykv::{InlineValue as TestInlineValue, Key as TestKey, Record as ShardRecord, encode_snapshot};
+    use database_types::cluster::ShardId;
+
+    /// Every test gets its own directory under the test binary directory.
     fn temporary(label: &str) -> PathBuf {
         let mut path = std::env::current_exe().expect("test binary path");
         path.pop();
@@ -527,6 +367,36 @@ mod tests {
         path.push(format!("postgres-store-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    #[test]
+    fn namespace_validation_stays_on_the_binding_side() {
+        let dir = temporary("namespace");
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(store.put("", b"k", b"v").unwrap_err().message(), "namespace must not be empty");
+        assert_eq!(store.put("public.\0bad", b"k", b"v").unwrap_err().message(), "namespace must not contain a NUL byte");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_removes_one_namespace_and_keeps_the_revision_counter() {
+        let dir = temporary("flush");
+        let store = Store::open(&dir).unwrap();
+        store.put("public.users", b"u1", b"alice").unwrap();
+        store.put("public.users", b"u2", b"bob").unwrap();
+        store.put("public.audit", b"a1", b"one").unwrap();
+        assert_eq!(store.flush("public.users").unwrap(), 2);
+        store.put("public.users", b"u3", b"carol").unwrap();
+        drop(store);
+
+        let reopened = Store::open(&dir).unwrap();
+        assert_eq!(reopened.get("public.users", b"u1"), None, "flushed rows stay gone after reopen");
+        assert_eq!(reopened.get("public.audit", b"a1"), Some(b"one".to_vec()));
+        assert_eq!(reopened.get("public.users", b"u3"), Some(b"carol".to_vec()));
+        let snapshot = decode_snapshot_strict(&fs::read(reopened.shard_path()).unwrap()).unwrap();
+        assert_eq!(snapshot.next_revision, 5, "flush must not reuse a flushed revision");
+        drop(reopened);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -543,7 +413,7 @@ mod tests {
         assert_eq!(&bytes[..5], KV_MAGIC);
         let (records, next) = decode_shard(&bytes).unwrap();
         assert_eq!(next, 3);
-        assert_eq!(records.len(), 2);
+        assert_eq!(records, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -621,11 +491,11 @@ mod tests {
 
     /// Assembles one shared-codec record, i.e. exactly what a node outside this
     /// repo writes when `database-formats` owns the shard.
-    fn shared_record(namespace: &str, key: &[u8], value: &[u8], revision: u64) -> (Key, ShardRecord) {
-        let key = Key::new(namespace, key.to_vec());
+    fn shared_record(namespace: &str, key: &[u8], value: &[u8], revision: u64) -> (TestKey, ShardRecord) {
+        let key = TestKey::new(namespace, key.to_vec());
         let stored = ShardRecord {
             key: key.clone(),
-            value: StoredValue::Inline(InlineValue(value.to_vec())),
+            value: StoredValue::Inline(TestInlineValue(value.to_vec())),
             revision,
             expires_at: None,
         };
@@ -642,12 +512,12 @@ mod tests {
         let snapshot = decode_snapshot_strict(&bytes).unwrap();
         assert_eq!(snapshot.next_revision, 3);
         assert_eq!(
-            snapshot.records[&Key::new("public.users", b"u1".to_vec())].value,
-            StoredValue::Inline(InlineValue(b"alice".to_vec()))
+            snapshot.records[&TestKey::new("public.users", b"u1".to_vec())].value,
+            StoredValue::Inline(TestInlineValue(b"alice".to_vec()))
         );
         assert_eq!(
-            snapshot.records[&Key::new("public.users", b"u2".to_vec())].value,
-            StoredValue::Inline(InlineValue(b"bob".to_vec()))
+            snapshot.records[&TestKey::new("public.users", b"u2".to_vec())].value,
+            StoredValue::Inline(TestInlineValue(b"bob".to_vec()))
         );
         assert_eq!(encode_snapshot(&snapshot.records, snapshot.next_revision).unwrap(), bytes);
         let _ = fs::remove_dir_all(&dir);
@@ -689,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_writes_stay_byte_identical_to_a_full_encode() {
+    fn every_write_matches_a_full_encode() {
         let dir = temporary("incremental-bytes");
         let store = Store::open(&dir).unwrap();
         let big = [9_u8; 257];
@@ -725,43 +595,13 @@ mod tests {
                 .iter()
                 .map(|((namespace, key), (revision, value))| shared_record(namespace, key, value, *revision))
                 .collect::<BTreeMap<_, _>>();
-            assert_eq!(written, encode_snapshot(&snapshot, next_revision).unwrap());
+            assert_eq!(written, encode_snapshot(&snapshot, next_revision).unwrap(), "step {namespace}/{key:?}");
         }
         drop(store);
         let reopened = Store::open(&dir).unwrap();
         assert_eq!(reopened.get("public.users", b"u1"), Some(b"alice-again".to_vec()));
         assert_eq!(reopened.get("public.users", b"u2"), None);
         assert_eq!(reopened.get("sys.utf8", "雪".as_bytes()), Some(long_key.to_vec()));
-        drop(reopened);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn interrupted_rename_leaves_either_the_old_or_the_new_shard() {
-        let dir = temporary("fault-rename");
-        let store = Store::open(&dir).unwrap();
-        store.put("public.users", b"u1", b"alice").unwrap();
-        let old = fs::read(store.shard_path()).unwrap();
-
-        fault::arm(fault::BEFORE_RENAME);
-        let interrupted = store.put("public.users", b"u2", b"bob");
-        fault::disarm();
-        assert!(interrupted.is_err(), "the interrupted write must surface as an error");
-        assert_eq!(fs::read(store.shard_path()).unwrap(), old, "a failure before rename must keep the old shard");
-        let reopened = Store::open(&dir).unwrap();
-        assert_eq!(reopened.get("public.users", b"u1"), Some(b"alice".to_vec()));
-        assert_eq!(reopened.get("public.users", b"u2"), None);
-        drop(reopened);
-
-        fault::arm(fault::AFTER_RENAME);
-        let interrupted = store.put("public.users", b"u2", b"bob");
-        fault::disarm();
-        assert!(interrupted.is_err(), "a failure after the swap still reports an error");
-        let reopened = Store::open(&dir).unwrap();
-        assert_eq!(reopened.get("public.users", b"u1"), Some(b"alice".to_vec()));
-        assert_eq!(reopened.get("public.users", b"u2"), Some(b"bob".to_vec()));
-        let bytes = fs::read(reopened.shard_path()).unwrap();
-        assert_eq!(decode_shard(&bytes).unwrap().0.len(), 2, "the swapped shard must decode cleanly");
         drop(reopened);
         let _ = fs::remove_dir_all(&dir);
     }
