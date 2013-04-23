@@ -702,7 +702,7 @@ for item in protocol["decodeCommandTag"]:
 # cannot be expressed by the oracle's socket server: it answers `CopyInResponse`
 # and then fails with `08006 unexpected EOF ...` and `08P01 terminating ...`,
 # so that direction is labelled `oracle-limitation` here and verified against
-# scripted protocol fixtures in `postgres-client/tests/robustness.rs`.
+# scripted protocol fixtures in `database.client/tests/pgsql_robustness.rs`.
 # -------------------------------------------------------------------------------
 for item in protocol["encodeCopy"]:
     key = f"protocol/copy/{item['name']}"

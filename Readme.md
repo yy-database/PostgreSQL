@@ -8,8 +8,7 @@ surfaces on top.
 ## What this repository implements
 
 - **Wire layer.** Startup, simple-query and extended-protocol framing plus
-  response decoding come from `database-protocol-pgsql`, re-exported here as
-  `postgres_client::protocol`.
+  response decoding come from `database-protocol-pgsql`.
 - **Socket client.** `Connection::open` connects to a server and
   `Connection::execute` sends one simple-query packet and decodes the replies
   from `database-client`'s `pgsql` client.
@@ -325,7 +324,7 @@ pnpm test
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
 one shared corpus on both language surfaces. Floors: node 1203, python 1203,
-rust 18, consistency 396, native 4, server 20; TS and Python results must match
+rust 0, consistency 396, native 4, server 20; TS and Python results must match
 case by case; `skipped` must stay 0. With `PSQL_BIN` set the `server` stage
 executes 25 cases because the five `psql` cases join the run.
 
