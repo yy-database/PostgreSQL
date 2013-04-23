@@ -8,11 +8,11 @@ surfaces on top.
 ## What this repository implements
 
 - **Wire layer.** Startup, simple-query and extended-protocol framing plus
-  response decoding in
-  `projects/postgres.rs/postgres-client/src/protocol.rs`.
+  response decoding come from `database-protocol-pgsql`, re-exported here as
+  `postgres_client::protocol`.
 - **Socket client.** `Connection::open` connects to a server and
   `Connection::execute` sends one simple-query packet and decodes the replies
-  (`projects/postgres.rs/postgres-client/src/client.rs`).
+  from `database-client`'s `pgsql` client.
 - **Wire server.** `startPostgresServer` in
   `projects/postgres.ts/packages/postgres/src/server/` listens on TCP and speaks
   protocol v3 as the backend: startup, trust or cleartext-password
@@ -246,8 +246,9 @@ decoding failure the connection is marked unusable, so a later call returns
 `connection is unusable after ...` instead of reading the abandoned reply as
 if it belonged to the next statement. A server error (`08P01` for a bad `Bind`)
 is *not* a desync: the stream is drained to `ReadyForQuery` and the session
-stays usable. `postgres-client/tests/robustness.rs` drives every path above
-with fixed byte scripts against a loopback listener.
+stays usable. `database.client/tests/pgsql_robustness.rs` in the `database.rs`
+repository drives every path above with fixed byte scripts against a loopback
+listener.
 
 **Timeout and idle.** The socket timeout is a per-read limit, not a session
 deadline: a six-second idle gap leaves the session usable and the next
@@ -278,9 +279,9 @@ lost` (`postgres.c`, `PostgresMainLongJmp`), which tears the whole server down.
 The harness records those bytes as an **oracle limitation** from a throwaway
 server before the suites start, and both suites assert them. The direction
 itself is verified against fixed byte scripts in
-`postgres-client/tests/robustness.rs`: success, a mid-copy `22P02`, a rejection
-before `CopyInResponse` that must not stream any data, 500 chunks, and a peer
-that closes mid-stream.
+`database.client/tests/pgsql_robustness.rs`: success, a mid-copy `22P02`, a
+rejection before `CopyInResponse` that must not stream any data, 500 chunks,
+and a peer that closes mid-stream.
 
 **Extended query boundary.** `bind_packet_with_formats` carries text and binary
 parameters plus per-column result formats. It refuses a parameter-format count
