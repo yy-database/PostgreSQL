@@ -11,10 +11,13 @@ use std::sync::{Arc, Mutex};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use postgres_client::{
-    Column, MessageField, Notice, Param as PostgresParam, PostgresError, QueryResult,
+use database_client::pgsql::{
+    client::{ClientConfig, Column, Connection as CoreConnection, Param as PostgresParam, QueryResult},
+    error::{MessageField, Notice, PostgresError},
     psql::{PsqlOptions, format_results, parse_arguments},
+    ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
 };
+use database_protocol_pgsql as protocol;
 
 /// Where to connect and which identity to present.
 #[napi(object)]
@@ -173,7 +176,7 @@ pub struct CommandOptions {
 /// statement can be executed after the connection handed it out.
 #[napi]
 pub struct Connection {
-    inner: Arc<Mutex<Option<postgres_client::Connection>>>,
+    inner: Arc<Mutex<Option<CoreConnection>>>,
 }
 
 #[napi]
@@ -414,7 +417,7 @@ impl Connection {
 /// One named prepared statement on a live connection.
 #[napi]
 pub struct PreparedStatement {
-    connection: Arc<Mutex<Option<postgres_client::Connection>>>,
+    connection: Arc<Mutex<Option<CoreConnection>>>,
     name: String,
     parameters: Vec<u32>,
     columns: Vec<ColumnInfo>,
@@ -482,8 +485,8 @@ impl PreparedStatement {
 /// Opens one connection. The caller owns the handle and closes it.
 #[napi]
 pub fn connect(options: ClientOptions) -> Result<Connection> {
-    let config = postgres_client::ClientConfig::new(options.host, options.port, options.user, options.database);
-    postgres_client::Connection::open(&config)
+    let config = ClientConfig::new(options.host, options.port, options.user, options.database);
+    CoreConnection::open(&config)
         .map(|inner| Connection { inner: Arc::new(Mutex::new(Some(inner))) })
         .map_err(native)
 }
@@ -497,37 +500,37 @@ pub fn version() -> String {
 /// Protocol 3.0 number carried by the startup packet.
 #[napi]
 pub fn protocol_version() -> u32 {
-    postgres_client::protocol::PROTOCOL_VERSION
+    protocol::PROTOCOL_VERSION
 }
 
 /// Message length ceiling accepted by the client.
 #[napi]
 pub fn max_message_bytes() -> u32 {
-    postgres_client::protocol::MAX_MESSAGE_BYTES as u32
+    protocol::MAX_MESSAGE_BYTES as u32
 }
 
 /// Builds the startup packet for one identity.
 #[napi]
 pub fn encode_startup_packet(user: String, database: String) -> Buffer {
-    Buffer::from(postgres_client::protocol::startup_packet(&user, &database))
+    Buffer::from(protocol::startup_packet(&user, &database))
 }
 
 /// Builds one simple-query `Query` message.
 #[napi]
 pub fn encode_query_packet(sql: String) -> Result<Buffer> {
-    postgres_client::protocol::query_packet(&sql).map(Buffer::from).map_err(native)
+    protocol::query_packet(&sql).map(Buffer::from).map_err(native)
 }
 
 /// Builds the 16-byte `CancelRequest` sent on its own connection.
 #[napi]
 pub fn encode_cancel_request(process_id: i32, secret_key: i32) -> Buffer {
-    Buffer::from(postgres_client::protocol::cancel_request_packet(process_id, secret_key))
+    Buffer::from(protocol::cancel_request_packet(process_id, secret_key))
 }
 
 /// Decodes an `ErrorResponse` payload.
 #[napi]
 pub fn decode_error_response(payload: Buffer) -> Result<ServerErrorInfo> {
-    match postgres_client::protocol::error_response(payload.as_ref()) {
+    match protocol::error_response(payload.as_ref()) {
         PostgresError::Server { code, message, .. } => Ok(ServerErrorInfo { code, message }),
         other => Err(Error::from_reason(other.to_string())),
     }
@@ -536,7 +539,7 @@ pub fn decode_error_response(payload: Buffer) -> Result<ServerErrorInfo> {
 /// Decodes every `ErrorResponse` field, in wire order.
 #[napi]
 pub fn decode_error_fields(payload: Buffer) -> Result<Vec<MessageFieldInfo>> {
-    postgres_client::protocol::message_fields(payload.as_ref())
+    protocol::message_fields(payload.as_ref())
         .map(|fields| fields.iter().map(message_field_info).collect())
         .map_err(native)
 }
@@ -544,7 +547,7 @@ pub fn decode_error_fields(payload: Buffer) -> Result<Vec<MessageFieldInfo>> {
 /// Decodes every `NoticeResponse` field, in wire order.
 #[napi]
 pub fn decode_notice_fields(payload: Buffer) -> Result<Vec<MessageFieldInfo>> {
-    postgres_client::protocol::notice_response(payload.as_ref())
+    protocol::notice_response(payload.as_ref())
         .map(|notice| notice.fields.iter().map(message_field_info).collect())
         .map_err(native)
 }
@@ -552,26 +555,26 @@ pub fn decode_notice_fields(payload: Buffer) -> Result<Vec<MessageFieldInfo>> {
 /// Decodes the column names of a `RowDescription`.
 #[napi]
 pub fn decode_row_description(payload: Buffer) -> Result<Vec<String>> {
-    postgres_client::protocol::column_names(payload.as_ref()).map_err(native)
+    protocol::column_names(payload.as_ref()).map_err(native)
 }
 
 /// Decodes the cells of a `DataRow`.
 #[napi]
 pub fn decode_data_row(payload: Buffer, columns: u32) -> Result<Vec<Option<String>>> {
-    postgres_client::protocol::data_row(payload.as_ref(), columns as usize).map_err(native)
+    protocol::data_row(payload.as_ref(), columns as usize).map_err(native)
 }
 
 /// Decodes the command tag of a `CommandComplete`.
 #[napi]
 pub fn decode_command_tag(payload: Buffer) -> Result<String> {
-    postgres_client::protocol::command_tag(payload.as_ref()).map_err(native)
+    protocol::command_tag(payload.as_ref()).map_err(native)
 }
 
 /// Builds one extended-protocol `Parse` message. `paramTypes` holds OIDs;
 /// an empty list lets the server infer every parameter.
 #[napi]
 pub fn encode_parse_message(name: String, sql: String, param_types: Vec<u32>) -> Result<Buffer> {
-    postgres_client::protocol::parse_packet(&name, &sql, &param_types).map(Buffer::from).map_err(native)
+    protocol::parse_packet(&name, &sql, &param_types).map(Buffer::from).map_err(native)
 }
 
 /// Builds one extended-protocol `Bind` message. Parameters are text values and
@@ -586,7 +589,7 @@ pub fn encode_bind_message(
 ) -> Result<Buffer> {
     let format = u16::try_from(result_format).map_err(|_| Error::from_reason("result format does not fit 16 bits"))?;
     let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
-    postgres_client::protocol::bind_packet(&portal, &statement, &values, format).map(Buffer::from).map_err(native)
+    protocol::bind_packet(&portal, &statement, &values, format).map(Buffer::from).map_err(native)
 }
 
 /// Builds one extended-protocol `Bind` message with explicit parameter and
@@ -603,7 +606,7 @@ pub fn encode_bind_message_with_formats(
     let values: Vec<Option<&[u8]>> = owned.iter().map(|(_, value)| value.as_deref()).collect();
     let param_codes = result_formats_u16(param_formats)?;
     let result_codes = result_formats_u16(result_formats)?;
-    postgres_client::protocol::bind_packet_with_formats(&portal, &statement, &values, &param_codes, &result_codes)
+    protocol::bind_packet_with_formats(&portal, &statement, &values, &param_codes, &result_codes)
         .map(Buffer::from)
         .map_err(native)
 }
@@ -612,57 +615,57 @@ pub fn encode_bind_message_with_formats(
 #[napi]
 pub fn encode_describe_message(target: String, name: String) -> Result<Buffer> {
     let kind = describe_target(&target)?;
-    postgres_client::protocol::describe_packet(kind, &name).map(Buffer::from).map_err(native)
+    protocol::describe_packet(kind, &name).map(Buffer::from).map_err(native)
 }
 
 /// Builds one extended-protocol `Execute` message. `maxRows` of `0` runs the
 /// portal to completion and a positive limit suspends it after that many rows.
 #[napi]
 pub fn encode_execute_message(portal: String, max_rows: i32) -> Result<Buffer> {
-    postgres_client::protocol::execute_packet(&portal, max_rows).map(Buffer::from).map_err(native)
+    protocol::execute_packet(&portal, max_rows).map(Buffer::from).map_err(native)
 }
 
 /// Builds the `Sync` message that ends an extended-protocol round trip.
 #[napi]
 pub fn encode_sync_message() -> Buffer {
-    Buffer::from(postgres_client::protocol::sync_packet())
+    Buffer::from(protocol::sync_packet())
 }
 
 /// Builds one extended-protocol `Close` message for a statement or portal.
 #[napi]
 pub fn encode_close_message(target: String, name: String) -> Result<Buffer> {
     let kind = describe_target(&target)?;
-    postgres_client::protocol::close_packet(kind, &name).map(Buffer::from).map_err(native)
+    protocol::close_packet(kind, &name).map(Buffer::from).map_err(native)
 }
 
 /// Decodes the parameter OIDs of a `ParameterDescription`.
 #[napi]
 pub fn decode_parameter_description(payload: Buffer) -> Result<Vec<u32>> {
-    postgres_client::protocol::parameter_description(payload.as_ref()).map_err(native)
+    protocol::parameter_description(payload.as_ref()).map_err(native)
 }
 
 /// Builds one `CopyData` message carrying a chunk of the copy stream.
 #[napi]
 pub fn encode_copy_data(data: Buffer) -> Result<Buffer> {
-    postgres_client::protocol::copy_data_packet(data.as_ref()).map(Buffer::from).map_err(native)
+    protocol::copy_data_packet(data.as_ref()).map(Buffer::from).map_err(native)
 }
 
 /// Builds the `CopyDone` message that ends a `COPY ... FROM STDIN` stream.
 #[napi]
 pub fn encode_copy_done() -> Buffer {
-    Buffer::from(postgres_client::protocol::copy_done_packet())
+    Buffer::from(protocol::copy_done_packet())
 }
 
 /// Builds a `CopyFail` message carrying a human readable reason.
 #[napi]
 pub fn encode_copy_fail(reason: String) -> Result<Buffer> {
-    postgres_client::protocol::copy_fail_packet(&reason).map(Buffer::from).map_err(native)
+    protocol::copy_fail_packet(&reason).map(Buffer::from).map_err(native)
 }
 
 /// Decodes a `CopyInResponse`, `CopyOutResponse` or `CopyBothResponse` payload.
 #[napi]
 pub fn decode_copy_response(payload: Buffer) -> Result<CopyResponseInfo> {
-    let response = postgres_client::protocol::copy_response(payload.as_ref()).map_err(native)?;
+    let response = protocol::copy_response(payload.as_ref()).map_err(native)?;
     Ok(CopyResponseInfo {
         format: response.format as u32,
         columns: response.columns as u32,
@@ -673,13 +676,13 @@ pub fn decode_copy_response(payload: Buffer) -> Result<CopyResponseInfo> {
 /// OID of the named SQL type, or `null` when the mapping has no entry.
 #[napi]
 pub fn parameter_type_oid(name: String) -> Option<u32> {
-    postgres_client::protocol::parameter_type_oid(&name)
+    protocol::parameter_type_oid(&name)
 }
 
 /// Text-format `bytea` value: `\x` plus lowercase hexadecimal.
 #[napi]
 pub fn encode_bytea(bytes: Buffer) -> String {
-    postgres_client::protocol::encode_bytea(bytes.as_ref())
+    protocol::encode_bytea(bytes.as_ref())
 }
 
 /// Parses the supported `psql` flags.
@@ -698,7 +701,7 @@ pub fn format_psql_results(results: Vec<StatementResult>, options: CommandOption
 /// One durable `.yyds`/`.yykv` store.
 #[napi]
 pub struct Store {
-    inner: postgres_client::Store,
+    inner: CoreStore,
 }
 
 #[napi]
@@ -706,7 +709,7 @@ impl Store {
     /// Opens or creates a store in `dataDir`.
     #[napi(constructor)]
     pub fn new(data_dir: String) -> Result<Self> {
-        postgres_client::Store::open(&data_dir).map(|inner| Self { inner }).map_err(native)
+        CoreStore::open(&data_dir).map(|inner| Self { inner }).map_err(native)
     }
 
     /// Writes one row.
@@ -911,12 +914,12 @@ pub struct ServerStoreRow {
 /// One durable server data directory: `.yyds` catalog, `.yykv` shard and lock.
 #[napi]
 pub struct ServerStore {
-    inner: Mutex<Option<postgres_client::ServerStore>>,
+    inner: Mutex<Option<CoreServerStore>>,
 }
 
 fn with_server_store<T>(
-    inner: &Mutex<Option<postgres_client::ServerStore>>,
-    run: impl FnOnce(&mut postgres_client::ServerStore) -> Result<T>,
+    inner: &Mutex<Option<CoreServerStore>>,
+    run: impl FnOnce(&mut CoreServerStore) -> Result<T>,
 ) -> Result<T> {
     let mut guard = inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
     let store = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
@@ -928,7 +931,7 @@ impl ServerStore {
     /// Opens or creates the data directory and takes its lock.
     #[napi(constructor)]
     pub fn new(data_dir: String) -> Result<Self> {
-        postgres_client::ServerStore::open(&data_dir).map(|inner| Self { inner: Mutex::new(Some(inner)) }).map_err(native)
+        CoreServerStore::open(&data_dir).map(|inner| Self { inner: Mutex::new(Some(inner)) }).map_err(native)
     }
 
     /// Ordered prefix scan inside one namespace.
@@ -955,12 +958,12 @@ impl ServerStore {
         let mut batch = Vec::with_capacity(changes.len());
         for change in changes {
             batch.push(match change.kind.as_str() {
-                "put" => postgres_client::ServerChange::Put {
+                "put" => CoreServerChange::Put {
                     namespace: change.namespace,
                     key: change.key.to_vec(),
                     value: change.value.ok_or_else(|| Error::from_reason("put change carries no value"))?.to_vec(),
                 },
-                "delete" => postgres_client::ServerChange::Delete { namespace: change.namespace, key: change.key.to_vec() },
+                "delete" => CoreServerChange::Delete { namespace: change.namespace, key: change.key.to_vec() },
                 other => return Err(Error::from_reason(format!("unknown server store change kind {other}"))),
             });
         }
@@ -983,7 +986,7 @@ impl ServerStore {
         self.inner
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(postgres_client::ServerStore::durable_atomic_commit))
+            .and_then(|guard| guard.as_ref().map(CoreServerStore::durable_atomic_commit))
             .unwrap_or(false)
     }
 

@@ -10,10 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::{create_exception, exceptions::PyException, prelude::*};
 
-use postgres_client::{
-    Column, MessageField, Notice, Param as CoreParam, PostgresError as CoreError, QueryResult,
+use database_client::pgsql::{
+    client::{ClientConfig, Column, Connection as CoreConnection, Param as CoreParam, QueryResult},
+    error::{MessageField, Notice, PostgresError as CoreError},
     psql::{PsqlOptions as CoreOptions, format_results, parse_arguments},
+    ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
 };
+use database_protocol_pgsql as protocol;
 
 create_exception!(postgres_pyo3, PostgresError, PyException);
 
@@ -327,7 +330,7 @@ pub struct StoreRow {
 /// One socket in the protocol-v3 simple and extended query modes.
 #[pyclass]
 pub struct Connection {
-    inner: Arc<Mutex<Option<postgres_client::Connection>>>,
+    inner: Arc<Mutex<Option<CoreConnection>>>,
 }
 
 #[pymethods]
@@ -598,7 +601,7 @@ impl Connection {
 /// One named prepared statement on a live connection.
 #[pyclass]
 pub struct PreparedStatement {
-    connection: Arc<Mutex<Option<postgres_client::Connection>>>,
+    connection: Arc<Mutex<Option<CoreConnection>>>,
     name: String,
     parameters: Vec<u32>,
     columns: Vec<ColumnInfo>,
@@ -667,8 +670,8 @@ impl PreparedStatement {
 /// Opens one connection. The caller owns the handle and closes it.
 #[pyfunction]
 fn connect(host: &str, port: u16, user: &str, database: &str) -> PyResult<Connection> {
-    let config = postgres_client::ClientConfig::new(host, port, user, database);
-    postgres_client::Connection::open(&config)
+    let config = ClientConfig::new(host, port, user, database);
+    CoreConnection::open(&config)
         .map(|inner| Connection { inner: Arc::new(Mutex::new(Some(inner))) })
         .map_err(native)
 }
@@ -682,37 +685,37 @@ fn version() -> String {
 /// Protocol 3.0 number carried by the startup packet.
 #[pyfunction]
 fn protocol_version() -> u32 {
-    postgres_client::protocol::PROTOCOL_VERSION
+    protocol::PROTOCOL_VERSION
 }
 
 /// Message length ceiling accepted by the client.
 #[pyfunction]
 fn max_message_bytes() -> u32 {
-    postgres_client::protocol::MAX_MESSAGE_BYTES as u32
+    protocol::MAX_MESSAGE_BYTES as u32
 }
 
 /// Builds the startup packet for one identity.
 #[pyfunction]
 fn encode_startup_packet(user: &str, database: &str) -> Vec<u8> {
-    postgres_client::protocol::startup_packet(user, database)
+    protocol::startup_packet(user, database)
 }
 
 /// Builds one simple-query `Query` message.
 #[pyfunction]
 fn encode_query_packet(sql: &str) -> PyResult<Vec<u8>> {
-    postgres_client::protocol::query_packet(sql).map_err(native)
+    protocol::query_packet(sql).map_err(native)
 }
 
 /// Builds the 16-byte `CancelRequest` sent on its own connection.
 #[pyfunction]
 fn encode_cancel_request(process_id: i32, secret_key: i32) -> Vec<u8> {
-    postgres_client::protocol::cancel_request_packet(process_id, secret_key)
+    protocol::cancel_request_packet(process_id, secret_key)
 }
 
 /// Decodes an `ErrorResponse` payload into `(code, message)`.
 #[pyfunction]
 fn decode_error_response(payload: Vec<u8>) -> PyResult<(String, String)> {
-    match postgres_client::protocol::error_response(&payload) {
+    match protocol::error_response(&payload) {
         CoreError::Server { code, message, .. } => Ok((code, message)),
         other => Err(native(other)),
     }
@@ -721,7 +724,7 @@ fn decode_error_response(payload: Vec<u8>) -> PyResult<(String, String)> {
 /// Decodes the ordered fields of an `ErrorResponse` payload.
 #[pyfunction]
 fn decode_error_fields(payload: Vec<u8>) -> PyResult<Vec<MessageFieldInfo>> {
-    postgres_client::protocol::message_fields(&payload)
+    protocol::message_fields(&payload)
         .map(|fields| fields.iter().map(message_field_info).collect())
         .map_err(native)
 }
@@ -729,7 +732,7 @@ fn decode_error_fields(payload: Vec<u8>) -> PyResult<Vec<MessageFieldInfo>> {
 /// Decodes the ordered fields of a `NoticeResponse` payload.
 #[pyfunction]
 fn decode_notice_fields(payload: Vec<u8>) -> PyResult<Vec<MessageFieldInfo>> {
-    postgres_client::protocol::notice_response(&payload)
+    protocol::notice_response(&payload)
         .map(|notice| notice.fields.iter().map(message_field_info).collect())
         .map_err(native)
 }
@@ -737,26 +740,26 @@ fn decode_notice_fields(payload: Vec<u8>) -> PyResult<Vec<MessageFieldInfo>> {
 /// Decodes the column names of a `RowDescription`.
 #[pyfunction]
 fn decode_row_description(payload: Vec<u8>) -> PyResult<Vec<String>> {
-    postgres_client::protocol::column_names(&payload).map_err(native)
+    protocol::column_names(&payload).map_err(native)
 }
 
 /// Decodes the cells of a `DataRow`.
 #[pyfunction]
 fn decode_data_row(payload: Vec<u8>, columns: usize) -> PyResult<Vec<Option<String>>> {
-    postgres_client::protocol::data_row(&payload, columns).map_err(native)
+    protocol::data_row(&payload, columns).map_err(native)
 }
 
 /// Decodes the command tag of a `CommandComplete`.
 #[pyfunction]
 fn decode_command_tag(payload: Vec<u8>) -> PyResult<String> {
-    postgres_client::protocol::command_tag(&payload).map_err(native)
+    protocol::command_tag(&payload).map_err(native)
 }
 
 /// Builds one extended-protocol `Parse` message. `param_types` holds OIDs;
 /// an empty list lets the server infer every parameter.
 #[pyfunction]
 fn encode_parse_message(name: &str, sql: &str, param_types: Vec<u32>) -> PyResult<Vec<u8>> {
-    postgres_client::protocol::parse_packet(name, sql, &param_types).map_err(native)
+    protocol::parse_packet(name, sql, &param_types).map_err(native)
 }
 
 /// Builds one extended-protocol `Bind` message. Parameters are text values and
@@ -765,7 +768,7 @@ fn encode_parse_message(name: &str, sql: &str, param_types: Vec<u32>) -> PyResul
 #[pyfunction]
 fn encode_bind_message(portal: &str, statement: &str, params: Vec<Option<String>>, result_format: u16) -> PyResult<Vec<u8>> {
     let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
-    postgres_client::protocol::bind_packet(portal, statement, &values, result_format).map_err(native)
+    protocol::bind_packet(portal, statement, &values, result_format).map_err(native)
 }
 
 /// Builds one extended-protocol `Bind` message with explicit parameter and
@@ -782,64 +785,64 @@ fn encode_bind_message_with_formats(
     let values: Vec<Option<&[u8]>> = owned.iter().map(|(_, value)| value.as_deref()).collect();
     let param_codes = result_formats_u16(&param_formats)?;
     let result_codes = result_formats_u16(&result_formats)?;
-    postgres_client::protocol::bind_packet_with_formats(portal, statement, &values, &param_codes, &result_codes).map_err(native)
+    protocol::bind_packet_with_formats(portal, statement, &values, &param_codes, &result_codes).map_err(native)
 }
 
 /// Builds one extended-protocol `Describe` message for a statement or portal.
 #[pyfunction]
 fn encode_describe_message(target: &str, name: &str) -> PyResult<Vec<u8>> {
     let kind = describe_target(target)?;
-    postgres_client::protocol::describe_packet(kind, name).map_err(native)
+    protocol::describe_packet(kind, name).map_err(native)
 }
 
 /// Builds one extended-protocol `Execute` message. `max_rows` of `0` runs the
 /// portal to completion and a positive limit suspends it after that many rows.
 #[pyfunction]
 fn encode_execute_message(portal: &str, max_rows: i32) -> PyResult<Vec<u8>> {
-    postgres_client::protocol::execute_packet(portal, max_rows).map_err(native)
+    protocol::execute_packet(portal, max_rows).map_err(native)
 }
 
 /// Builds the `Sync` message that ends an extended-protocol round trip.
 #[pyfunction]
 fn encode_sync_message() -> Vec<u8> {
-    postgres_client::protocol::sync_packet()
+    protocol::sync_packet()
 }
 
 /// Builds one extended-protocol `Close` message for a statement or portal.
 #[pyfunction]
 fn encode_close_message(target: &str, name: &str) -> PyResult<Vec<u8>> {
     let kind = describe_target(target)?;
-    postgres_client::protocol::close_packet(kind, name).map_err(native)
+    protocol::close_packet(kind, name).map_err(native)
 }
 
 /// Decodes the parameter OIDs of a `ParameterDescription`.
 #[pyfunction]
 fn decode_parameter_description(payload: Vec<u8>) -> PyResult<Vec<u32>> {
-    postgres_client::protocol::parameter_description(&payload).map_err(native)
+    protocol::parameter_description(&payload).map_err(native)
 }
 
 /// Builds one `CopyData` message carrying a chunk of the copy stream.
 #[pyfunction]
 fn encode_copy_data(data: Vec<u8>) -> PyResult<Vec<u8>> {
-    postgres_client::protocol::copy_data_packet(&data).map_err(native)
+    protocol::copy_data_packet(&data).map_err(native)
 }
 
 /// Builds the `CopyDone` message that ends a `COPY ... FROM STDIN` stream.
 #[pyfunction]
 fn encode_copy_done() -> Vec<u8> {
-    postgres_client::protocol::copy_done_packet()
+    protocol::copy_done_packet()
 }
 
 /// Builds a `CopyFail` message carrying a human readable reason.
 #[pyfunction]
 fn encode_copy_fail(reason: &str) -> PyResult<Vec<u8>> {
-    postgres_client::protocol::copy_fail_packet(reason).map_err(native)
+    protocol::copy_fail_packet(reason).map_err(native)
 }
 
 /// Decodes a `CopyInResponse`, `CopyOutResponse` or `CopyBothResponse` payload.
 #[pyfunction]
 fn decode_copy_response(payload: Vec<u8>) -> PyResult<CopyResponseInfo> {
-    let response = postgres_client::protocol::copy_response(&payload).map_err(native)?;
+    let response = protocol::copy_response(&payload).map_err(native)?;
     Ok(CopyResponseInfo {
         format: response.format as u32,
         columns: response.columns as u32,
@@ -850,13 +853,13 @@ fn decode_copy_response(payload: Vec<u8>) -> PyResult<CopyResponseInfo> {
 /// OID of the named SQL type, or `None` when the mapping has no entry.
 #[pyfunction]
 fn parameter_type_oid(name: &str) -> Option<u32> {
-    postgres_client::protocol::parameter_type_oid(name)
+    protocol::parameter_type_oid(name)
 }
 
 /// Text-format `bytea` value: `\x` plus lowercase hexadecimal.
 #[pyfunction]
 fn encode_bytea(bytes: Vec<u8>) -> String {
-    postgres_client::protocol::encode_bytea(&bytes)
+    protocol::encode_bytea(&bytes)
 }
 
 /// Parses the supported `psql` flags.
@@ -875,14 +878,14 @@ fn format_psql_results(results: Vec<StatementResult>, options: PsqlOptions) -> V
 /// One durable `.yyds`/`.yykv` store.
 #[pyclass]
 pub struct Store {
-    inner: postgres_client::Store,
+    inner: CoreStore,
 }
 
 #[pymethods]
 impl Store {
     #[new]
     fn new(data_dir: String) -> PyResult<Self> {
-        postgres_client::Store::open(&data_dir).map(|inner| Self { inner }).map_err(native)
+        CoreStore::open(&data_dir).map(|inner| Self { inner }).map_err(native)
     }
 
     /// Writes one row.
@@ -968,14 +971,14 @@ impl ServerStoreChange {
 /// One durable server data directory: `.yyds` catalog, `.yykv` shard and lock.
 #[pyclass]
 pub struct ServerStore {
-    inner: Mutex<Option<postgres_client::ServerStore>>,
+    inner: Mutex<Option<CoreServerStore>>,
 }
 
 #[pymethods]
 impl ServerStore {
     #[new]
     fn new(data_dir: String) -> PyResult<Self> {
-        postgres_client::ServerStore::open(&data_dir).map(|inner| Self { inner: Mutex::new(Some(inner)) }).map_err(native)
+        CoreServerStore::open(&data_dir).map(|inner| Self { inner: Mutex::new(Some(inner)) }).map_err(native)
     }
 
     /// Ordered prefix scan inside one namespace.
@@ -1001,12 +1004,12 @@ impl ServerStore {
         let mut batch = Vec::with_capacity(changes.len());
         for change in changes {
             batch.push(match change.kind.as_str() {
-                "put" => postgres_client::ServerChange::Put {
+                "put" => CoreServerChange::Put {
                     namespace: change.namespace,
                     key: change.key,
                     value: change.value.ok_or_else(|| native_message("put change carries no value"))?,
                 },
-                "delete" => postgres_client::ServerChange::Delete { namespace: change.namespace, key: change.key },
+                "delete" => CoreServerChange::Delete { namespace: change.namespace, key: change.key },
                 other => return Err(native_message(format!("unknown server store change kind {other}"))),
             });
         }
@@ -1029,7 +1032,7 @@ impl ServerStore {
         self.inner
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(postgres_client::ServerStore::durable_atomic_commit))
+            .and_then(|guard| guard.as_ref().map(CoreServerStore::durable_atomic_commit))
             .unwrap_or(false)
     }
 
@@ -1055,10 +1058,10 @@ impl ServerStore {
 }
 
 /// Guard that dereferences to the live store, never to a closed slot.
-struct StoreGuard<'a>(std::sync::MutexGuard<'a, Option<postgres_client::ServerStore>>);
+struct StoreGuard<'a>(std::sync::MutexGuard<'a, Option<CoreServerStore>>);
 
 impl std::ops::Deref for StoreGuard<'_> {
-    type Target = postgres_client::ServerStore;
+    type Target = CoreServerStore;
 
     fn deref(&self) -> &Self::Target {
         self.0.as_ref().expect("server store is open")
