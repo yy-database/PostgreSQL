@@ -2,23 +2,27 @@
 
 `postgres-client` dropped its local `src/protocol.rs` (1026 lines), `src/client.rs`
 (889 lines) and `src/error.rs` (120 lines) in `5f60187` and now re-exports
-`database-protocol-pgsql` plus `database-client`. The `rust` harness stage only
-runs `cargo test -p postgres-client`, so its executable test count fell from 60
-to 35 while the re-export landed.
+`database-protocol-pgsql` plus `database-client`. Its two integration suites,
+`tests/robustness.rs` and `tests/roundtrip.rs`, moved to
+`database.client/tests/pgsql_robustness.rs` and `pgsql_live.rs` in the
+`database.rs` repository. The `rust` harness stage only runs
+`cargo test -p postgres-client`, so its executable test count fell from 60 to
+35 while the re-export landed and from 36 to 18 when the integration suites
+left.
 
 This ledger accounts for every disappeared test. It is the basis for the
-`floor: 35` value in `stages/rust.mjs`, which cites this file.
+`floor: 18` value in `stages/rust.mjs`, which cites this file.
 
 ## Counts
 
-| Source | Tests before removal | Tests left in this workspace |
-|--------|----------------------|-----------------------------|
-| `src/protocol.rs` | 23 | 0 (file removed) |
-| `src/client.rs` | 2 | 0 (file removed) |
-| `src/error.rs` | 0 | 0 (file removed) |
-| Other local unit tests | 17 | 17 |
-| `tests/roundtrip.rs` + `tests/robustness.rs` | 18 | 18 |
-| Total | 60 | 35 |
+| Source | Tests before removal | Tests left in this workspace | Where they went |
+|--------|----------------------|-----------------------------|-----------------|
+| `src/protocol.rs` | 23 | 0 (file removed) | `database-protocol-pgsql/src/messages.rs` |
+| `src/client.rs` | 2 | 0 (file removed) | `database-client/src/pgsql/client.rs` |
+| `src/error.rs` | 0 | 0 (file removed) | `database-client/src/pgsql/error.rs` |
+| Other local unit tests | 18 | 18 | stayed (one write-path test left with `FileShard`) |
+| `tests/roundtrip.rs` + `tests/robustness.rs` | 18 | 0 (files removed) | `database.client/tests/pgsql_live.rs` and `pgsql_robustness.rs` |
+| Total | 60 | 18 | |
 
 `error.rs` had no tests, so the whole 25-test drop comes from `protocol.rs` and
 `client.rs`.
@@ -71,12 +75,58 @@ No tests existed before the removal, so nothing migrated. Its error shape is
 carried by `database.client/src/pgsql/error.rs`; the `code`/`message`/`field`/
 `feature` accessors are still asserted by #2, #4, #21 and #23 above.
 
+## Per-test map: `tests/robustness.rs` (16 tests) and `tests/roundtrip.rs` (2 tests)
+
+Both suites spoke only framing and public client APIs, with no `Store`,
+`ServerStore` or `database-protocol-pgsql` dependency, so they compiled
+upstream with zero API additions. The copies are byte-identical apart from the
+`use` paths (`database_client::pgsql::client` and `database_client::pgsql::error`
+instead of `postgres_client`), and `roundtrip.rs` now returns early when
+`POSTGRES_TEST_PORT` is absent instead of failing, matching the other live
+tests in `database.client`.
+
+| # | Test | Behaviour asserted | Upstream file |
+|---|------|--------------------|---------------|
+| 26 | `cancel_request_uses_a_fresh_connection_and_the_backend_key` | Cancel opens a second socket and sends the backend pid/secret | `pgsql_robustness.rs` |
+| 27 | `server_error_then_ready_for_query_keeps_the_connection_usable` | `08P01` plus `ReadyForQuery` leaves the session usable | `pgsql_robustness.rs` |
+| 28 | `peer_close_after_a_partial_row_poisons_the_connection` | EOF mid-result marks the connection poisoned | `pgsql_robustness.rs` |
+| 29 | `truncated_message_length_poisons_the_connection` | A truncated length header poisons the connection | `pgsql_robustness.rs` |
+| 30 | `cancel_without_backend_key_data_is_a_protocol_error` | Cancel before `BackendKeyData` is a protocol error | `pgsql_robustness.rs` |
+| 31 | `copy_in_streams_every_chunk_and_reports_the_tag` | `COPY IN` streams every chunk and reports the tag | `pgsql_robustness.rs` |
+| 32 | `copy_in_mid_error_keeps_the_connection_usable` | A mid-copy error drains to `ReadyForQuery` | `pgsql_robustness.rs` |
+| 33 | `copy_in_rejected_before_copy_response_sends_no_data` | Rejection before `CopyInResponse` sends no data | `pgsql_robustness.rs` |
+| 34 | `copy_out_collects_every_chunk_and_reports_the_tag` | `COPY OUT` collects every chunk and reports the tag | `pgsql_robustness.rs` |
+| 35 | `copy_in_streams_a_large_batch_without_buffering_it` | A large batch is streamed without buffering | `pgsql_robustness.rs` |
+| 36 | `copy_in_transport_loss_poisons_the_connection` | Transport loss during copy poisons the connection | `pgsql_robustness.rs` |
+| 37 | `copy_out_error_keeps_the_prefix_and_the_connection_usable` | A copy-out error keeps the received prefix | `pgsql_robustness.rs` |
+| 38 | `binary_result_rows_are_decoded_from_the_wire` | Binary result rows decode to text | `pgsql_robustness.rs` |
+| 39 | `binary_decode_errors_drain_to_ready_for_query` | A binary decode error drains to `ReadyForQuery` | `pgsql_robustness.rs` |
+| 40 | `portal_suspension_keeps_rows_and_the_session_open` | Portal suspension keeps rows and the session open | `pgsql_robustness.rs` |
+| 41 | `binary_parameters_are_bound_as_bytes` | Binary parameters bind as raw bytes | `pgsql_robustness.rs` |
+| 42 | `selects_one_row_from_a_live_server` | `SELECT 1` tag, column name, cell and close | `pgsql_live.rs` |
+| 43 | `reports_server_error_code_and_message` | `42P01` code and `missing_table` message | `pgsql_live.rs` |
+
+The one local unit test that did not survive in place is the old
+`interrupted_rename_leaves_either_the_old_or_the_new_shard`: its write path is
+now `database-storage`'s `FileShard`, which owns the atomic-replace contract
+and its own crash tests. Two local tests were added instead
+(`flush_removes_one_namespace_and_keeps_the_revision_counter` and
+`namespace_validation_stays_on_the_binding_side`), which is why the local
+count is 18 rather than 17.
+
 ## Upstream run evidence
 
 ```
 cargo test -p database-protocol-pgsql   -> 25 passed; 0 failed; 0 ignored
 cargo test -p database-client           ->  8 passed; 0 failed; 0 ignored
+cargo test -p database-client --test pgsql_robustness -> 16 passed; 0 failed
+POSTGRES_TEST_PORT=55433 cargo test -p database-client --test pgsql_live -> 2 passed; 0 failed
 ```
+
+The live pair ran against PostgreSQL 16.9 on `127.0.0.1:55433`. The
+`database.rs` `check-rust.yml` now has a `postgres-live` job that starts a
+`postgres:16` service and runs `pgsql_live` with the `POSTGRES_TEST_*`
+variables.
 
 The protocol crate now holds the 23 mapped tests plus 2 authentication tests
 (`md5`/`SCRAM-SHA-256`) added by the deduplication line. The client crate holds
@@ -86,9 +136,11 @@ the 2 mapped tests plus 6 authentication tests.
 
 - All 25 disappeared tests exist upstream and pass, byte-identical where the
   module was shared. Nothing was "no longer meaningful" and nothing is missing.
+- The 18 integration tests moved to `database.client/tests`, where 16 run
+  always and 2 run in the `postgres-live` job against a `postgres:16` service.
 - This workspace's `rust` stage only runs `cargo test -p postgres-client`, so
-  its executable count legitimately fell from 60 to 35.
-- `stages/rust.mjs` therefore sets `floor: 35`, citing this ledger.
+  its executable count legitimately fell from 60 to 35 and then to 18.
+- `stages/rust.mjs` therefore sets `floor: 18`, citing this ledger.
 
 Recurring rule: **the floor may only move with per-item attribution.** Any
 commit that changes the executable test count must record which tests
