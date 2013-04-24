@@ -12,10 +12,10 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use database_client::pgsql::{
+    ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
     client::{ClientConfig, Column, Connection as CoreConnection, Param as PostgresParam, QueryResult},
     error::{MessageField, Notice, PostgresError},
     psql::{PsqlOptions, format_results, parse_arguments},
-    ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
 };
 use database_protocol_pgsql as protocol;
 
@@ -486,9 +486,7 @@ impl PreparedStatement {
 #[napi]
 pub fn connect(options: ClientOptions) -> Result<Connection> {
     let config = ClientConfig::new(options.host, options.port, options.user, options.database);
-    CoreConnection::open(&config)
-        .map(|inner| Connection { inner: Arc::new(Mutex::new(Some(inner))) })
-        .map_err(native)
+    CoreConnection::open(&config).map(|inner| Connection { inner: Arc::new(Mutex::new(Some(inner))) }).map_err(native)
 }
 
 /// Package version of this binding.
@@ -539,9 +537,7 @@ pub fn decode_error_response(payload: Buffer) -> Result<ServerErrorInfo> {
 /// Decodes every `ErrorResponse` field, in wire order.
 #[napi]
 pub fn decode_error_fields(payload: Buffer) -> Result<Vec<MessageFieldInfo>> {
-    protocol::message_fields(payload.as_ref())
-        .map(|fields| fields.iter().map(message_field_info).collect())
-        .map_err(native)
+    protocol::message_fields(payload.as_ref()).map(|fields| fields.iter().map(message_field_info).collect()).map_err(native)
 }
 
 /// Decodes every `NoticeResponse` field, in wire order.
@@ -983,11 +979,7 @@ impl ServerStore {
     /// Whether every commit survives process exit.
     #[napi]
     pub fn durable_atomic_commit(&self) -> bool {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(CoreServerStore::durable_atomic_commit))
-            .unwrap_or(false)
+        self.inner.lock().ok().and_then(|guard| guard.as_ref().map(CoreServerStore::durable_atomic_commit)).unwrap_or(false)
     }
 
     /// Data directory.

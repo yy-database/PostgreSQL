@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use pyo3::{create_exception, exceptions::PyException, prelude::*};
 
 use database_client::pgsql::{
+    ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
     client::{ClientConfig, Column, Connection as CoreConnection, Param as CoreParam, QueryResult},
     error::{MessageField, Notice, PostgresError as CoreError},
     psql::{PsqlOptions as CoreOptions, format_results, parse_arguments},
-    ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
 };
 use database_protocol_pgsql as protocol;
 
@@ -671,9 +671,7 @@ impl PreparedStatement {
 #[pyfunction]
 fn connect(host: &str, port: u16, user: &str, database: &str) -> PyResult<Connection> {
     let config = ClientConfig::new(host, port, user, database);
-    CoreConnection::open(&config)
-        .map(|inner| Connection { inner: Arc::new(Mutex::new(Some(inner))) })
-        .map_err(native)
+    CoreConnection::open(&config).map(|inner| Connection { inner: Arc::new(Mutex::new(Some(inner))) }).map_err(native)
 }
 
 /// Package version of this binding.
@@ -724,17 +722,13 @@ fn decode_error_response(payload: Vec<u8>) -> PyResult<(String, String)> {
 /// Decodes the ordered fields of an `ErrorResponse` payload.
 #[pyfunction]
 fn decode_error_fields(payload: Vec<u8>) -> PyResult<Vec<MessageFieldInfo>> {
-    protocol::message_fields(&payload)
-        .map(|fields| fields.iter().map(message_field_info).collect())
-        .map_err(native)
+    protocol::message_fields(&payload).map(|fields| fields.iter().map(message_field_info).collect()).map_err(native)
 }
 
 /// Decodes the ordered fields of a `NoticeResponse` payload.
 #[pyfunction]
 fn decode_notice_fields(payload: Vec<u8>) -> PyResult<Vec<MessageFieldInfo>> {
-    protocol::notice_response(&payload)
-        .map(|notice| notice.fields.iter().map(message_field_info).collect())
-        .map_err(native)
+    protocol::notice_response(&payload).map(|notice| notice.fields.iter().map(message_field_info).collect()).map_err(native)
 }
 
 /// Decodes the column names of a `RowDescription`.
@@ -1029,11 +1023,7 @@ impl ServerStore {
 
     /// Whether every commit survives process exit.
     fn durable_atomic_commit(&self) -> bool {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(CoreServerStore::durable_atomic_commit))
-            .unwrap_or(false)
+        self.inner.lock().ok().and_then(|guard| guard.as_ref().map(CoreServerStore::durable_atomic_commit)).unwrap_or(false)
     }
 
     /// Data directory.
