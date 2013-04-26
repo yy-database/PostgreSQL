@@ -97,6 +97,11 @@ Storage layout under `--data-dir`:
 - `local-0.yyds` holds the catalog document. `local-0.yykv` holds shards; the
   catalog is `pg_catalog/catalog`, and each user relation is `pg_data.<relOid>`
   with zero-padded row ids as keys.
+- `sql-schema.v0.json` is a `yyds-sql-schema/v0` projection of the same catalogs,
+  rewritten atomically after every schema commit so a data directory carries the
+  artifact set the yyds gateways expect. It is never read back for recovery, and
+  table names are qualified as `<database>.<schema>.<table>` because the registry
+  contract has no cluster dimension. `local-0.yyds` remains the only truth.
 - One statement message opens one `Database`, runs its statements, then calls
   `ServerStore.commitChanges` once. A multi-statement simple query therefore
   behaves like one implicit transaction: either every statement becomes durable
