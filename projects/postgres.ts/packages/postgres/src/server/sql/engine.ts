@@ -7,7 +7,11 @@ import {
     PUBLIC_NAMESPACE,
     SYSTEM_NAMESPACES,
     catalogTables,
+    describeObject,
     formatTypeByOid,
+    functionNameFor,
+    namespaceNameFor,
+    objectDescription,
     pgGetConstraintDef,
     pgGetExpr,
     pgGetIndexDef,
@@ -15,7 +19,10 @@ import {
     pgRelationIsPublishable,
     pgTableIsVisible,
     relationByName,
+    relationDisplayName,
+    relationOidForName,
     systemColumns,
+    systemRelationOidForName,
     typeByOid,
 } from './catalog.ts';
 import type { Database } from './database.ts';
@@ -102,6 +109,8 @@ interface Binding {
     alias: string;
     name: string;
     type: DataType;
+    /** System columns resolve by name but never expand through `*`. */
+    hidden?: boolean;
 }
 
 interface RowSet {
@@ -723,6 +732,7 @@ function expandTargets(database: Database, targets: Target[], columns: Binding[]
         if (target.expr.kind === 'star') {
             const qualifier = (target.expr as { qualifier: string | undefined }).qualifier;
             for (const binding of columns) {
+                if (binding.hidden) continue;
                 if (qualifier !== undefined && binding.alias !== qualifier) continue;
                 expanded.push({ expr: { kind: 'column', qualifier: binding.alias, name: binding.name } satisfies ColumnExpr, alias: undefined });
             }
@@ -821,8 +831,26 @@ function functionType(name: string): DataType {
             return typeOf('name');
         case 'pg_table_is_visible':
         case 'pg_relation_is_publishable':
+        case 'pg_type_is_visible':
+        case 'pg_conversion_is_visible':
+        case 'pg_operator_is_visible':
+        case 'pg_opclass_is_visible':
+        case 'pg_opfamily_is_visible':
+        case 'pg_amop_is_visible':
+        case 'pg_amproc_is_visible':
+        case 'pg_ts_config_is_visible':
+        case 'pg_ts_dict_is_visible':
+        case 'pg_ts_parser_is_visible':
+        case 'pg_ts_template_is_visible':
         case 'has_database_privilege':
             return BOOL;
+        case 'pg_table_size':
+        case 'pg_indexes_size':
+        case 'pg_total_relation_size':
+        case 'pg_relation_size':
+        case 'pg_database_size':
+        case 'pg_tablespace_size':
+            return typeOf('int8');
         case 'generate_series':
             return INT4;
         case 'nextval':
@@ -877,6 +905,12 @@ function findBinding(scope: Scope | undefined, qualifier: string | undefined, na
         if (candidates.length > 1) throw new ServerError('42702', `column reference "${name}" is ambiguous`, undefined, start);
         const found = candidates[0];
         if (found) return found;
+        // A bare name may also be the whole-row reference of a single-column
+        // FROM item, which is how psql addresses `unnest(...) x`.
+        if (qualifier === undefined) {
+            const single = current.columns.filter((column) => column.alias === name && !column.hidden);
+            if (single.length === 1 && current.columns.filter((column) => column.alias === name).length === 1) return single[0];
+        }
         if (qualifier !== undefined && current.columns.some((column) => column.alias === qualifier)) return undefined;
         current = current.outer;
     }
@@ -928,7 +962,7 @@ function functionColumns(ref: RelationRef): Binding[] {
 }
 
 function buildItem(database: Database, item: FromItem, params: SqlValue[], outer: Context | undefined): RowSet {
-    if (item.kind === 'relation') return buildRelation(database, item, params);
+    if (item.kind === 'relation') return buildRelation(database, item, params, outer);
     if (item.kind === 'subquery') {
         const result = executeSelect(database, item.select, params, outer);
         const alias = item.alias ?? '';
@@ -1090,6 +1124,12 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
             const values: SqlValue[] = ref.ordinality === true ? [argument, 1] : [argument];
             return { columns, rows: argument === null ? [] : [values] };
         }
+        if (lowered === 'unnest') {
+            const argument = ref.args[0] === undefined ? null : evaluate(database, ref.args[0], context ?? emptyContext(), params);
+            const values = argument === null ? [] : splitArray(argument);
+            const columns = functionColumns(ref);
+            return { columns, rows: values.map((value, index) => (ref.ordinality === true ? [value, index + 1] : [value])) };
+        }
         throw new ServerError('42883', `function ${ref.name}(${ref.args.length} arguments) does not exist`, undefined, ref.start);
     }
     const system = ref.schema === 'pg_catalog' ? systemColumns(ref.name) : ref.schema === undefined ? systemColumns(ref.name) : undefined;
@@ -1100,9 +1140,13 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
             database.roles,
             database.session.pgCursors?.() ?? [],
         ).get(ref.name);
+        const oid = systemRelationOidForName(ref.name) ?? 0;
         return {
-            columns: (table?.columns ?? system).map((column) => ({ alias, name: column.name, type: column.type })),
-            rows: table?.rows ?? [],
+            columns: [
+                ...(table?.columns ?? system).map((column) => ({ alias, name: column.name, type: column.type })),
+                { alias, name: 'tableoid', type: typeOf('oid'), hidden: true },
+            ],
+            rows: (table?.rows ?? []).map((row) => [...row, oid]),
         };
     }
     if (ref.schema !== undefined && ref.schema !== 'public') throw new ServerError('3F000', `schema "${ref.schema}" does not exist`, undefined, ref.start);
@@ -1113,8 +1157,14 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
         .filter((column) => column.relid === relation.oid)
         .sort((left, right) => left.attnum - right.attnum)
         .map((column) => ({ name: column.name, type: typeByOid(column.typeOid, column.typmod) }));
-    const rows = [...database.table(relation.oid).values()];
-    return { columns: columns.map((column) => ({ alias, name: column.name, type: column.type })), rows };
+    const rows = [...database.table(relation.oid).values()].map((row) => [...row, relation.oid]);
+    return {
+        columns: [
+            ...columns.map((column) => ({ alias, name: column.name, type: column.type })),
+            { alias, name: 'tableoid', type: typeOf('oid'), hidden: true },
+        ],
+        rows,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,17 +1281,17 @@ function lookup(database: Database, context: Context, qualifier: string | undefi
 function evaluateCast(database: Database, expr: CastExpr, context: Context, params: SqlValue[]): SqlValue {
     const value = evaluate(database, expr.expr, context, params);
     try {
-        return castValue(value, expr.type, { relationName: (oid) => relationDisplayName(database.catalog, oid) });
+        return castValue(value, expr.type, {
+            relationName: (oid) => relationDisplayName(database.catalog, oid),
+            relationOid: (text) => relationOidForName(database.catalog, text),
+            functionName: (oid) => functionNameFor(oid),
+        });
     }
     catch (error) {
         // Range errors surface from the executor without a source position.
         if (error instanceof ServerError && error.position === undefined && error.code !== '22003') error.position = expr.expr.start;
         throw error;
     }
-}
-
-function relationDisplayName(catalog: CatalogDoc, oid: number): string | null {
-    return catalog.relations.find((relation) => relation.oid === oid)?.name ?? null;
 }
 
 function evaluateBinary(database: Database, expr: BinaryExpr, context: Context, params: SqlValue[]): SqlValue {
@@ -1518,8 +1568,50 @@ function evaluateFunction(database: Database, expr: FunctionExpr, context: Conte
                 : hasDatabasePrivilege(database.databases, database.roles, text(first), text(second), text(third));
         }
         case 'pg_database_size':
-            // Databases share one physical store, so the size is a fixed stand-in.
-            return 8000000;
+        case 'pg_tablespace_size':
+            // Databases and tablespaces share one physical store, so every
+            // argument reports the same footprint.
+            return database.storeBytes();
+        case 'pg_tablespace_location':
+            // Only the seeded `pg_default`/`pg_global` tablespaces exist and
+            // both report an empty location, matching a fresh cluster.
+            return '';
+        case 'pg_table_size':
+        case 'pg_total_relation_size':
+        case 'pg_relation_size': {
+            const relation = database.catalog.relations.find((candidate) => candidate.oid === Number(args[0] ?? 0));
+            if (!relation) return 0;
+            // Indexes carry no separate storage: they are catalog metadata.
+            if (relation.relkind === 'i') return 0;
+            return database.relationBytes(relation.oid);
+        }
+        case 'pg_indexes_size': {
+            const relation = database.catalog.relations.find((candidate) => candidate.oid === Number(args[0] ?? 0));
+            if (!relation || relation.relkind !== 'r') return 0;
+            const count = database.catalog.indexes.filter((index) => index.relid === relation.oid).length;
+            return count === 0 ? 0 : database.relationBytes(relation.oid) * count;
+        }
+        case 'obj_description': {
+            const classOid = typeof args[1] === 'string' ? systemRelationOidForName(args[1]) : typeof args[1] === 'number' ? args[1] : null;
+            if (classOid === null) return null;
+            return objectDescription(classOid, Number(args[0]));
+        }
+        case 'col_description':
+            return null;
+        case 'pg_describe_object':
+            return describeObject(args[0] ?? null, args[1] ?? null);
+        case 'pg_type_is_visible':
+        case 'pg_conversion_is_visible':
+        case 'pg_operator_is_visible':
+        case 'pg_opclass_is_visible':
+        case 'pg_opfamily_is_visible':
+        case 'pg_amop_is_visible':
+        case 'pg_amproc_is_visible':
+        case 'pg_ts_config_is_visible':
+        case 'pg_ts_dict_is_visible':
+        case 'pg_ts_parser_is_visible':
+        case 'pg_ts_template_is_visible':
+            return true;
         case 'pg_size_pretty':
             return pgSizePretty(Number(args[0] ?? 0));
         case 'shobj_description': {

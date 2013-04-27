@@ -149,6 +149,33 @@ Indexes:
 asserts each one parses, executes and returns the real row count, and compares
 the two `psql` transcripts with the captured real ones.
 
+The same `server` stage now replays 68 system-catalog meta commands in one
+`psql` session (`fixtures/psql-meta.sql`) against a server seeded from
+`fixtures/meta-setup.sql`, and compares the transcript with one captured from a
+real PostgreSQL 16 cluster holding that identical schema. Covered families are
+`\d`/`\d+`/`\d <relation>`, `\dt`/`\di`/`\dv`/`\dm`/`\ds`/`\dP(i)` and their
+`+` variants, `\dn`, `\df`, `\dp`/`\z`, `\dA`, `\dc`, `\dD`, `\dd`, `\ddf`,
+`\dT`, `\dL`, `\dO`, `\dX`, `\dE`, `\det`, `\des`/`\dew`/`\deu`, `\dg`,
+`\dl`/`\lo_list`, `\db`, `\dRp`, `\drds`, `\ddp`, `\drg`, `\dRs`, `\dx`, `\l`.
+`psql` advisories for empty command results are compared as well, and a server
+`ERROR` anywhere in the sweep fails the check instead of being swallowed.
+
+`pg_table_size`, `pg_indexes_size`, `pg_database_size` and
+`pg_tablespace_size` report this engine's real byte footprint: the sum of
+`.yykv` key and value bytes for the relation, and catalog plus all relations for
+a database or tablespace. PostgreSQL counts 8 kB pages, so the `Size` cell of
+`\d+`, `\dt+`, `\di+`, `\l+` and `\db+` necessarily differs. The harness masks
+only that cell (and the alignment it implies) and still compares every other
+character; it does not claim the sizes match.
+
+Deliberately not implemented: `\dAc`, `\dAf`, `\dAo`, `\dAp` and `\dC`, which
+dump PostgreSQL's own built-in operator, function, aggregate and conversion
+catalogs; `\dFd`/`\dFp`/`\dFt` and their `+` variants, which dump built-in text
+search dictionaries, parsers and templates; `\dconfig`, which reads
+`pg_settings`; and `\sf`/`\sv`, which print function source. These describe the
+server's own implementation inventory rather than user objects, and `\sf`/`\sv`
+fail identically on an empty schema in a real cluster.
+
 SQLSTATE evidence through the `pg` driver: `22P02` invalid input syntax,
 `42703` unknown column, `42P01` unknown relation, `42P07` duplicate relation,
 `23502` not-null, `23505` duplicate key with `Key (id)=(2) already exists.`
@@ -329,9 +356,10 @@ pnpm test
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
 one shared corpus on both language surfaces. Floors: node 1203, python 1203,
-rust 0, consistency 396, native 4, server 20; TS and Python results must match
+rust 0, consistency 396, native 4, server 108; TS and Python results must match
 case by case; `skipped` must stay 0. With `PSQL_BIN` set the `server` stage
-executes 25 cases because the five `psql` cases join the run.
+additionally opens real `psql` sessions, including the 68-command
+system-catalog sweep described above.
 
 ## Wiring SQL onto this repository's storage (batch 2 landed)
 

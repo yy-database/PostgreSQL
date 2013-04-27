@@ -241,6 +241,7 @@ const SYSTEM_RELATIONS: SystemRelation[] = [
             ['attbyval', bool],
             ['attalign', char],
             ['attstorage', char],
+            ['attcompression', char],
             ['attnotnull', bool],
             ['atthasdef', bool],
             ['atthasmissing', bool],
@@ -293,7 +294,7 @@ const SYSTEM_RELATIONS: SystemRelation[] = [
             ['typacl', typeOf('text_array')],
         ),
     },
-    { name: 'pg_am', oid: 2601, columns: columns(['oid', oid], ['amname', name], ['amhandler', oid], ['amtype', char]) },
+    { name: 'pg_am', oid: 2601, columns: columns(['oid', oid], ['amname', name], ['amhandler', typeOf('regproc')], ['amtype', char]) },
     {
         name: 'pg_index',
         oid: 2610,
@@ -436,10 +437,22 @@ const SYSTEM_RELATIONS: SystemRelation[] = [
         columns: columns(['inhrelid', oid], ['inhparent', oid], ['inhseqno', int4], ['inhdetachpending', bool]),
     },
     {
-        // Only the shape psql's `\df` reads; user-defined functions are not stored.
+        // Only the shape psql's `\df`/`\ddf` reads; user-defined functions are not stored.
         name: 'pg_proc',
         oid: 1255,
-        columns: columns(['oid', oid], ['proname', name], ['pronamespace', oid], ['prokind', char]),
+        columns: columns(
+            ['oid', oid],
+            ['proname', name],
+            ['pronamespace', oid],
+            ['proowner', oid],
+            ['prolang', oid],
+            ['prokind', char],
+            ['provolatile', char],
+            ['proparallel', char],
+            ['prosecdef', bool],
+            ['proacl', typeOf('text_array')],
+            ['prosrc', text],
+        ),
     },
     {
         name: 'pg_database',
@@ -490,6 +503,306 @@ const SYSTEM_RELATIONS: SystemRelation[] = [
     },
     { name: 'pg_depend', oid: 2608, columns: columns(['classid', oid], ['objid', oid], ['objsubid', int4], ['refclassid', oid], ['refobjid', oid], ['refobjsubid', int4], ['deptype', char]) },
     {
+        // The engine has no user-defined languages, so only the seeded `plpgsql`
+        // row lives here. It is what `\dL` and `\df+` join against.
+        name: 'pg_language',
+        oid: 2612,
+        columns: columns(
+            ['oid', oid],
+            ['lanname', name],
+            ['lanowner', oid],
+            ['lanispl', bool],
+            ['lanpltrusted', bool],
+            ['lanplcallfoid', oid],
+            ['laninline', oid],
+            ['lanvalidator', oid],
+            ['lanacl', typeOf('text_array')],
+        ),
+    },
+    {
+        // `plpgsql` is the only extension this server ships.
+        name: 'pg_extension',
+        oid: 3079,
+        columns: columns(
+            ['oid', oid],
+            ['extname', name],
+            ['extowner', oid],
+            ['extnamespace', oid],
+            ['extrelocatable', bool],
+            ['extversion', text],
+            ['extconfig', typeOf('oid_array')],
+            ['extcondition', typeOf('text_array')],
+        ),
+    },
+    {
+        // Object comments, keyed by the class oid they belong to. Only the
+        // seeded namespaces, access methods, `plpgsql` and its language are
+        // annotated; user objects carry no comment because no `COMMENT ON`
+        // syntax is implemented.
+        name: 'pg_description',
+        oid: 2609,
+        columns: columns(['objoid', oid], ['classoid', oid], ['objsubid', int4], ['description', text]),
+    },
+    {
+        // Large objects are not implemented; `\dl` still needs the relation.
+        name: 'pg_largeobject_metadata',
+        oid: 2995,
+        columns: columns(['oid', oid], ['lomowner', oid], ['lomacl', typeOf('text_array')]),
+    },
+    {
+        name: 'pg_conversion',
+        oid: 2607,
+        columns: columns(
+            ['oid', oid],
+            ['conname', name],
+            ['connamespace', oid],
+            ['conowner', oid],
+            ['conforencoding', int4],
+            ['contoencoding', int4],
+            ['conproc', oid],
+            ['condefault', bool],
+        ),
+    },
+    {
+        name: 'pg_operator',
+        oid: 2617,
+        columns: columns(
+            ['oid', oid],
+            ['oprname', name],
+            ['oprnamespace', oid],
+            ['oprower', oid],
+            ['oprkind', char],
+            ['oprcanmerge', bool],
+            ['oprcanhash', bool],
+            ['oprleft', oid],
+            ['oprright', oid],
+            ['oprresult', oid],
+            ['oprcom', oid],
+            ['oprnegate', oid],
+            ['oprcode', oid],
+            ['oprrest', oid],
+            ['oprjoin', oid],
+        ),
+    },
+    {
+        name: 'pg_opclass',
+        oid: 2616,
+        columns: columns(
+            ['oid', oid],
+            ['opcmethod', oid],
+            ['opcname', name],
+            ['opcnamespace', oid],
+            ['opcowner', oid],
+            ['opcfamily', oid],
+            ['opcintype', oid],
+            ['opcdefault', bool],
+            ['opckeytype', oid],
+        ),
+    },
+    {
+        name: 'pg_opfamily',
+        oid: 2753,
+        columns: columns(['oid', oid], ['opfmethod', oid], ['opfname', name], ['opfnamespace', oid], ['opfowner', oid]),
+    },
+    {
+        name: 'pg_amop',
+        oid: 2602,
+        columns: columns(
+            ['oid', oid],
+            ['amopfamily', oid],
+            ['amoplefttype', oid],
+            ['amoprighttype', oid],
+            ['amopstrategy', int2],
+            ['amoppurpose', char],
+            ['amopopr', oid],
+            ['amopmethod', oid],
+            ['amopsortfamily', oid],
+        ),
+    },
+    {
+        name: 'pg_amproc',
+        oid: 2603,
+        columns: columns(
+            ['oid', oid],
+            ['amprocfamily', oid],
+            ['amproclefttype', oid],
+            ['amprocrighttype', oid],
+            ['amprocnum', int2],
+            ['amproc', oid],
+        ),
+    },
+    {
+        name: 'pg_rewrite',
+        oid: 2618,
+        columns: columns(
+            ['oid', oid],
+            ['rulename', name],
+            ['ev_class', oid],
+            ['ev_type', char],
+            ['ev_enabled', char],
+            ['is_instead', bool],
+            ['ev_qual', typeOf('pg_node_tree')],
+            ['ev_action', typeOf('pg_node_tree')],
+        ),
+    },
+    {
+        name: 'pg_foreign_server',
+        oid: 1417,
+        columns: columns(
+            ['oid', oid],
+            ['srvname', name],
+            ['srvowner', oid],
+            ['srvfdw', oid],
+            ['srvtype', text],
+            ['srvversion', text],
+            ['srvacl', typeOf('text_array')],
+            ['srvoptions', typeOf('text_array')],
+        ),
+    },
+    {
+        name: 'pg_foreign_data_wrapper',
+        oid: 2328,
+        columns: columns(
+            ['oid', oid],
+            ['fdwname', name],
+            ['fdwowner', oid],
+            ['fdwhandler', oid],
+            ['fdwvalidator', oid],
+            ['fdwacl', typeOf('text_array')],
+            ['fdwoptions', typeOf('text_array')],
+        ),
+    },
+    {
+        name: 'pg_foreign_table',
+        oid: 3118,
+        columns: columns(['ftrelid', oid], ['ftserver', oid], ['ftoptions', typeOf('text_array')]),
+    },
+    {
+        // `pg_user_mappings` is a view over `pg_user_mapping`; psql only reads
+        // the exposed column shape.
+        name: 'pg_user_mappings',
+        oid: 1418,
+        view: true,
+        columns: columns(
+            ['umid', oid],
+            ['srvid', oid],
+            ['srvname', name],
+            ['umuser', oid],
+            ['usename', name],
+            ['umoptions', typeOf('text_array')],
+        ),
+    },
+    {
+        name: 'pg_db_role_setting',
+        oid: 2964,
+        columns: columns(['oid', oid], ['setrole', oid], ['setdatabase', oid], ['setconfig', typeOf('text_array')]),
+    },
+    {
+        name: 'pg_event_trigger',
+        oid: 3466,
+        columns: columns(
+            ['oid', oid],
+            ['evtname', name],
+            ['evtevent', name],
+            ['evtowner', oid],
+            ['evtfoid', oid],
+            ['evtenabled', char],
+            ['evttags', typeOf('text_array')],
+        ),
+    },
+    {
+        name: 'pg_default_acl',
+        oid: 1034,
+        columns: columns(['oid', oid], ['defaclrole', oid], ['defaclnamespace', oid], ['defaclobjtype', char], ['defaclacl', typeOf('text_array')]),
+    },
+    {
+        name: 'pg_auth_members',
+        oid: 1261,
+        columns: columns(
+            ['oid', oid],
+            ['roleid', oid],
+            ['member', oid],
+            ['grantor', oid],
+            ['admin_option', bool],
+            ['inherit_option', bool],
+            ['set_option', bool],
+        ),
+    },
+    {
+        name: 'pg_subscription',
+        oid: 6100,
+        columns: columns(
+            ['oid', oid],
+            ['subdbid', oid],
+            ['subname', name],
+            ['subowner', oid],
+            ['subenabled', bool],
+            ['subconninfo', text],
+            ['subslotname', name],
+            ['subsynccommit', text],
+            ['subpublications', typeOf('text_array')],
+        ),
+    },
+    {
+        name: 'pg_ts_parser',
+        oid: 3601,
+        columns: columns(
+            ['oid', oid],
+            ['prsname', name],
+            ['prsnamespace', oid],
+            ['prsstart', oid],
+            ['prstoken', oid],
+            ['prsend', oid],
+            ['prsheadline', oid],
+            ['prslextype', oid],
+        ),
+    },
+    {
+        name: 'pg_ts_dict',
+        oid: 3600,
+        columns: columns(
+            ['oid', oid],
+            ['dictname', name],
+            ['dictnamespace', oid],
+            ['dictowner', oid],
+            ['dicttemplate', oid],
+            ['dictinitoption', text],
+        ),
+    },
+    {
+        name: 'pg_ts_template',
+        oid: 3764,
+        columns: columns(
+            ['oid', oid],
+            ['tmplname', name],
+            ['tmplnamespace', oid],
+            ['tmplinit', oid],
+            ['tmpllexize', oid],
+        ),
+    },
+    {
+        name: 'pg_ts_config',
+        oid: 3602,
+        columns: columns(['oid', oid], ['cfgname', name], ['cfgnamespace', oid], ['cfgowner', oid], ['cfgparser', oid]),
+    },
+    {
+        name: 'pg_ts_config_map',
+        oid: 3603,
+        columns: columns(['mapcfg', oid], ['maptokentype', int4], ['mapseqno', int4], ['mapdict', oid]),
+    },
+    {
+        name: 'pg_cast',
+        oid: 2605,
+        columns: columns(
+            ['oid', oid],
+            ['castsource', oid],
+            ['casttarget', oid],
+            ['castfunc', oid],
+            ['castcontext', char],
+            ['castmethod', char],
+        ),
+    },
+    {
         // A view over session portals, so its rows come from the live session
         // rather than from the catalog document.
         name: 'pg_cursors',
@@ -522,6 +835,56 @@ const AMS = [
     { oid: 2742, name: 'gin', handler: 333, type: 'i' },
     { oid: 3580, name: 'brin', handler: 4600, type: 'i' },
     { oid: 4000, name: 'spgist', handler: 4001, type: 'i' },
+];
+
+/** Oids for the seeded `plpgsql` language and extension, matching a fresh 16 cluster. */
+const PLPGSQL_LANGUAGE_OID = 13699;
+const PLPGSQL_EXTENSION_OID = 15096;
+const PLPGSQL_HANDLERS = {
+    call: 'plpgsql_call_handler()',
+    inline: 'plpgsql_inline_handler(internal)',
+    validator: 'plpgsql_validator(oid)',
+};
+
+const AM_DESCRIPTIONS: Record<number, string> = {
+    2: 'heap table access method',
+    403: 'b-tree index access method',
+    405: 'hash index access method',
+    783: 'GiST index access method',
+    2742: 'GIN index access method',
+    3580: 'block range index (BRIN) access method',
+    4000: 'SP-GiST index access method',
+};
+
+const AM_HANDLER_NAMES: Record<number, string> = {
+    5: 'heap_tableam_handler',
+    330: 'bthandler',
+    331: 'hashhandler',
+    332: 'gisthandler',
+    333: 'ginhandler',
+    4600: 'brinhandler',
+    4001: 'spghandler',
+};
+
+/** `regproc`/`regprocedure` name for the built-in handlers this projection seeds. */
+export function functionNameFor(oidValue: number): string | null {
+    return AM_HANDLER_NAMES[oidValue] ?? null;
+}
+
+/** `obj_description` rows the projection seeds; user objects carry no comment. */
+const OBJECT_DESCRIPTIONS: [number, number, string][] = [
+    [2615, 2200, 'standard public schema'],
+    [3079, PLPGSQL_EXTENSION_OID, 'PL/pgSQL procedural language'],
+    [2612, PLPGSQL_LANGUAGE_OID, 'PL/pgSQL procedural language'],
+    ...AMS.map((am): [number, number, string] => [2601, am.oid, AM_DESCRIPTIONS[am.oid]!]),
+];
+
+/** `pg_describe_object` entries for the members of the seeded `plpgsql` extension. */
+const DEPENDENCY_DESCRIPTIONS: [number, number, string][] = [
+    [1255, 13693, 'function plpgsql_call_handler()'],
+    [1255, 13694, 'function plpgsql_inline_handler(internal)'],
+    [1255, 13695, 'function plpgsql_validator(oid)'],
+    [2612, PLPGSQL_LANGUAGE_OID, 'language plpgsql'],
 ];
 
 const BUILTIN_TYPES: { oid: number; name: string; len: number; byval: boolean; category: string; arrayOid: number | null; collation: number }[] = [
@@ -642,6 +1005,53 @@ export function relationDisplayName(doc: CatalogDoc, oidValue: number): string |
     if (relation) return relation.name;
     const system = SYSTEM_BY_OID.get(oidValue);
     return system ? system.name : null;
+}
+
+/** Resolves a `regclass` input written as a name or a numeric oid. */
+export function relationOidForName(doc: CatalogDoc, text: string): number | null {
+    if (/^\d+$/.test(text)) return Number(text);
+    const parts = text.split('.').map((part) => part.replace(/"/g, ''));
+    const name = parts[parts.length - 1]!;
+    const system = SYSTEM_BY_NAME.get(name);
+    if (system && (parts.length === 1 || parts[parts.length - 2] === 'pg_catalog')) return system.oid;
+    for (const relation of doc.relations) if (relation.name === name) return relation.oid;
+    for (const index of doc.indexes) if (index.name === name) return index.oid;
+    for (const constraint of doc.constraints) {
+        if (!constraint.indexOid) continue;
+        const index = doc.indexes.find((candidate) => candidate.oid === constraint.indexOid);
+        if (index && index.name === name) return index.oid;
+    }
+    return null;
+}
+
+/** The oid of a system relation named in a catalog argument. */
+export function systemRelationOidForName(text: string): number | null {
+    const bare = text.includes('.') ? text.slice(text.lastIndexOf('.') + 1) : text;
+    return SYSTEM_BY_NAME.get(bare)?.oid ?? null;
+}
+
+/** `obj_description` over the seeded comment projection. */
+export function objectDescription(classOid: number, objectOid: number): SqlValue {
+    const entry = OBJECT_DESCRIPTIONS.find(([classoid, objoid]) => classoid === classOid && objoid === objectOid);
+    return entry ? entry[2] : null;
+}
+
+/** `pg_describe_object` over the seeded `plpgsql` extension members. */
+export function describeObject(classid: SqlValue, objid: SqlValue): SqlValue {
+    const entry = DEPENDENCY_DESCRIPTIONS.find(([classOid, objectOid]) => classOid === Number(classid) && objectOid === Number(objid));
+    return entry ? entry[2] : null;
+}
+
+const NAMESPACE_NAMES = new Map<number, string>([
+    [11, 'pg_catalog'],
+    [99, 'pg_toast'],
+    [2200, 'public'],
+    [13207, 'information_schema'],
+]);
+
+/** `regnamespace` output for the namespaces this cluster publishes. */
+export function namespaceNameFor(oidValue: SqlValue): SqlValue {
+    return typeof oidValue === 'number' ? NAMESPACE_NAMES.get(oidValue) ?? null : oidValue;
 }
 
 /** One row of `pg_cursors`, supplied by the live session for its open portals. */
@@ -790,6 +1200,7 @@ export function catalogTables(
                 attbyval: false,
                 attalign: 'i',
                 attstorage: 'x',
+                attcompression: '',
                 attnotnull: false,
                 atthasdef: false,
                 atthasmissing: false,
@@ -817,7 +1228,8 @@ export function catalogTables(
             atttypmod: column.typmod,
             attbyval: isByValue(column.typeOid),
             attalign: 'i',
-            attstorage: 'p',
+            attstorage: storageForType(column.typeOid),
+            attcompression: '',
             attnotnull: column.notNull,
             atthasdef: column.defaultText !== null,
             atthasmissing: false,
@@ -830,7 +1242,7 @@ export function catalogTables(
         });
     }
 
-    for (const am of AMS) push('pg_am', { oid: am.oid, amname: am.name, amhandler: am.handler, amtype: am.type });
+    for (const am of AMS) push('pg_am', { oid: am.oid, amname: am.name, amhandler: AM_HANDLER_NAMES[am.handler] ?? am.handler, amtype: am.type });
 
     for (const type of BUILTIN_TYPES) {
         push('pg_type', {
@@ -988,6 +1400,42 @@ export function catalogTables(
     push('pg_tablespace', { oid: 1663, spcname: 'pg_default', spcowner: POSTGRES_ROLE });
     push('pg_tablespace', { oid: 1664, spcname: 'pg_global', spcowner: POSTGRES_ROLE });
 
+    push('pg_language', {
+        oid: PLPGSQL_LANGUAGE_OID,
+        lanname: 'plpgsql',
+        lanowner: POSTGRES_ROLE,
+        lanispl: true,
+        lanpltrusted: true,
+        lanplcallfoid: PLPGSQL_HANDLERS.call,
+        laninline: PLPGSQL_HANDLERS.inline,
+        lanvalidator: PLPGSQL_HANDLERS.validator,
+        lanacl: null,
+    });
+    push('pg_extension', {
+        oid: PLPGSQL_EXTENSION_OID,
+        extname: 'plpgsql',
+        extowner: POSTGRES_ROLE,
+        extnamespace: 11,
+        extrelocatable: false,
+        extversion: '1.0',
+        extconfig: null,
+        extcondition: null,
+    });
+    for (const [classoid, objoid, description] of OBJECT_DESCRIPTIONS) {
+        push('pg_description', { objoid, classoid, objsubid: 0, description });
+    }
+    for (const [classid, objid] of DEPENDENCY_DESCRIPTIONS) {
+        push('pg_depend', {
+            classid,
+            objid,
+            objsubid: 0,
+            refclassid: 3079,
+            refobjid: PLPGSQL_EXTENSION_OID,
+            refobjsubid: 0,
+            deptype: 'e',
+        });
+    }
+
     return tables;
 }
 
@@ -1129,6 +1577,13 @@ function typeLengthOf(type: DataType): number {
 
 function isByValue(typeOidValue: number): boolean {
     return BUILTIN_BY_OID.get(typeOidValue)?.byval ?? false;
+}
+
+/** PostgreSQL's default `typstorage` for the types this server stores. */
+function storageForType(typeOidValue: number): string {
+    if (typeOidValue === 1700) return 'm';
+    if (typeOidValue === 25 || typeOidValue === 1042 || typeOidValue === 1043) return 'x';
+    return 'p';
 }
 
 /** Rejects writes to the system catalog surface. */

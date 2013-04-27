@@ -1,0 +1,9 @@
+psql:E:/���ݿ��о�/PostgreSQL/projects/postgres.ts/packages/postgres-harness/fixtures/psql-meta.sql:26: error: Did not find any settings.
+psql:E:/���ݿ��о�/PostgreSQL/projects/postgres.ts/packages/postgres-harness/fixtures/psql-meta.sql:28: error: Did not find any relations.
+psql:E:/���ݿ��о�/PostgreSQL/projects/postgres.ts/packages/postgres-harness/fixtures/psql-meta.sql:29: error: Did not find any relations.
+psql:E:/���ݿ��о�/PostgreSQL/projects/postgres.ts/packages/postgres-harness/fixtures/psql-meta.sql:32: error: Did not find any relations.
+psql:E:/���ݿ��о�/PostgreSQL/projects/postgres.ts/packages/postgres-harness/fixtures/psql-meta.sql:33: error: Did not find any relations.
+psql:E:/���ݿ��о�/PostgreSQL/projects/postgres.ts/packages/postgres-harness/fixtures/psql-meta.sql:45: error: Did not find any relations.
+psql:E:/���ݿ��о�/PostgreSQL/projects/postgres.ts/packages/postgres-harness/fixtures/psql-meta.sql:46: error: Did not find any relations.
+psql:E:/���ݿ��о�/PostgreSQL/projects/postgres.ts/packages/postgres-harness/fixtures/psql-meta.sql:60: error: Did not find any relations.
+psql:E:/���ݿ��о�/PostgreSQL/projects/postgres.ts/packages/postgres-harness/fixtures/psql-meta.sql:61: error: Did not find any relations.
