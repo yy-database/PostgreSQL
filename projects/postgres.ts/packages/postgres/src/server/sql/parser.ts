@@ -452,6 +452,10 @@ export interface TransactionStatement {
     kind: 'transaction';
     command: 'begin' | 'commit' | 'rollback' | 'savepoint' | 'release' | 'rollback-to';
     name: string | undefined;
+    /** Isolation level named on `BEGIN`/`START TRANSACTION`, if any. */
+    isolation?: string;
+    /** `READ ONLY`/`READ WRITE` named on `BEGIN`, if any. */
+    readOnly?: boolean;
 }
 
 /** Options accepted by `COPY ... FROM STDIN` / `COPY ... TO STDOUT`. */
@@ -2417,7 +2421,47 @@ class Parser {
             this.accept('WORK');
             this.accept('TRANSACTION');
         }
-        return { kind: 'transaction', command: 'begin', name: undefined };
+        return { kind: 'transaction', command: 'begin', name: undefined, ...this.parseTransactionOptions() };
+    }
+
+    /** Parses the `ISOLATION LEVEL`/`READ ONLY` options shared by `BEGIN` and `SET TRANSACTION`. */
+    private parseTransactionOptions(): { isolation?: string; readOnly?: boolean } {
+        const options: { isolation?: string; readOnly?: boolean } = {};
+        for (;;) {
+            if (this.at('ISOLATION')) {
+                this.next();
+                this.expect('LEVEL');
+                if (this.accept('READ')) {
+                    if (this.accept('UNCOMMITTED')) options.isolation = 'read uncommitted';
+                    else {
+                        this.expect('COMMITTED');
+                        options.isolation = 'read committed';
+                    }
+                }
+                else if (this.accept('REPEATABLE')) {
+                    this.expect('READ');
+                    options.isolation = 'repeatable read';
+                }
+                else {
+                    this.expect('SERIALIZABLE');
+                    options.isolation = 'serializable';
+                }
+                continue;
+            }
+            if (this.at('READ')) {
+                this.next();
+                if (this.accept('ONLY')) options.readOnly = true;
+                else {
+                    this.expect('WRITE');
+                    options.readOnly = false;
+                }
+                continue;
+            }
+            // `[NOT] DEFERRABLE` only matters to serializable transactions that
+            // wait instead of failing, but PostgreSQL accepts it on every level.
+            if (this.accept('DEFERRABLE') || (this.accept('NOT') && (this.expect('DEFERRABLE'), true))) continue;
+            return options;
+        }
     }
 
     private parseTransaction(command: 'commit'): TransactionStatement {

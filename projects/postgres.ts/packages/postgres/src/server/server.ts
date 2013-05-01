@@ -25,6 +25,7 @@ import {
 } from './sql/parser.ts';
 import { decodeBinaryParameter } from './sql/binary.ts';
 import { describeSelect, inferParameterTypes, runStatement, type Field, type Outcome } from './sql/engine.ts';
+import { LockWait, snapshotIsolation, TransactionManager, type IsolationLevel, type TransactionHandle } from './sql/transaction.ts';
 import { TEXT, formatValue, parseLiteral, typeLength, typeOid, type SqlValue, type DataType } from './sql/types.ts';
 import {
     authenticationCleartextPassword,
@@ -159,6 +160,7 @@ for (const [canonical, value] of [
     ['bytea_output', 'hex'],
     ['client_min_messages', 'notice'],
     ['default_transaction_isolation', 'read committed'],
+    ['transaction_isolation', 'read committed'],
     ['statement_timeout', '0'],
     ['lock_timeout', '0'],
     ['idle_in_transaction_session_timeout', '0'],
@@ -252,13 +254,19 @@ function unquote(value: string): string {
 
 /** Splits a simple-query payload on statement boundaries outside quotes and comments. */
 export function splitStatements(sql: string): string[] {
-    const statements: string[] = [];
+    return scanStatements(sql).map((part) => part.text);
+}
+
+/** Splits like [`splitStatements`], also telling where each statement starts. */
+export function scanStatements(sql: string): { text: string; start: number }[] {
+    const statements: { raw: string; start: number }[] = [];
     let current = '';
+    let segmentStart = 0;
     let single = false;
     let double = false;
     let lineComment = false;
     for (let index = 0; index < sql.length; index += 1) {
-        const character = sql[index];
+        const character = sql[index]!;
         const next = sql[index + 1];
         if (lineComment) {
             if (character === '\n') lineComment = false;
@@ -270,6 +278,7 @@ export function splitStatements(sql: string): string[] {
             continue;
         }
         if (!double && character === "'") {
+            if (current.trim().length === 0) segmentStart = index;
             current += character;
             if (single && next === "'") {
                 current += "'";
@@ -280,19 +289,23 @@ export function splitStatements(sql: string): string[] {
             continue;
         }
         if (!single && character === '"') {
+            if (current.trim().length === 0) segmentStart = index;
             double = !double;
             current += character;
             continue;
         }
         if (!single && !double && character === ';') {
-            statements.push(current);
+            statements.push({ raw: current, start: segmentStart });
             current = '';
             continue;
         }
+        if (current.trim().length === 0 && !/\s/.test(character)) segmentStart = index;
         current += character;
     }
-    statements.push(current);
-    return statements.map((statement) => statement.trim()).filter((statement) => statement.length > 0);
+    statements.push({ raw: current, start: segmentStart });
+    return statements
+        .map((part) => ({ text: part.raw.trim(), start: part.start + (part.raw.length - part.raw.replace(/^\s+/, '').length) }))
+        .filter((part) => part.text.length > 0);
 }
 
 /** An engine result plus the streamed `COPY ... TO STDOUT` payload. */
@@ -354,7 +367,28 @@ class Session {
     private closing = false;
     private readonly runtime: SessionRuntime = createSessionRuntime();
     /** Set while an explicit `BEGIN` transaction is open, across messages. */
-    private transaction: { database: Database; savepoints: { name: string; state: Database }[]; aborted: boolean } | null = null;
+    private transaction:
+        | {
+              database: Database;
+              handle: TransactionHandle;
+              isolation: IsolationLevel;
+              readOnly: boolean;
+              /** `true` once a real statement ran, which freezes `SET TRANSACTION`. */
+              started: boolean;
+              savepoints: { name: string; state: Database }[];
+              aborted: boolean;
+          }
+        | null = null;
+    /** Row locks of the implicit transaction owned by the current message. */
+    private implicitHandle: TransactionHandle | null = null;
+    /** A suspended simple-query batch awaiting a row lock. */
+    private pendingBatch: { statements: string[]; index: number; outcomes: ServerOutcome[]; implicit: Database | null } | null = null;
+    /** A suspended extended-protocol `Execute` awaiting a row lock. */
+    private pendingExecute: Buffer | null = null;
+    private suspended = false;
+    private readonly manager: TransactionManager;
+    /** Byte offset of each statement of the current simple query, for psql's caret. */
+    private statementOffsets: number[] = [];
     private readonly hub: NotificationHub;
     private readonly channels = new Set<string>();
     /** `NOTIFY` payloads accumulated until the next commit. */
@@ -375,7 +409,14 @@ class Session {
           }
         | null = null;
 
-    constructor(socket: net.Socket, options: PostgresServerOptions, storage: Storage, hub: NotificationHub, cluster: ClusterStore) {
+    constructor(
+        socket: net.Socket,
+        options: PostgresServerOptions,
+        storage: Storage,
+        hub: NotificationHub,
+        cluster: ClusterStore,
+        manager: TransactionManager,
+    ) {
         this.socket = socket;
         this.user = options.user ?? 'postgres';
         this.database = options.database ?? 'postgres';
@@ -383,6 +424,7 @@ class Session {
         this.baseStorage = storage;
         this.storage = scopedStorage(storage, databasePrefix(this.database));
         this.cluster = cluster;
+        this.manager = manager;
         this.hub = hub;
         this.runtime.pgCursors = () =>
             [...this.cursors.entries()].map(([name, cursor]) => ({
@@ -409,8 +451,31 @@ class Session {
         this.socket.on('error', () => this.destroy());
         this.socket.on('close', () => {
             this.hub.sessions.delete(this);
+            this.endTransactions();
             this.purgeTempTables();
         });
+    }
+
+    /** Aborts an open transaction and releases its row locks when the client goes away. */
+    private endTransactions(): void {
+        if (this.transaction !== null) {
+            this.manager.rollback(this.transaction.handle);
+            this.transaction = null;
+        }
+        if (this.implicitHandle !== null) {
+            this.manager.rollback(this.implicitHandle);
+            this.implicitHandle = null;
+        }
+    }
+
+    /** Drops a parked session that will never resume. */
+    private forgetLocks(): void {
+        if (this.transaction !== null) this.manager.forget(this.transaction.handle);
+        if (this.implicitHandle !== null) this.manager.forget(this.implicitHandle);
+        this.transaction = null;
+        this.implicitHandle = null;
+        this.pendingBatch = null;
+        this.pendingExecute = null;
     }
 
     /** Drops the temporary tables this session leaves behind, like session exit. */
@@ -441,6 +506,7 @@ class Session {
     destroy(): void {
         this.closing = true;
         this.hub.sessions.delete(this);
+        this.forgetLocks();
         this.socket.destroy();
     }
 
@@ -448,12 +514,13 @@ class Session {
     terminate(): void {
         this.closing = true;
         this.hub.sessions.delete(this);
+        this.forgetLocks();
         this.socket.write(errorResponse({ severity: 'FATAL', code: '57P01', message: 'terminating connection due to administrator command' }));
         this.socket.end();
     }
 
     private pump(): void {
-        while (!this.closing) {
+        while (!this.closing && !this.suspended) {
             if (this.startupPhase) {
                 if (this.buffer.length < 4) return;
                 const length = this.buffer.readInt32BE(0);
@@ -577,6 +644,8 @@ class Session {
                 ['session_authorization', user],
                 ['application_name', applicationName],
                 ['default_transaction_read_only', 'off'],
+                ['default_transaction_isolation', 'read committed'],
+                ['transaction_isolation', 'read committed'],
                 ['in_hot_standby', 'off'],
                 ['max_connections', '100'],
             ]),
@@ -677,7 +746,9 @@ class Session {
             this.fail('08006', 'session is not authenticated');
             return;
         }
-        const statements = splitStatements(sql);
+        const parts = scanStatements(sql);
+        const statements = parts.map((part) => part.text);
+        this.statementOffsets = parts.map((part) => part.start);
         if (statements.length === 0) {
             this.socket.write(emptyQueryResponse());
             this.socket.write(readyForQuery(this.transactionStatus()));
@@ -701,7 +772,7 @@ class Session {
                 if (/^(?:begin|start|commit|end|rollback|abort|savepoint|release)\b/i.test(statement)) {
                     const parsed = parseStatement(statement) as TransactionStatement;
                     if (parsed.command === 'begin' && implicit !== null) {
-                        implicit.commit();
+                        this.commitImplicit(implicit);
                         this.flushNotifications();
                         implicit = null;
                     }
@@ -716,7 +787,8 @@ class Session {
                     outcomes.push(direct);
                     continue;
                 }
-                const database = this.transaction !== null ? this.transaction.database : (implicit ??= Database.open(this.storage, this.cluster, this.runtime));
+                const database = this.transaction !== null ? this.transaction.database : (implicit ??= this.openImplicit());
+                this.statementStarted(database);
                 const before = database.clone();
                 let parsed: Statement | null = null;
                 try {
@@ -738,23 +810,97 @@ class Session {
                     outcomes.push(this.runParsed(state, database, parsed, [], statements.length === 1));
                 } catch (error) {
                     database.restore(before);
+                    if (error instanceof ServerError && error.position !== undefined && error.position >= 0) {
+                        error.position += this.statementOffsets[index] ?? 0;
+                    }
+                    if (error instanceof LockWait) {
+                        this.suspendBatch(statements, index, outcomes, implicit);
+                        return;
+                    }
                     throw error;
                 }
             }
             if (implicit !== null) {
-                implicit.commit();
+                this.commitImplicit(implicit);
                 this.flushNotifications();
             }
         } catch (error) {
             for (const outcome of outcomes) this.emitOutcome(outcome);
             this.pending.length = 0;
-            if (this.transaction !== null) this.transaction.aborted = true;
+            if (implicit !== null && this.implicitHandle !== null) {
+                this.manager.rollback(this.implicitHandle);
+                this.implicitHandle = null;
+            }
+            if (this.transaction !== null) this.abortTransaction();
             this.sendError(error);
             this.socket.write(readyForQuery(this.transactionStatus()));
             return;
         }
         for (const outcome of outcomes) this.emitOutcome(outcome);
         this.socket.write(readyForQuery(this.transactionStatus()));
+    }
+
+    /** Opens the working set of one implicit transaction and wires its row locks. */
+    private openImplicit(): Database {
+        const database = Database.open(this.storage, this.cluster, this.runtime);
+        database.readOnly = this.state?.parameters.get('default_transaction_read_only') === 'on';
+        database.onWrite = (relOid, key, operation) => this.acquireWrite(database, relOid, key, operation);
+        return database;
+    }
+
+    /**
+     * Prepares one statement of an explicit transaction: `READ COMMITTED`
+     * re-reads committed state, the snapshot levels freeze their view on the
+     * first statement rather than at `BEGIN`.
+     */
+    private statementStarted(database: Database): void {
+        if (this.transaction === null) return;
+        if (snapshotIsolation(this.transaction.isolation) === 'read committed') database.refreshCommitted();
+        else if (!this.transaction.started) this.manager.takeSnapshot(this.transaction.handle);
+        this.transaction.started = true;
+    }
+
+    /** Takes the write lock of one row for the transaction that owns the statement. */
+    private acquireWrite(database: Database, relOid: number, key: string, operation: 'update' | 'delete'): void {
+        const relation = database.catalog.relations.find((candidate) => candidate.oid === relOid)?.name ?? String(relOid);
+        if (this.transaction !== null) {
+            this.manager.acquire(this.transaction.handle, relOid, key, relation, operation);
+            return;
+        }
+        if (this.implicitHandle === null) this.implicitHandle = this.manager.begin(this.pid, 'read committed');
+        this.manager.acquire(this.implicitHandle, relOid, key, relation, operation);
+    }
+
+    /** Ends an implicit transaction through the single commit boundary. */
+    private commitImplicit(database: Database): void {
+        const handle = this.implicitHandle;
+        const written = database.writtenRows();
+        try {
+            database.commit();
+            if (handle !== null) this.manager.commit(handle, written);
+        } catch (error) {
+            if (handle !== null) this.manager.rollback(handle);
+            throw error;
+        } finally {
+            this.implicitHandle = null;
+        }
+    }
+
+    /** Parks a simple-query batch until the row lock it needs is released. */
+    private suspendBatch(statements: string[], index: number, outcomes: ServerOutcome[], implicit: Database | null): void {
+        const handle = this.transaction?.handle ?? this.implicitHandle;
+        if (handle === null || handle === undefined) throw new ServerError('55000', 'lock wait without a transaction');
+        this.pendingBatch = { statements, index, outcomes, implicit };
+        this.suspended = true;
+        this.manager.park(handle, () => this.resumeBatch());
+    }
+
+    private resumeBatch(): void {
+        const pending = this.pendingBatch;
+        this.pendingBatch = null;
+        this.suspended = false;
+        if (pending !== null) this.runSimpleBatch(pending.statements, pending.index, pending.outcomes, pending.implicit);
+        this.pump();
     }
 
     /** Ends an interactive COPY: inserts the buffered rows or reports failure. */
@@ -766,7 +912,7 @@ class Session {
             if (success) {
                 count = copyIn(copy.database, copy.statement, Buffer.concat(copy.chunks).toString('utf8'));
                 if (this.transaction === null) {
-                    copy.database.commit();
+                    this.commitImplicit(copy.database);
                     this.flushNotifications();
                 }
             }
@@ -776,7 +922,11 @@ class Session {
         } catch (error) {
             copy.database.restore(copy.snapshot);
             this.pending.length = 0;
-            if (this.transaction !== null) this.transaction.aborted = true;
+            if (this.transaction !== null) this.abortTransaction();
+            else if (this.implicitHandle !== null) {
+                this.manager.rollback(this.implicitHandle);
+                this.implicitHandle = null;
+            }
             this.sendError(error);
             this.socket.write(readyForQuery(this.transactionStatus()));
         }
@@ -786,6 +936,17 @@ class Session {
     private transactionStatus(): 'I' | 'T' | 'E' {
         if (this.transaction === null) return 'I';
         return this.transaction.aborted ? 'E' : 'T';
+    }
+
+    /**
+     * Aborts the open transaction block the way PostgreSQL does at the first
+     * error: the block stays open for `ROLLBACK`, but its row locks are handed
+     * to waiting sessions immediately and its staged writes can never commit.
+     */
+    private abortTransaction(): void {
+        if (this.transaction === null) return;
+        this.manager.rollback(this.transaction.handle);
+        this.transaction.aborted = true;
     }
 
     private warn(code: string, message: string): void {
@@ -807,7 +968,25 @@ class Session {
                     this.warn('25001', 'there is already a transaction in progress');
                     return { kind: 'command', tag: 'BEGIN' };
                 }
-                this.transaction = { database: Database.open(this.storage, this.cluster, this.runtime), savepoints: [], aborted: false };
+                {
+                    const state = this.state!;
+                    const isolation =
+                        (statement.isolation as IsolationLevel | undefined) ??
+                        ((state.parameters.get('default_transaction_isolation') ?? 'read committed') as IsolationLevel);
+                    const readOnly = statement.readOnly ?? state.parameters.get('default_transaction_read_only') === 'on';
+                    const database = Database.open(this.storage, this.cluster, this.runtime);
+                    database.readOnly = readOnly;
+                    database.onWrite = (relOid, key, operation) => this.acquireWrite(database, relOid, key, operation);
+                    this.transaction = {
+                        database,
+                        handle: this.manager.begin(this.pid, isolation),
+                        isolation,
+                        readOnly,
+                        started: false,
+                        savepoints: [],
+                        aborted: false,
+                    };
+                }
                 return { kind: 'command', tag: 'BEGIN' };
             case 'commit':
                 if (this.transaction === null) {
@@ -815,14 +994,23 @@ class Session {
                     return { kind: 'command', tag: 'COMMIT' };
                 }
                 if (this.transaction.aborted) {
+                    this.manager.rollback(this.transaction.handle);
                     this.transaction = null;
                     this.closeCursorsInTransaction(true);
                     this.pending.length = 0;
                     return { kind: 'command', tag: 'ROLLBACK' };
                 }
-                try {
-                    this.transaction.database.commit();
-                } finally {
+                {
+                    const handle = this.transaction.handle;
+                    const written = this.transaction.database.writtenRows();
+                    try {
+                        this.transaction.database.commit();
+                    } catch (error) {
+                        this.manager.rollback(handle);
+                        this.transaction = null;
+                        throw error;
+                    }
+                    this.manager.commit(handle, written);
                     this.transaction = null;
                 }
                 this.closeCursorsInTransaction(false);
@@ -833,10 +1021,12 @@ class Session {
                     this.warn('25P01', 'there is no transaction in progress');
                     return { kind: 'command', tag: 'ROLLBACK' };
                 }
+                this.manager.rollback(this.transaction.handle);
                 this.transaction = null;
                 this.closeCursorsInTransaction(true);
                 this.pending.length = 0;
                 return { kind: 'command', tag: 'ROLLBACK' };
+
             case 'savepoint': {
                 const name = statement.name ?? '';
                 if (this.transaction === null) {
@@ -895,6 +1085,10 @@ class Session {
     /** Handles `SET`/`SHOW` without the SQL parser; `null` means "parse normally". */
     private sessionCommand(state: SessionState, sql: string): ServerOutcome | null {
         const statement = sql.trim();
+        const setTransaction = /^set\s+transaction\s+([\s\S]+)$/i.exec(statement);
+        if (setTransaction?.[1] !== undefined) return this.setTransactionOptions(state, setTransaction[1], false);
+        const setSessionTransaction = /^set\s+session\s+characteristics\s+as\s+transaction\s+([\s\S]+)$/i.exec(statement);
+        if (setSessionTransaction?.[1] !== undefined) return this.setTransactionOptions(state, setSessionTransaction[1], true);
         const set = /^(?:set|set\s+session|set\s+local)\s+(?:"([^"]+)"|([a-z_][a-z0-9_.]*))\s*(?:=|to)\s*([\s\S]+)$/i.exec(statement);
         if (set) {
             const rawName = set[1] ?? set[2];
@@ -913,12 +1107,56 @@ class Session {
             const rawName = show[1] ?? show[2];
             if (rawName !== undefined) {
                 const key = canonicalGuc(rawName) ?? [...state.parameters.keys()].find((name) => name.toLowerCase() === rawName.toLowerCase());
-                const value = key === undefined ? undefined : state.parameters.get(key);
+                const value =
+                    key === 'transaction_isolation'
+                        ? (this.transaction?.isolation ?? state.parameters.get('default_transaction_isolation') ?? 'read committed')
+                        : key === undefined
+                          ? undefined
+                          : (state.parameters.get(key) ?? GUC_DEFAULTS.get(key));
                 if (key === undefined || value === undefined) throw new ServerError('42704', `unrecognized configuration parameter "${rawName.toLowerCase()}"`);
                 return { kind: 'rows', fields: [{ name: key, type: TEXT }], rows: [[value]], tag: 'SHOW' };
             }
         }
         return null;
+    }
+
+    /**
+     * Applies `SET TRANSACTION ...` to the current transaction, or stores the
+     * defaults for `SET SESSION CHARACTERISTICS AS TRANSACTION ...`.
+     */
+    private setTransactionOptions(state: SessionState, text: string, sessionWide: boolean): ServerOutcome {
+        const parsed = parseStatement(`BEGIN ${text}`) as TransactionStatement;
+        if (sessionWide) {
+            if (parsed.isolation !== undefined) state.parameters.set('default_transaction_isolation', parsed.isolation);
+            if (parsed.readOnly !== undefined) state.parameters.set('default_transaction_read_only', parsed.readOnly ? 'on' : 'off');
+            return {
+                kind: 'command',
+                tag: 'SET',
+                ...(parsed.readOnly !== undefined
+                    ? { parameters: [{ name: 'default_transaction_read_only', value: parsed.readOnly ? 'on' : 'off' }] }
+                    : {}),
+            };
+        }
+        if (this.transaction === null) {
+            this.warn('25P01', 'SET TRANSACTION can only be used in transaction blocks');
+            return { kind: 'command', tag: 'SET' };
+        }
+        if (this.transaction.started) {
+            if (parsed.isolation !== undefined) {
+                throw new ServerError('25001', 'SET TRANSACTION ISOLATION LEVEL must be called before any query');
+            }
+            throw new ServerError('25001', 'SET TRANSACTION READ ONLY must be called before any query');
+        }
+        if (parsed.isolation !== undefined) {
+            this.manager.rollback(this.transaction.handle);
+            this.transaction.isolation = parsed.isolation as IsolationLevel;
+            this.transaction.handle = this.manager.begin(this.pid, this.transaction.isolation);
+        }
+        if (parsed.readOnly !== undefined) {
+            this.transaction.readOnly = parsed.readOnly;
+            this.transaction.database.readOnly = parsed.readOnly;
+        }
+        return { kind: 'command', tag: 'SET' };
     }
 
     /** Applies one `SET`, normalizes its value and reports it when it is `GUC_REPORT`. */
@@ -937,6 +1175,18 @@ class Session {
             value = GUC_DEFAULTS.get(key) ?? '';
         } else if (key === 'DateStyle') {
             value = normalizeDateStyle(text, current);
+        } else if (key === 'default_transaction_isolation') {
+            const level = text.toLowerCase();
+            if (!['read uncommitted', 'read committed', 'repeatable read', 'serializable'].includes(level)) {
+                throw new ServerError(
+                    '22023',
+                    `invalid value for parameter "default_transaction_isolation": "${text}"`,
+                    undefined,
+                    undefined,
+                    'Available values: serializable, repeatable read, read committed, read uncommitted.',
+                );
+            }
+            value = level;
         } else if (GUC_BOOLEAN.has(key)) {
             value = normalizeBoolean(key, text);
         } else if (key === 'TimeZone' && text.toUpperCase() === 'UTC') {
@@ -952,11 +1202,20 @@ class Session {
         };
     }
 
+    /** Rejects writes when the active transaction, or the session default, is read only. */
+    private assertWritable(statement: Statement): void {
+        const readOnly = this.transaction !== null ? this.transaction.readOnly : this.state?.parameters.get('default_transaction_read_only') === 'on';
+        if (!readOnly) return;
+        const verb = writeVerb(statement);
+        if (verb !== undefined) throw new ServerError('25006', `cannot execute ${verb} in a read-only transaction`);
+    }
+
     /**
      * Runs one statement: session GUCs, then session-owned SQL, then the engine.
      * `topLevel` is false for every statement of a multi-statement simple query.
      */
     private runParsed(state: SessionState, database: Database, statement: Statement, parameters: SqlValue[], topLevel = true): ServerOutcome {
+        this.assertWritable(statement);
         switch (statement.kind) {
             case 'copy': {
                 if (statement.direction === 'from') {
@@ -1221,6 +1480,7 @@ class Session {
         if (direct !== null) return direct;
         if (this.transaction !== null) {
             const database = this.transaction.database;
+            this.statementStarted(database);
             const before = database.clone();
             try {
                 return this.runParsed(state, database, parseStatement(trimmed), parameters);
@@ -1229,15 +1489,19 @@ class Session {
                 throw error;
             }
         }
-        const database = Database.open(this.storage, this.cluster, this.runtime);
+        const database = this.openImplicit();
         const before = database.clone();
         try {
             const outcome = this.runParsed(state, database, parseStatement(trimmed), parameters);
-            database.commit();
+            this.commitImplicit(database);
             this.flushNotifications();
             return outcome;
         } catch (error) {
             database.restore(before);
+            if (!(error instanceof LockWait) && this.implicitHandle !== null) {
+                this.manager.rollback(this.implicitHandle);
+                this.implicitHandle = null;
+            }
             throw error;
         }
     }
@@ -1383,8 +1647,26 @@ class Session {
             const outcome = this.executeStatement(prepared.sql, portal.parameters);
             this.emitOutcome(outcome, portal.described);
         } catch (error) {
+            if (error instanceof LockWait) {
+                const handle = this.transaction?.handle ?? this.implicitHandle;
+                if (handle !== null && handle !== undefined) {
+                    this.pendingExecute = payload;
+                    this.suspended = true;
+                    this.manager.park(handle, () => this.resumeExecute());
+                    return;
+                }
+            }
+            if (this.transaction !== null) this.abortTransaction();
             this.sendExtendedError(error);
         }
+    }
+
+    private resumeExecute(): void {
+        const payload = this.pendingExecute;
+        this.pendingExecute = null;
+        this.suspended = false;
+        if (payload !== null) this.handleExecute(payload);
+        this.pump();
     }
 
     private handleClose(payload: Buffer): void {
@@ -1457,6 +1739,42 @@ class Session {
         this.socket.write(errorResponse({ severity: 'FATAL', code, message, ...(detail ? { detail } : {}) }));
         this.closing = true;
         this.socket.end();
+    }
+}
+
+/** Name of the SQL command a read-only transaction must reject, if this statement writes. */
+function writeVerb(statement: Statement): string | undefined {
+    switch (statement.kind) {
+        case 'insert':
+            return 'INSERT';
+        case 'update':
+            return 'UPDATE';
+        case 'delete':
+            return 'DELETE';
+        case 'create-table':
+            return 'CREATE TABLE';
+        case 'drop-table':
+            return 'DROP TABLE';
+        case 'create-index':
+            return 'CREATE INDEX';
+        case 'drop-index':
+            return 'DROP INDEX';
+        case 'alter-table':
+            return 'ALTER TABLE';
+        case 'create-role':
+            return 'CREATE ROLE';
+        case 'alter-role':
+            return 'ALTER ROLE';
+        case 'drop-role':
+            return 'DROP ROLE';
+        case 'grant':
+            return 'GRANT';
+        case 'revoke':
+            return 'REVOKE';
+        case 'copy':
+            return statement.direction === 'from' ? 'COPY' : undefined;
+        default:
+            return undefined;
     }
 }
 
@@ -1589,10 +1907,11 @@ export function startPostgresServer(options: PostgresServerOptions = {}): Promis
     const sockets = new Set<net.Socket>();
     const host = options.host ?? '127.0.0.1';
     const hub: NotificationHub = { sessions: new Set<Session>() };
+    const manager = new TransactionManager();
     const server = net.createServer((socket) => {
         sockets.add(socket);
         socket.on('close', () => sockets.delete(socket));
-        const session = new Session(socket, options, storage, hub, cluster);
+        const session = new Session(socket, options, storage, hub, cluster, manager);
         session.start();
     });
 

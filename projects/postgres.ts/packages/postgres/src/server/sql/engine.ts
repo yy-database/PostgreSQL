@@ -2508,9 +2508,13 @@ function shapeForOid(database: Database, oid: number): TableShape {
 }
 
 function tableShape(database: Database, ref: RelationRef): TableShape {
-    if (ref.schema !== undefined && ref.schema !== 'public') throw new ServerError('3F000', `schema "${ref.schema}" does not exist`);
+    if (ref.schema !== undefined && ref.schema !== 'public') {
+        throw new ServerError('3F000', `schema "${ref.schema}" does not exist`, undefined, ref.start);
+    }
     const relation = relationByName(database.catalog, ref.name);
-    if (!relation || relation.relkind !== 'r') throw new ServerError('42P01', `relation "${ref.name}" does not exist`);
+    if (!relation || relation.relkind !== 'r') {
+        throw new ServerError('42P01', `relation "${ref.name}" does not exist`, undefined, ref.start);
+    }
     return shapeForRelation(database, relation);
 }
 

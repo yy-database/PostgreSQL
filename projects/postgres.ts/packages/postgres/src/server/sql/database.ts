@@ -90,6 +90,13 @@ export class Database {
     readonly cluster: ClusterStore;
     /** This message's working copy of `pg_roles`, persisted on commit. */
     roles: ClusterRole[];
+    /**
+     * Called before a statement changes an existing row, so the session can take
+     * the row lock that keeps two writers from touching it at the same time.
+     */
+    onWrite?: (relOid: number, key: string, operation: 'update' | 'delete') => void;
+    /** `true` while the owning transaction is `READ ONLY`. */
+    readOnly = false;
     /** This message's working copy of `datacl`, keyed by database name. */
     private databaseAcls = new Map<string, string | null>();
     private readonly storage: Storage;
@@ -144,6 +151,8 @@ export class Database {
     /** Copies the working set for `SAVEPOINT`/`ROLLBACK TO`; shares row arrays. */
     clone(): Database {
         const copy = new Database(this.storage, structuredClone(this.catalog), this.session, this.cluster);
+        copy.onWrite = this.onWrite;
+        copy.readOnly = this.readOnly;
         copy.roles = structuredClone(this.roles);
         copy.databaseAcls = new Map(this.databaseAcls);
         for (const [relOid, rows] of this.tables) copy.tables.set(relOid, new Map(rows));
@@ -164,6 +173,34 @@ export class Database {
         }
         this.tables.set(relOid, rows);
         return rows;
+    }
+
+    /**
+     * Re-reads committed state for everything this transaction has not written.
+     *
+     * `READ COMMITTED` calls this before every statement, so a transaction sees
+     * rows other sessions committed after its own `BEGIN`. The snapshot levels
+     * never call it: their working copy is the snapshot.
+     */
+    refreshCommitted(): void {
+        if (!this.catalogDirty) this.catalog = loadCatalog(this.storage);
+        if (!this.rolesDirty) this.roles = structuredClone(this.cluster.doc.roles);
+        if (!this.clusterDirty) {
+            this.databaseAcls = new Map();
+            for (const row of this.cluster.doc.databases) this.databaseAcls.set(row.datname, row.datacl);
+        }
+        for (const relOid of [...this.tables.keys()]) {
+            if (!this.writes.has(relOid)) this.tables.delete(relOid);
+        }
+    }
+
+    /** Rows this transaction has changed, used to publish their versions on commit. */
+    writtenRows(): { relOid: number; key: string }[] {
+        const written: { relOid: number; key: string }[] = [];
+        for (const [relOid, rows] of this.writes) {
+            for (const key of rows.keys()) written.push({ relOid, key });
+        }
+        return written;
     }
 
     /** Byte footprint of one relation's stored rows, keys included. */
@@ -197,11 +234,14 @@ export class Database {
     }
 
     updateRow(relOid: number, key: string, values: SqlValue[]): void {
+        this.onWrite?.(relOid, key, 'update');
         this.table(relOid).set(key, values);
         this.changesFor(relOid).set(key, values);
     }
 
     deleteRow(relOid: number, key: string): void {
+        if (!this.table(relOid).has(key)) return;
+        this.onWrite?.(relOid, key, 'delete');
         if (!this.table(relOid).delete(key)) return;
         this.changesFor(relOid).set(key, null);
     }
@@ -247,6 +287,7 @@ export class Database {
 
     /** Advances a sequence, remembering the value for `currval`/`lastval`. */
     nextSequence(sequenceOid: number): number {
+        if (this.readOnly) throw new ServerError('25006', 'cannot execute nextval() in a read-only transaction');
         const sequence = this.catalog.sequences.find((candidate) => candidate.oid === sequenceOid);
         if (!sequence) throw new ServerError('55000', 'sequence does not exist');
         // A discarded working set (failed statement) must not rewind the
