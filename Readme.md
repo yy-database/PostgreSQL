@@ -40,8 +40,9 @@ catalog SQL `psql` sends for `\dt` and `\d`. Types are `int2`/`int4`/`int8`/
 `timestamptz`/`uuid`; constraints are `NOT NULL`, literal `DEFAULT`,
 `PRIMARY KEY` and `UNIQUE`.
 
-Still missing: `numeric`, transactions, cursors, `ALTER`, views and indexes
-outside `PRIMARY KEY`/`UNIQUE`, and user-table `JOIN`/aggregate acceptance (they
+Still missing: `numeric`, cursors, `ALTER` beyond constraint operations, views
+and indexes outside `PRIMARY KEY`/`UNIQUE`, and user-table
+`JOIN`/aggregate acceptance (they
 work incidentally where the catalog queries exercise them but are not gated).
 `Connection.execute(sql)` still serialises the statement text and reads the
 reply; the acceptance suites for the client surfaces keep talking to PGlite as
@@ -180,7 +181,29 @@ SQLSTATE evidence through the `pg` driver: `22P02` invalid input syntax,
 `42703` unknown column, `42P01` unknown relation, `42P07` duplicate relation,
 `23502` not-null, `23505` duplicate key with `Key (id)=(2) already exists.`
 
-`numeric`, transactions, cursors and `ALTER` remain `0A000` + `DETAIL`.
+Transactions are session state in the wire server. Every simple-query message
+still runs as one implicit transaction, and `BEGIN`/`START TRANSACTION` opens an
+explicit one whose rows are staged until `COMMIT`. `ROLLBACK`, `SAVEPOINT`,
+`RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and nested `BEGIN` behave like
+PostgreSQL 16.9. Isolation is per transaction: `READ COMMITTED` refreshes the
+catalog before each statement, `REPEATABLE READ` freezes a commit counter
+snapshot at its first statement and rejects a write to a row committed after it
+with `40001 could not serialize access due to concurrent update`; `READ
+UNCOMMITTED` is accepted and behaves as `READ COMMITTED`. Row locks are held
+until commit, rollback or the first error, which aborts the block, hands its
+locks to waiting sessions and turns later statements into `25P02` while
+`ROLLBACK` still closes it. A wait that closes a cycle fails the requester with
+`40P01 deadlock detected`, the two `Process ... waits for ShareLock ...` detail
+lines, the hint and the `while updating tuple (0,N) in relation "..."` context.
+The implicit and explicit block transcript, savepoints, DDL rollback, nested
+`BEGIN`, read-only transactions, `SET`/`SHOW transaction_isolation`, and the
+`READ COMMITTED`/`REPEATABLE READ` visibility transcript match real `psql`
+byte for byte against PostgreSQL 16.9; the `40001` and `40P01` reports are
+compared modulo process, transaction, tuple and source-location ids. A client
+that disappears mid-transaction leaves no rows, and a `COMMIT` already on the
+wire completes exactly once.
+
+`numeric`, cursors and `ALTER` remain `0A000` + `DETAIL`.
 
 Build cost of bringing `database-storage` (and `vos`) into the native graph,
 measured once on this machine with clean release target directories:
@@ -365,20 +388,21 @@ graceful `SIGTERM` still leaves `postmaster.pid` behind, so the operator step
 above (confirm the process is gone, delete the file) applies unchanged and
 automatic stale-lock detection remains out of scope here.
 
-**Long-running sessions.** A 30-minute soak held two sessions open while
-running an insert, a delete and a count every two seconds and opening and
-closing a fresh connection every three seconds, 600 connections in total.
-Open connections were exactly the two long-lived sessions throughout and zero
-after they closed. The process handle count stayed at 245 in the sibling run
-that sampled it, so neither sessions nor file handles accumulate. Heap taken
-from the inspector, with a forced GC at the end, moved from 7.7 MB to 8.2 MB,
-while `arrayBuffers` fell from 0.9 MB to 0.1 MB in a shorter run with that
-breakdown, so the buffers a busy session allocates are garbage and are
-reclaimed. RSS rose from 67.1 MB to 71.1 MB over the half hour, but that is
-V8 heap slack and allocator high-water: live heap stayed flat. What did not
-fully return on GC is `external` memory outside `arrayBuffers`, which grew
-2.6 MB to 4.8 MB; it is small but unattributed, so boundedness over hours is
-not claimed yet and a longer soak with that breakdown is the next measurement.
+**Long-running sessions.** A 90-minute soak held two sessions open while
+running a count every five seconds, opening and closing a fresh connection
+every nine seconds (598 in total) and, during the second 45 minutes, wrapping a
+delete plus an insert in `BEGIN`/`COMMIT`. Open connections were exactly the two
+long-lived sessions at every sample and zero after they closed. Heap read after
+two forced GCs moved from 8.2 MB to 9.7 MB over the 90 minutes, RSS from
+78.3 MB to 61.2 MB after the start-up spike settled. `arrayBuffers` sat at
+209147 bytes for the whole read-only half, rose to 274683 bytes during write
+churn and returned to exactly 209147 bytes at the 85- and 90-minute samples.
+`external` tracked it apart from one 64 KiB bump and was otherwise the same
+2581640 bytes every sample, so `external` minus `arrayBuffers` stayed at
+2372493 bytes byte for byte. The earlier unattributed 2.6 MB to 4.8 MB reading
+does not reproduce once the two counters are split: the only movement is the
+temporary `arrayBuffers` allocation, and it is reclaimed. That bounds this
+workload over 90 minutes; multi-hour boundedness is still not claimed.
 
 ## Testing
 
@@ -389,7 +413,7 @@ pnpm test
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
 one shared corpus on both language surfaces. Floors: node 1203, python 1203,
-rust 0, consistency 396, native 4, server 108; TS and Python results must match
+rust 0, consistency 396, native 4, server 114; TS and Python results must match
 case by case; `skipped` must stay 0. With `PSQL_BIN` set the `server` stage
 additionally opens real `psql` sessions, including the 68-command
 system-catalog sweep described above.
