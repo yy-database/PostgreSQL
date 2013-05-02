@@ -1,0 +1,89 @@
+CREATE TABLE
+INSERT 0 1
+BEGIN
+ count 
+-------
+     1
+(1 row)
+
+ count 
+-------
+     2
+(1 row)
+
+UPDATE 1
+ v  
+----
+ rc
+(1 row)
+
+COMMIT
+ count 
+-------
+     2
+(1 row)
+
+BEGIN
+ count 
+-------
+     2
+(1 row)
+
+ count 
+-------
+     2
+(1 row)
+
+ count 
+-------
+     0
+(1 row)
+
+COMMIT
+ count 
+-------
+     3
+(1 row)
+
+BEGIN
+     v     
+-----------
+ rc-update
+(1 row)
+
+ROLLBACK
+    v     
+----------
+ rr-other
+(1 row)
+
+BEGIN
+    v     
+----------
+ rr-other
+(1 row)
+
+UPDATE 1
+    v    
+---------
+ rc-mine
+(1 row)
+
+COMMIT
+    v    
+---------
+ rc-mine
+(1 row)
+
+BEGIN
+ count 
+-------
+     1
+(1 row)
+
+COMMIT
+ count 
+-------
+     4
+(1 row)
+

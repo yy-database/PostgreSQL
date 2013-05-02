@@ -1,0 +1,21 @@
+psql:<stdin>:27: ERROR:  relation "tx_ddl" does not exist
+LINE 1: SELECT count(*) FROM tx_ddl;
+                             ^
+psql:<stdin>:29: WARNING:  there is already a transaction in progress
+psql:<stdin>:35: ERROR:  relation "tx_missing" does not exist
+LINE 1: SELECT * FROM tx_missing;
+                      ^
+psql:<stdin>:36: ERROR:  current transaction is aborted, commands ignored until end of transaction block
+psql:<stdin>:38: WARNING:  there is no transaction in progress
+psql:<stdin>:39: ERROR:  SAVEPOINT can only be used in transaction blocks
+psql:<stdin>:40: ERROR:  ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+psql:<stdin>:41: ERROR:  RELEASE SAVEPOINT can only be used in transaction blocks
+psql:<stdin>:48: ERROR:  SET TRANSACTION ISOLATION LEVEL must be called before any query
+psql:<stdin>:52: ERROR:  cannot execute INSERT in a read-only transaction
+psql:<stdin>:53: ERROR:  current transaction is aborted, commands ignored until end of transaction block
+psql:<stdin>:70: ERROR:  cannot execute INSERT in a read-only transaction
+psql:<stdin>:73: ERROR:  invalid value for parameter "default_transaction_isolation": "bogus"
+HINT:  Available values: serializable, repeatable read, read committed, read uncommitted.
+psql:<stdin>:77: ERROR:  relation "tx_missing" does not exist
+LINE 1: INSERT INTO tx_missing VALUES (1);
+                    ^

@@ -1,0 +1,162 @@
+CREATE TABLE
+BEGIN
+INSERT 0 1
+ count 
+-------
+     1
+(1 row)
+
+ROLLBACK
+ count 
+-------
+     0
+(1 row)
+
+BEGIN
+INSERT 0 1
+COMMIT
+ count 
+-------
+     1
+(1 row)
+
+BEGIN
+SAVEPOINT
+INSERT 0 1
+SAVEPOINT
+INSERT 0 1
+ count 
+-------
+     3
+(1 row)
+
+ROLLBACK
+ count 
+-------
+     1
+(1 row)
+
+RELEASE
+COMMIT
+ count 
+-------
+     1
+(1 row)
+
+BEGIN
+CREATE TABLE
+INSERT 0 1
+ count 
+-------
+     1
+(1 row)
+
+ROLLBACK
+BEGIN
+BEGIN
+INSERT 0 1
+ count 
+-------
+     2
+(1 row)
+
+ROLLBACK
+ count 
+-------
+     1
+(1 row)
+
+BEGIN
+ROLLBACK
+COMMIT
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+BEGIN
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+SET
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+ ?column? 
+----------
+        1
+(1 row)
+
+ROLLBACK
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+BEGIN
+ROLLBACK
+BEGIN
+ transaction_isolation 
+-----------------------
+ read uncommitted
+(1 row)
+
+ROLLBACK
+BEGIN
+ transaction_isolation 
+-----------------------
+ serializable
+(1 row)
+
+ROLLBACK
+SET
+ default_transaction_isolation 
+-------------------------------
+ repeatable read
+(1 row)
+
+BEGIN
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+ROLLBACK
+SET
+SET
+BEGIN
+ default_transaction_read_only 
+-------------------------------
+ on
+(1 row)
+
+ROLLBACK
+SET
+SET
+ default_transaction_isolation 
+-------------------------------
+ repeatable read
+(1 row)
+
+SET
+INSERT 0 1
+ count 
+-------
+     1
+(1 row)
+
+BEGIN
+INSERT 0 1
+SAVEPOINT
+INSERT 0 1
+ROLLBACK
+COMMIT
+ count 
+-------
+     1
+(1 row)
+

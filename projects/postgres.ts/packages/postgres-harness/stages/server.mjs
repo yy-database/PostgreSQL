@@ -300,6 +300,11 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batch9fixture = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch9-fixture-')) });
     const batch10 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch10-')) });
     const batchMeta = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-meta-')) });
+    const batchTx = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-')) });
+    const batchTxVis = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-vis-')) });
+    const batchTxVerbose = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-verbose-')) });
+    const batchTxDeadlock = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-deadlock-')) });
+    const batchTxDisc = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-disc-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -2364,15 +2369,170 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             await checkFixture('psql/b10-identity', 'b10-identity', 'b10-identity.sql', batch10);
             await checkFixture('psql/b10-check', 'b10-check', 'b10-check.sql', batch10);
             await checkFixture('psql/b10-foreign', 'b10-foreign', 'b10-foreign.sql', batch10);
+
+            // Batch 12: transactions. The transcripts below were captured from
+            // PostgreSQL 16.9 through the same psql on stdin, so stdout and
+            // stderr have to match byte for byte.
+            const runStdinOn = (server, script, extraArgs = []) =>
+                new Promise((resolve, reject) => {
+                    const child = spawn(
+                        psql,
+                        ['-X', '-h', server.host, '-p', String(server.port), '-U', 'postgres', '-d', 'postgres', ...extraArgs, '-f', '-'],
+                        { env: { ...process.env, LANG: 'C', LC_ALL: 'C', LC_MESSAGES: 'C' }, stdio: ['pipe', 'pipe', 'pipe'] },
+                    );
+                    let stdout = '';
+                    let stderr = '';
+                    child.stdout.on('data', (chunk) => {
+                        stdout += chunk;
+                    });
+                    child.stderr.on('data', (chunk) => {
+                        stderr += chunk;
+                    });
+                    child.once('error', reject);
+                    child.once('close', (status) => resolve({ stdout, stderr, status: status ?? 1 }));
+                    child.stdin.end(script);
+                });
+            const sameStreams = async (server, script, prefix, extraArgs = []) => {
+                const result = await runStdinOn(server, script, extraArgs);
+                const expectedOut = fs.readFileSync(path.join(harnessDir, 'fixtures', `${prefix}.out.txt`));
+                const expectedErr = fs.readFileSync(path.join(harnessDir, 'fixtures', `${prefix}.err.txt`));
+                assert(result.status === 0, `${prefix} exited with ${result.status}: ${result.stderr}`);
+                assert(
+                    Buffer.compare(Buffer.from(result.stdout, 'utf8'), expectedOut) === 0,
+                    `${prefix} stdout differs:\n${result.stdout}`,
+                );
+                assert(
+                    Buffer.compare(Buffer.from(result.stderr, 'utf8'), expectedErr) === 0,
+                    `${prefix} stderr differs:\n${result.stderr}`,
+                );
+            };
+            const visibilityScript = (server) =>
+                fs
+                    .readFileSync(path.join(harnessDir, 'fixtures', 'tx-visibility.sql'), 'utf8')
+                    .replaceAll('{{PSQL}}', `"${psql}"`)
+                    .replaceAll('{{PORT}}', String(server.port))
+                    .replaceAll('{{DB}}', 'postgres');
+
+            await check('psql/tx-script', async () => {
+                await sameStreams(batchTx, fs.readFileSync(path.join(harnessDir, 'fixtures', 'tx-script.sql'), 'utf8'), 'psql-tx');
+                lines.push('  tx transcript matches pg16 byte for byte');
+            });
+
+            await check('psql/tx-visibility', async () => {
+                await sameStreams(batchTxVis, visibilityScript(batchTxVis), 'psql-tx-vis');
+                lines.push('  read committed and repeatable read visibility matches pg16 byte for byte');
+            });
+
+            await check('psql/tx-40001', async () => {
+                const result = await runStdinOn(batchTxVerbose, visibilityScript(batchTxVerbose), ['-v', 'VERBOSITY=verbose']);
+                assert(result.status === 0, `verbose visibility exited ${result.status}: ${result.stderr}`);
+                const report = result.stderr.trimEnd().split(/\r?\n/);
+                assert(report.length === 2, `serialization output has ${report.length} lines: ${result.stderr}`);
+                assert(
+                    report[0] === 'psql:<stdin>:21: ERROR:  40001: could not serialize access due to concurrent update',
+                    `serialization error is ${report[0]}`,
+                );
+                assert(/^LOCATION:  \S/.test(report[1]), `serialization report lacks LOCATION: ${result.stderr}`);
+            });
+
+            await check('psql/tx-deadlock', async () => {
+                const sleep = '\\! powershell -NoProfile -Command "Start-Sleep -Milliseconds 400"';
+                const body = (label, first, second) =>
+                    `BEGIN;\nUPDATE dl SET v = '${label}' WHERE id = ${first};\n${sleep}\nUPDATE dl SET v = '${label}' WHERE id = ${second};\nCOMMIT;\n`;
+                const setup = await runStdinOn(
+                    batchTxDeadlock,
+                    "CREATE TABLE dl (id int, v text);\nINSERT INTO dl VALUES (1, 'seed');\nINSERT INTO dl VALUES (2, 'seed');\n",
+                );
+                assert(setup.status === 0, `deadlock setup exited ${setup.status}: ${setup.stderr}`);
+                const first = runStdinOn(batchTxDeadlock, body('from-a', 1, 2), ['-v', 'VERBOSITY=verbose']);
+                await new Promise((resolve) => setTimeout(resolve, 150));
+                const second = runStdinOn(batchTxDeadlock, body('from-b', 2, 1), ['-v', 'VERBOSITY=verbose']);
+                const [ra, rb] = await Promise.all([first, second]);
+                const winners = [ra, rb].filter((result) => !result.stderr.includes('deadlock detected'));
+                assert(winners.length === 1, `expected exactly one surviving session, received ${winners.length}`);
+                const loser = ra === winners[0] ? rb : ra;
+                const winner = winners[0];
+                assert(winner.stderr === '', `the surviving session reported ${winner.stderr}`);
+                const masked = loser.stderr
+                    .replace(/\r\n/g, '\n')
+                    .replace(/Process \d+/g, 'Process <pid>')
+                    .replace(/blocked by process \d+/g, 'blocked by process <pid>')
+                    .replace(/transaction \d+/g, 'transaction <tid>')
+                    .replace(/\(0,\d+\)/g, '(0,<tuple>)')
+                    .replace(/^LOCATION:  .*$/m, 'LOCATION:  <location>');
+                const expected = [
+                    'psql:<stdin>:4: ERROR:  40P01: deadlock detected',
+                    'DETAIL:  Process <pid> waits for ShareLock on transaction <tid>; blocked by process <pid>.',
+                    'Process <pid> waits for ShareLock on transaction <tid>; blocked by process <pid>.',
+                    'HINT:  See server log for query details.',
+                    'CONTEXT:  while updating tuple (0,<tuple>) in relation "dl"',
+                    'LOCATION:  <location>',
+                    '',
+                ].join('\n');
+                assert(masked === expected, `deadlock report differs:\n${masked}`);
+                await withClient(batchTxDeadlock, async (client) => {
+                    const rows = await client.query('SELECT id, v FROM dl ORDER BY id');
+                    const label = ra === winner ? 'from-a' : 'from-b';
+                    assert(
+                        JSON.stringify(rows.rows) ===
+                            JSON.stringify([
+                                { id: 1, v: label },
+                                { id: 2, v: label },
+                            ]),
+                        `deadlock left ${JSON.stringify(rows.rows)} instead of the surviving transaction`,
+                    );
+                });
+                lines.push('  40P01 report matches pg16 modulo process, transaction and tuple ids');
+            });
         }
+
+        // Batch 12: a client that dies mid-transaction must not leave rows
+        // behind, and a commit already on the wire must complete exactly once.
+        await check('tx/disconnect-rollback', async () => {
+            const wire = await openTrustSession(batchTxDisc.host, batchTxDisc.port);
+            requireTags(await wire.query('CREATE TABLE tx_disc (id int)'), 'CZ');
+            await wire.query('BEGIN');
+            await wire.query('INSERT INTO tx_disc VALUES (1)');
+            wire.socket.destroy();
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            const verify = await openTrustSession(batchTxDisc.host, batchTxDisc.port);
+            const rows = await verify.query('SELECT count(*) FROM tx_disc');
+            assert(JSON.stringify(firstRow(rows)) === '["0"]', `an interrupted transaction left ${JSON.stringify(firstRow(rows))}`);
+            verify.close();
+        });
+
+        await check('tx/disconnect-commit', async () => {
+            const wire = await openTrustSession(batchTxDisc.host, batchTxDisc.port);
+            await wire.query('BEGIN');
+            await wire.query('INSERT INTO tx_disc VALUES (2)');
+            wire.send(frame('Q', Buffer.concat([Buffer.from('COMMIT'), Buffer.from([0])])));
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            wire.socket.destroy();
+            let count = null;
+            for (let attempt = 0; attempt < 20; attempt += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 50));
+                const verify = await openTrustSession(batchTxDisc.host, batchTxDisc.port);
+                const rows = await verify.query('SELECT count(*) FROM tx_disc');
+                count = firstRow(rows)[0];
+                verify.close();
+                if (count === '1') break;
+            }
+            assert(count === '1', `a commit in flight applied ${count} rows`);
+            const again = await openTrustSession(batchTxDisc.host, batchTxDisc.port);
+            const rows = await again.query('SELECT count(*) FROM tx_disc WHERE id = 2');
+            assert(JSON.stringify(firstRow(rows)) === '["1"]', `the commit was applied ${JSON.stringify(firstRow(rows))} times`);
+            again.close();
+        });
 
         return {
             name: 'server',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
             // 98 before batch 11, plus the GUC, binary, `pg_cursors`, temp-table
-            // and structured-error checks, plus the system-catalog meta sweep.
-            floor: 108,
+            // and structured-error checks, the system-catalog meta sweep, and
+            // the transaction transcript, visibility, serialization, deadlock
+            // and disconnect checks.
+            floor: 114,
         };
     } finally {
         await trust.close();
@@ -2387,5 +2547,10 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batch9fixture.close();
         await batch10.close();
         await batchMeta.close();
+        await batchTx.close();
+        await batchTxVis.close();
+        await batchTxVerbose.close();
+        await batchTxDeadlock.close();
+        await batchTxDisc.close();
     }
 }
