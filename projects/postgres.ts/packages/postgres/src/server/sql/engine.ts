@@ -111,6 +111,13 @@ interface Binding {
     type: DataType;
     /** System columns resolve by name but never expand through `*`. */
     hidden?: boolean;
+    /** Extra relation aliases that expose the same value, added by `USING`/`NATURAL`. */
+    aliases?: string[];
+}
+
+/** Whether `qualifier` names the relation this binding belongs to. */
+function matchesAlias(binding: Binding, qualifier: string): boolean {
+    return binding.alias === qualifier || binding.aliases?.includes(qualifier) === true;
 }
 
 interface RowSet {
@@ -720,8 +727,12 @@ function orderKey(database: Database, item: OrderItem, context: Context, values:
     }
     if (expr.kind === 'column' && (expr as ColumnExpr).qualifier === undefined) {
         const columnName = (expr as ColumnExpr).name;
-        const index = fields.findIndex((field) => field.name === columnName);
-        if (index >= 0) return values[index] ?? null;
+        const matches: number[] = [];
+        fields.forEach((field, index) => {
+            if (field.name === columnName) matches.push(index);
+        });
+        if (matches.length > 1) throw new ServerError('42702', `ORDER BY "${columnName}" is ambiguous`, undefined, (expr as ColumnExpr).start);
+        if (matches.length === 1) return values[matches[0]!] ?? null;
     }
     return evaluate(database, expr, context, params);
 }
@@ -733,8 +744,8 @@ function expandTargets(database: Database, targets: Target[], columns: Binding[]
             const qualifier = (target.expr as { qualifier: string | undefined }).qualifier;
             for (const binding of columns) {
                 if (binding.hidden) continue;
-                if (qualifier !== undefined && binding.alias !== qualifier) continue;
-                expanded.push({ expr: { kind: 'column', qualifier: binding.alias, name: binding.name } satisfies ColumnExpr, alias: undefined });
+                if (qualifier !== undefined && !matchesAlias(binding, qualifier)) continue;
+                expanded.push({ expr: { kind: 'column', qualifier: qualifier ?? binding.alias, name: binding.name } satisfies ColumnExpr, alias: undefined });
             }
             continue;
         }
@@ -901,17 +912,17 @@ function staticExprType(expr: Expr): DataType | undefined {
 function findBinding(scope: Scope | undefined, qualifier: string | undefined, name: string, start?: number): Binding | undefined {
     let current = scope;
     while (current) {
-        const candidates = current.columns.filter((column) => column.name === name && (qualifier === undefined || column.alias === qualifier));
+        const candidates = current.columns.filter((column) => column.name === name && (qualifier === undefined || matchesAlias(column, qualifier)));
         if (candidates.length > 1) throw new ServerError('42702', `column reference "${name}" is ambiguous`, undefined, start);
         const found = candidates[0];
         if (found) return found;
         // A bare name may also be the whole-row reference of a single-column
         // FROM item, which is how psql addresses `unnest(...) x`.
         if (qualifier === undefined) {
-            const single = current.columns.filter((column) => column.alias === name && !column.hidden);
-            if (single.length === 1 && current.columns.filter((column) => column.alias === name).length === 1) return single[0];
+            const single = current.columns.filter((column) => matchesAlias(column, name) && !column.hidden);
+            if (single.length === 1 && current.columns.filter((column) => matchesAlias(column, name)).length === 1) return single[0];
         }
-        if (qualifier !== undefined && current.columns.some((column) => column.alias === qualifier)) return undefined;
+        if (qualifier !== undefined && current.columns.some((column) => matchesAlias(column, qualifier))) return undefined;
         current = current.outer;
     }
     return undefined;
@@ -978,8 +989,23 @@ function buildItem(database: Database, item: FromItem, params: SqlValue[], outer
     const left = buildItem(database, item.left, params, outer);
     const right = buildItem(database, item.right, params, outer);
     if (item.joinType === 'cross') return crossJoin(left, right);
+    if (item.natural === true) {
+        const using = naturalUsing(left, right);
+        if (using.length === 0) return crossJoin(left, right);
+        return usingJoin(database, { ...item, using }, left, right, params, outer);
+    }
     if (item.using !== undefined && item.using.length > 0) return usingJoin(database, item, left, right, params, outer);
     return onJoin(database, item, left, right, params, outer);
+}
+
+/** Columns both sides of a `NATURAL JOIN` expose, in left-side order. */
+function naturalUsing(left: RowSet, right: RowSet): string[] {
+    const names: string[] = [];
+    for (const binding of left.columns) {
+        if (binding.hidden || names.includes(binding.name)) continue;
+        if (right.columns.some((column) => !column.hidden && column.name === binding.name)) names.push(binding.name);
+    }
+    return names;
 }
 
 function onJoin(
@@ -1023,6 +1049,19 @@ function onJoin(
 }
 
 /** `JOIN ... USING (...)`: merged join columns appear once, then both remainders. */
+/**
+ * The single output column `USING`/`NATURAL` keeps for a shared name.
+ *
+ * PostgreSQL still answers both `a.id` and `b.id`, so the binding remembers
+ * every relation alias that may qualify the merged value.
+ */
+function mergedBinding(left: Binding, right: Binding): Binding {
+    const aliases = new Set<string>([...(left.aliases ?? []), left.alias, right.alias, ...(right.aliases ?? [])]);
+    aliases.delete(left.alias);
+    return aliases.size > 0 ? { ...left, aliases: [...aliases] } : left;
+}
+
+/** `JOIN ... USING (...)`: merged join columns appear once, then both remainders. */
 function usingJoin(
     database: Database,
     item: Extract<FromItem, { kind: 'join' }>,
@@ -1032,16 +1071,20 @@ function usingJoin(
     outer: Context | undefined,
 ): RowSet {
     const names = item.using ?? [];
-    const leftIndexes = names.map((name) => left.columns.findIndex((column) => column.name === name));
-    const rightIndexes = names.map((name) => right.columns.findIndex((column) => column.name === name));
+    const leftIndexes = names.map((name) => left.columns.findIndex((column) => !column.hidden && column.name === name));
+    const rightIndexes = names.map((name) => right.columns.findIndex((column) => !column.hidden && column.name === name));
     for (let index = 0; index < names.length; index += 1) {
-        if (leftIndexes[index] === -1) throw new ServerError('42703', `column "${names[index]}" does not exist`);
-        if (rightIndexes[index] === -1) throw new ServerError('42703', `column "${names[index]}" does not exist`);
+        if (leftIndexes[index] === -1) {
+            throw new ServerError('42703', `column "${names[index]}" specified in USING clause does not exist in left table`);
+        }
+        if (rightIndexes[index] === -1) {
+            throw new ServerError('42703', `column "${names[index]}" specified in USING clause does not exist in right table`);
+        }
     }
     const leftRest = left.columns.map((_, index) => index).filter((index) => !leftIndexes.includes(index));
     const rightRest = right.columns.map((_, index) => index).filter((index) => !rightIndexes.includes(index));
     const columns: Binding[] = [
-        ...leftIndexes.map((index) => left.columns[index]!),
+        ...leftIndexes.map((index, position) => mergedBinding(left.columns[index]!, right.columns[rightIndexes[position]!]!)),
         ...leftRest.map((index) => left.columns[index]!),
         ...rightRest.map((index) => right.columns[index]!),
     ];
@@ -1270,7 +1313,7 @@ function lookup(database: Database, context: Context, qualifier: string | undefi
             const index = current.columns.indexOf(binding);
             return current.row[index] ?? null;
         }
-        if (qualifier !== undefined && current.columns.some((column) => column.alias === qualifier)) {
+        if (qualifier !== undefined && current.columns.some((column) => matchesAlias(column, qualifier))) {
             throw new ServerError('42703', `column ${qualifier}.${name} does not exist`, undefined, start);
         }
         current = current.outer;

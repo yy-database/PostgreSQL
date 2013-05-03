@@ -207,6 +207,8 @@ export interface JoinRef {
     on: Expr | undefined;
     /** `JOIN ... USING (a, b)`; mutually exclusive with `on`. */
     using?: string[];
+    /** `NATURAL JOIN`, whose `USING` list is the columns both sides share. */
+    natural?: boolean;
 }
 
 export type FromItem = RelationRef | SubqueryRef | JoinRef;
@@ -623,6 +625,7 @@ const RESERVED = new Set([
     'LEFT',
     'LIKE',
     'LIMIT',
+    'NATURAL',
     'NOT',
     'NULL',
     'NULLS',
@@ -1425,6 +1428,7 @@ class Parser {
         let left = this.parseFromPrimary();
         while (true) {
             let joinType: JoinRef['joinType'] | undefined;
+            let natural = false;
             if (this.at('JOIN')) {
                 this.next();
                 joinType = 'inner';
@@ -1440,6 +1444,21 @@ class Parser {
                 left = { kind: 'join', left, right: this.parseFromPrimary(), joinType: 'cross', on: undefined };
                 continue;
             }
+            else if (this.at('NATURAL')) {
+                this.next();
+                natural = true;
+                if (this.at('INNER')) {
+                    this.next();
+                    joinType = 'inner';
+                }
+                else if (this.at('LEFT') || this.at('RIGHT') || this.at('FULL')) {
+                    const keyword = this.next().upper;
+                    this.accept('OUTER');
+                    joinType = keyword === 'LEFT' ? 'left' : keyword === 'RIGHT' ? 'right' : 'full';
+                }
+                else joinType = 'inner';
+                this.expect('JOIN');
+            }
             else if (this.at('LEFT') || this.at('RIGHT') || this.at('FULL')) {
                 const keyword = this.next().upper;
                 this.accept('OUTER');
@@ -1448,6 +1467,12 @@ class Parser {
             }
             if (joinType === undefined) return left;
             const right = this.parseFromPrimary();
+            if (natural) {
+                // PostgreSQL rejects `NATURAL ... ON`/`USING`: the column list is implied.
+                if (this.at('ON') || this.at('USING')) throw syntax('syntax error', this.peek());
+                left = { kind: 'join', left, right, joinType, on: undefined, natural: true };
+                continue;
+            }
             if (this.at('USING')) {
                 this.next();
                 this.expect('(');
