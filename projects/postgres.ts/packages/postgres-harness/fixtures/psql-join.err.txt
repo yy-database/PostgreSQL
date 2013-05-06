@@ -1,0 +1,16 @@
+psql:<stdin>:26: ERROR:  ORDER BY "id" is ambiguous
+LINE 1: ...n_b.id, v, w FROM join_a JOIN join_b USING (id) ORDER BY id;
+                                                                    ^
+psql:<stdin>:32: ERROR:  column reference "id" is ambiguous
+LINE 1: SELECT id FROM join_a JOIN join_b ON join_a.id = join_b.id O...
+               ^
+psql:<stdin>:33: ERROR:  column "nope" does not exist
+LINE 1: SELECT nope FROM join_a JOIN join_b ON join_a.id = join_b.id...
+               ^
+psql:<stdin>:34: ERROR:  column join_a.nope does not exist
+LINE 1: SELECT * FROM join_a JOIN join_b ON join_a.nope = join_b.id;
+                                            ^
+psql:<stdin>:35: ERROR:  column "nope" specified in USING clause does not exist in left table
+psql:<stdin>:43: ERROR:  syntax error at or near "USING"
+LINE 1: SELECT count(*) FROM join_a NATURAL JOIN join_b USING (id);
+                                                        ^

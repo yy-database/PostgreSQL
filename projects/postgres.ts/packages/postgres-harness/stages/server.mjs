@@ -305,6 +305,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batchTxVerbose = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-verbose-')) });
     const batchTxDeadlock = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-deadlock-')) });
     const batchTxDisc = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-disc-')) });
+    const batchJoin = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-join-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -2418,6 +2419,11 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 lines.push('  tx transcript matches pg16 byte for byte');
             });
 
+            await check('psql/join-script', async () => {
+                await sameStreams(batchJoin, fs.readFileSync(path.join(harnessDir, 'fixtures', 'join-script.sql'), 'utf8'), 'psql-join');
+                lines.push('  join transcript matches pg16 byte for byte');
+            });
+
             await check('psql/tx-visibility', async () => {
                 await sameStreams(batchTxVis, visibilityScript(batchTxVis), 'psql-tx-vis');
                 lines.push('  read committed and repeatable read visibility matches pg16 byte for byte');
@@ -2529,10 +2535,10 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
             // 98 before batch 11, plus the GUC, binary, `pg_cursors`, temp-table
-            // and structured-error checks, the system-catalog meta sweep, and
-            // the transaction transcript, visibility, serialization, deadlock
-            // and disconnect checks.
-            floor: 114,
+            // and structured-error checks, the system-catalog meta sweep, the
+            // transaction transcript, visibility, serialization, deadlock and
+            // disconnect checks, and the join transcript.
+            floor: 115,
         };
     } finally {
         await trust.close();
@@ -2552,5 +2558,6 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batchTxVerbose.close();
         await batchTxDeadlock.close();
         await batchTxDisc.close();
+        await batchJoin.close();
     }
 }
