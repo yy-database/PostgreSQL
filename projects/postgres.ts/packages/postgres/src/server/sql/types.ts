@@ -640,6 +640,16 @@ function quoteArrayElement(text: string): string {
     return /[{},"\\\s]/.test(text) || text === '' || text.toUpperCase() === 'NULL' ? `"${text.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"` : text;
 }
 
+/** Renders a one-dimensional array value the way `psql` shows a column. */
+export function arrayValueText(type: DataType, values: SqlValue[]): string {
+    const element = arrayElement(type) ?? typeOf('text');
+    const items = values.map((value) => {
+        if (value === null) return 'NULL';
+        return quoteArrayElement(formatValue(value, element) ?? '');
+    });
+    return `{${items.join(',')}}`;
+}
+
 /** Coerces every element of an array literal to its element type. */
 function arrayText(type: DataType, text: string): string {
     const element = arrayElement(type);

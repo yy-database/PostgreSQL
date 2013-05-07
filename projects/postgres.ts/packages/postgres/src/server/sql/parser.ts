@@ -54,6 +54,10 @@ export interface FunctionExpr extends ExprBase {
     star: boolean;
     /** `count(DISTINCT x)`. */
     distinct?: boolean;
+    /** `string_agg(x, ',' ORDER BY x)` inside the aggregate call. */
+    orderBy?: OrderItem[];
+    /** `FILTER (WHERE ...)` applied to the aggregate inputs. */
+    filter?: Expr;
     /** Window specification when the call carries `OVER (...)`. */
     over?: WindowSpec;
 }
@@ -1902,18 +1906,28 @@ class Parser {
                 let star = false;
                 let distinct = false;
                 let args: Expr[] = [];
+                let orderBy: OrderItem[] = [];
                 if (this.accept('DISTINCT')) distinct = true;
                 if (this.at('*')) {
                     this.next();
                     star = true;
                 } else if (!this.at(')')) {
                     args = this.parseExprList();
+                    if (this.at('ORDER')) orderBy = this.parseOrderBy();
                 }
                 this.expect(')');
                 const name = names[names.length - 1] ?? '';
                 const schema = names.length > 1 ? names[names.length - 2] : undefined;
                 const call: FunctionExpr = { kind: 'function', schema, name, args, star, start: token.start };
                 if (distinct) call.distinct = true;
+                if (orderBy.length > 0) call.orderBy = orderBy;
+                if (this.at('FILTER')) {
+                    this.next();
+                    this.expect('(');
+                    this.expect('WHERE');
+                    call.filter = this.parseExpr();
+                    this.expect(')');
+                }
                 if (this.at('OVER')) {
                     this.next();
                     call.over = this.parseWindowSpec();

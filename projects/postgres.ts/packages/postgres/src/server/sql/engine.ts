@@ -84,6 +84,7 @@ import {
     INT4,
     TEXT,
     arrayOf,
+    arrayValueText,
     castValue,
     compareValues,
     formatType,
@@ -539,6 +540,7 @@ function executeCore(
     const targets = expandTargets(database, core.targets, from.columns);
     const scope: Scope = { columns: from.columns, outer: outer ? { columns: outer.columns, outer: undefined } : undefined };
     const fields: Field[] = targets.map((target) => ({ name: targetName(target), type: fieldType(database, target.expr, scope, params) }));
+    const groupBy = resolveGroupBy(core.groupBy, targets, scope);
 
     // WHERE runs per input row; grouping and windows need the surviving rows.
     const rows: Context[] = [];
@@ -551,14 +553,15 @@ function executeCore(
         rows.push(context);
     }
 
-    const grouped = core.groupBy.length > 0
+    const grouped = groupBy.length > 0
         || core.having !== undefined
         || targets.some((target) => containsAggregate(target.expr))
         || orderBy.some((item) => containsAggregate(item.expr));
     let contexts: Context[];
     if (grouped) {
+        validateGrouped(targets, core.having, orderBy, groupBy, scope, fields);
         contexts = [];
-        for (const group of groupRows(database, core.groupBy, rows, params)) {
+        for (const group of groupRows(database, groupBy, rows, params)) {
             const groupContext: Context = { columns: from.columns, row: group[0]?.row ?? [], outer, group };
             if (core.having !== undefined && evaluate(database, core.having, groupContext, params) !== true) continue;
             contexts.push(groupContext);
@@ -707,6 +710,128 @@ function collectWindows(roots: Expr[]): FunctionExpr[] {
     return result;
 }
 
+/**
+ * Rewrites `GROUP BY` ordinals and output aliases into input expressions.
+ *
+ * Input columns win over output aliases, matching the server, and an output
+ * alias only resolves when exactly one target carries that name.
+ */
+function resolveGroupBy(groupBy: Expr[], targets: Target[], scope: Scope): Expr[] {
+    return groupBy.map((expr) => {
+        let resolved = expr;
+        if (expr.kind === 'literal' && Number.isInteger((expr as LiteralExpr).value) && typeof (expr as LiteralExpr).value === 'number') {
+            const position = Number((expr as LiteralExpr).value);
+            const target = targets[position - 1];
+            if (target === undefined) {
+                throw new ServerError('42P10', `GROUP BY position ${position} is not in select list`, undefined, expr.start);
+            }
+            resolved = target.expr;
+        }
+        else if (expr.kind === 'column' && (expr as ColumnExpr).qualifier === undefined) {
+            const name = (expr as ColumnExpr).name;
+            const isInput = scope.columns.some((column) => column.name === name)
+                || scope.outer?.columns.some((column) => column.name === name) === true;
+            if (!isInput) {
+                const matches = targets.filter((target) => targetName(target) === name);
+                if (matches.length > 1) throw new ServerError('42702', `GROUP BY "${name}" is ambiguous`, undefined, expr.start);
+                if (matches.length === 1) resolved = matches[0]!.expr;
+            }
+        }
+        if (containsAggregate(resolved)) {
+            throw new ServerError('42803', 'aggregate functions are not allowed in GROUP BY', undefined, expr.start);
+        }
+        return resolved;
+    });
+}
+
+interface GroupedColumns {
+    /** `alias\0name` for every plain column the grouping exposes. */
+    identities: Set<string>;
+    /** Structural shapes of grouping expressions, so repeated expressions match. */
+    shapes: Set<string>;
+}
+
+function bindingIdentity(binding: Binding): string {
+    return `${binding.alias}\u0000${binding.name}`;
+}
+
+function exprShape(expr: Expr): string {
+    return JSON.stringify(expr, (key, value) => key === 'start' ? undefined : value);
+}
+
+/** Rejects target, `HAVING` and `ORDER BY` columns that grouping does not expose. */
+function validateGrouped(targets: Target[], having: Expr | undefined, orderBy: OrderItem[], groupBy: Expr[], scope: Scope, fields: Field[]): void {
+    const identities = new Set<string>();
+    const shapes = new Set<string>();
+    for (const expr of groupBy) {
+        shapes.add(exprShape(expr));
+        if (expr.kind !== 'column') continue;
+        const column = expr as ColumnExpr;
+        const binding = findBinding(scope, column.qualifier, column.name, column.start);
+        if (binding !== undefined) identities.add(bindingIdentity(binding));
+    }
+    const grouped: GroupedColumns = { identities, shapes };
+    for (const target of targets) validateUngrouped(target.expr, grouped, scope);
+    if (having !== undefined) validateUngrouped(having, grouped, scope);
+    for (const item of orderBy) {
+        const expr = item.expr;
+        if (expr.kind === 'column' && (expr as ColumnExpr).qualifier === undefined) {
+            const name = (expr as ColumnExpr).name;
+            // A bare name that matches an output column is an alias reference.
+            if (fields.some((field) => field.name === name)) continue;
+        }
+        validateUngrouped(expr, grouped, scope);
+    }
+}
+
+function validateUngrouped(expr: Expr, grouped: GroupedColumns, scope: Scope): void {
+    if (grouped.shapes.has(exprShape(expr))) return;
+    if (isAggregate(expr)) return;
+    if (expr.kind === 'subquery') return;
+    if (expr.kind === 'column') {
+        const column = expr as ColumnExpr;
+        const binding = findBinding(scope, column.qualifier, column.name, column.start);
+        if (binding === undefined) return;
+        if (!grouped.identities.has(bindingIdentity(binding))) {
+            throw new ServerError('42803', `column "${binding.alias}.${binding.name}" must appear in the GROUP BY clause or be used in an aggregate function`, undefined, column.start);
+        }
+        return;
+    }
+    for (const child of expressionChildren(expr)) validateUngrouped(child, grouped, scope);
+}
+
+/** Immediate sub-expressions that can carry column references. */
+function expressionChildren(node: Expr): Expr[] {
+    switch (node.kind) {
+        case 'cast':
+        case 'unary':
+        case 'collate':
+        case 'subscript':
+            return [(node as { expr: Expr }).expr];
+        case 'binary':
+            return [(node as BinaryExpr).left, (node as BinaryExpr).right];
+        case 'any':
+            return [(node as AnyExpr).left, (node as AnyExpr).array];
+        case 'case': {
+            const node2 = node as CaseExpr;
+            return [node2.operand, node2.otherwise, ...node2.whens.flatMap((branch) => [branch.when, branch.then])]
+                .filter((child): child is Expr => child !== undefined);
+        }
+        case 'in': {
+            const node2 = node as InExpr;
+            return [node2.expr, ...node2.list];
+        }
+        case 'isnull':
+            return [(node as IsNullExpr).expr];
+        case 'array':
+            return (node as ArrayExpr).elements ?? [];
+        case 'function':
+            return (node as FunctionExpr).args;
+        default:
+            return [];
+    }
+}
+
 function groupRows(database: Database, groupBy: Expr[], rows: Context[], params: SqlValue[]): Context[][] {
     if (groupBy.length === 0) return [rows];
     const buckets = new Map<string, Context[]>();
@@ -823,12 +948,18 @@ function functionFieldType(database: Database, expr: FunctionExpr, scope: Scope 
     if (name === 'sum' || name === 'avg') {
         const argument = expr.args[0];
         const argumentType = argument === undefined ? undefined : fieldType(database, argument, scope, params);
-        if (argumentType !== undefined && (argumentType.key === 'float4' || argumentType.key === 'float8')) {
-            return argumentType.key === 'float4' ? typeOf('float4') : typeOf('float8');
+        if (name === 'avg') {
+            return argumentType?.key === 'float4' || argumentType?.key === 'float8' ? typeOf('float8') : typeOf('numeric');
         }
-        if (name === 'avg') return typeOf('numeric');
+        if (argumentType !== undefined && (argumentType.key === 'float4' || argumentType.key === 'float8')) return argumentType;
         return argumentType?.key === 'numeric' ? typeOf('numeric') : typeOf('int8');
     }
+    if (name === 'array_agg') {
+        const argument = expr.args[0];
+        return arrayOf(argument === undefined ? TEXT : fieldType(database, argument, scope, params));
+    }
+    if (name === 'string_agg') return TEXT;
+    if (name === 'bool_and' || name === 'bool_or' || name === 'every') return BOOL;
     if (name === 'min' || name === 'max' || name === 'lag' || name === 'lead' || name === 'coalesce' || name === 'nullif') {
         const argument = expr.args[0];
         return argument === undefined ? TEXT : fieldType(database, argument, scope, params);
@@ -1718,37 +1849,65 @@ function evaluateAggregate(database: Database, expr: FunctionExpr, context: Cont
         throw new ServerError('0A000', 'feature not supported', 'aggregate functions are only supported in grouped queries');
     }
     const name = expr.name.toLowerCase();
+    let rows = group;
+    if (expr.filter !== undefined) {
+        const filter = expr.filter;
+        rows = rows.filter((row) => evaluate(database, filter, row, params) === true);
+    }
+    if (expr.orderBy !== undefined) rows = sortGroupRows(database, rows, expr.orderBy, params);
     if (expr.star) {
         if (name !== 'count') throw new ServerError('42809', `aggregate ${expr.name}(*) does not accept a star`);
-        return group.length;
+        return rows.length;
     }
-    const values = group.map((row) => evaluate(database, expr.args[0]!, row, params));
-    return aggregateValue(name, values, expr.distinct === true, expr.name);
+    const scope: Scope = {
+        columns: context.columns,
+        outer: context.outer ? { columns: context.outer.columns, outer: undefined } : undefined,
+    };
+    const argumentTypes = expr.args.map((arg) => fieldType(database, arg, scope, params));
+    const columns = expr.args.map((arg) => rows.map((row) => evaluate(database, arg, row, params)));
+    return aggregateValue(name, columns, expr.distinct === true, expr.name, argumentTypes[0]);
 }
 
-function aggregateValue(name: string, raw: SqlValue[], distinct: boolean, displayName: string): SqlValue {
-    let values = raw;
+/** Orders one aggregate's input rows by an `ORDER BY` inside the call. */
+function sortGroupRows(database: Database, rows: Context[], orderBy: OrderItem[], params: SqlValue[]): Context[] {
+    return rows
+        .map((row) => ({ row, values: row.row, keys: orderBy.map((item) => evaluate(database, item.expr, row, params)) }))
+        .sort((left, right) => compareEntries(left, right, orderBy))
+        .map((entry) => entry.row);
+}
+
+function aggregateValue(name: string, columns: SqlValue[][], distinct: boolean, displayName: string, argumentType: DataType | undefined): SqlValue {
+    const raw = columns[0] ?? [];
+    // `DISTINCT` aggregates sort their inputs before dropping duplicates, and
+    // that sort order is what `array_agg` and `string_agg` expose.
+    let order = raw.map((value, index) => ({ value, index }));
     if (distinct) {
+        order.sort((left, right) => compareWithNulls(left.value, right.value, { direction: 'ASC' } as OrderItem));
         const seen = new Set<string>();
-        values = [];
-        for (const value of raw) {
-            const key = JSON.stringify(value);
-            if (seen.has(key)) continue;
+        order = order.filter((entry) => {
+            const key = JSON.stringify(entry.value);
+            if (seen.has(key)) return false;
             seen.add(key);
-            values.push(value);
-        }
+            return true;
+        });
     }
+    const values = order.map((entry) => entry.value);
     switch (name) {
         case 'count':
             return values.filter((value) => value !== null).length;
         case 'sum': {
             const numbers = values.filter((value): value is Exclude<SqlValue, null> => value !== null);
             if (numbers.length === 0) return null;
+            if (argumentType?.key === 'float4') return numbers.reduce<number>((total, value) => Math.fround(total + Number(value)), 0);
+            if (argumentType?.key === 'float8') return numbers.reduce<number>((total, value) => total + Number(value), 0);
             return decimalSum(numbers);
         }
         case 'avg': {
             const numbers = values.filter((value): value is Exclude<SqlValue, null> => value !== null);
             if (numbers.length === 0) return null;
+            if (argumentType?.key === 'float4' || argumentType?.key === 'float8') {
+                return numbers.reduce<number>((total, value) => total + Number(value), 0) / numbers.length;
+            }
             return decimalAverage(numbers);
         }
         case 'min':
@@ -1764,6 +1923,36 @@ function aggregateValue(name: string, raw: SqlValue[], distinct: boolean, displa
                 if (name === 'min' ? compared < 0 : compared > 0) best = value;
             }
             return best;
+        }
+        case 'string_agg': {
+            let text = '';
+            let appended = 0;
+            for (const entry of order) {
+                if (entry.value === null) continue;
+                if (appended > 0) {
+                    const delimiter = columns[1]?.[entry.index];
+                    text += delimiter === null || delimiter === undefined ? '' : String(delimiter);
+                }
+                text += formatValue(entry.value, argumentType ?? TEXT) ?? '';
+                appended += 1;
+            }
+            return appended === 0 ? null : text;
+        }
+        case 'array_agg':
+            return arrayValueText(arrayOf(argumentType ?? TEXT), values);
+        case 'bool_and':
+        case 'every':
+        case 'bool_or': {
+            let seen = false;
+            let result = name === 'bool_or' ? false : true;
+            for (const value of values) {
+                if (value === null) continue;
+                seen = true;
+                const flag = value === true;
+                if (name === 'bool_or') result = result || flag;
+                else result = result && flag;
+            }
+            return seen ? result : null;
         }
         default:
             throw new ServerError('0A000', 'feature not supported', `aggregate ${displayName} is not implemented`);
@@ -1807,6 +1996,38 @@ function decimalSum(values: Exclude<SqlValue, null>[]): string {
     return renderDecimal(total < 0n, total < 0n ? -total : total, scale);
 }
 
+/**
+ * Leading base-10000 digit and its weight, matching `select_div_scale`.
+ *
+ * PostgreSQL picks a division display scale from this, which is why `2/2`
+ * renders twenty fractional digits while `3/2` renders sixteen.
+ */
+function numericLeading(magnitude: bigint, dscale: number): { weight: number; first: number } {
+    if (magnitude === 0n) return { weight: 0, first: 0 };
+    const digits = magnitude.toString().padStart(dscale + 1, '0');
+    const split = digits.length - dscale;
+    const integer = digits.slice(0, split).replace(/^0+/, '');
+    if (integer.length === 0) {
+        const fraction = digits.slice(split);
+        for (let offset = 0; offset < fraction.length; offset += 4) {
+            const group = Number(fraction.slice(offset, offset + 4).padEnd(4, '0'));
+            if (group !== 0) return { weight: -1 - Math.floor(offset / 4), first: group };
+        }
+        return { weight: 0, first: 0 };
+    }
+    const lead = integer.length % 4;
+    const groups = Math.ceil(integer.length / 4);
+    return { weight: groups - 1, first: Number(integer.slice(0, lead === 0 ? 4 : lead)) };
+}
+
+/** PostgreSQL's `select_div_scale`: at least sixteen significant digits. */
+function divisionScale(dividend: bigint, dscale: number, divisor: bigint): number {
+    const left = numericLeading(dividend < 0n ? -dividend : dividend, dscale);
+    const right = numericLeading(divisor < 0n ? -divisor : divisor, 0);
+    const quotientWeight = left.weight - right.weight - (left.first <= right.first ? 1 : 0);
+    return Math.min(Math.max(16 - quotientWeight * 4, dscale, 0), 1000);
+}
+
 function decimalAverage(values: Exclude<SqlValue, null>[]): string {
     const decimals = values.map(decimalParse);
     const scale = Math.max(...decimals.map((decimal) => decimal.scale));
@@ -1815,10 +2036,10 @@ function decimalAverage(values: Exclude<SqlValue, null>[]): string {
         const scaled = decimal.magnitude * 10n ** BigInt(scale - decimal.scale);
         total += decimal.negative ? -scaled : scaled;
     }
-    // PostgreSQL renders `avg` with 16 fractional digits for integer and
-    // numeric input. `total` is scaled by 10^scale, so divide it out too.
-    let numerator = total * 10n ** 16n;
-    const denominator = BigInt(values.length) * 10n ** BigInt(scale);
+    const divisor = BigInt(values.length);
+    const rscale = divisionScale(total, scale, divisor);
+    let numerator = total * 10n ** BigInt(rscale);
+    const denominator = divisor * 10n ** BigInt(scale);
     let quotient = numerator / denominator;
     const remainder = numerator % denominator;
     if (remainder !== 0n) {
@@ -1826,7 +2047,7 @@ function decimalAverage(values: Exclude<SqlValue, null>[]): string {
         if (absolute * 2n >= denominator) quotient += numerator < 0n ? -1n : 1n;
     }
     numerator = quotient;
-    return renderDecimal(numerator < 0n, numerator < 0n ? -numerator : numerator, 16);
+    return renderDecimal(numerator < 0n, numerator < 0n ? -numerator : numerator, rscale);
 }
 
 function compareWindowKeys(left: SqlValue[], right: SqlValue[], orderBy: OrderItem[]): number {
@@ -1932,7 +2153,13 @@ function windowValue(
     for (let index = start; index <= end; index += 1) {
         collected.push(evaluate(database, node.args[0]!, contexts[items[index]!.index]!, params));
     }
-    return aggregateValue(name, collected, node.distinct === true, node.name);
+    const scopeContext = contexts[items[position]!.index]!;
+    const scope: Scope = {
+        columns: scopeContext.columns,
+        outer: scopeContext.outer ? { columns: scopeContext.outer.columns, outer: undefined } : undefined,
+    };
+    const argumentType = node.args[0] === undefined ? undefined : fieldType(database, node.args[0], scope, params);
+    return aggregateValue(name, [collected], node.distinct === true, node.name, argumentType);
 }
 
 function frameBoundPosition(
