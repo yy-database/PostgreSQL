@@ -306,6 +306,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batchTxDeadlock = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-deadlock-')) });
     const batchTxDisc = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-disc-')) });
     const batchJoin = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-join-')) });
+    const batchAgg = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-agg-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -2424,6 +2425,11 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 lines.push('  join transcript matches pg16 byte for byte');
             });
 
+            await check('psql/agg-script', async () => {
+                await sameStreams(batchAgg, fs.readFileSync(path.join(harnessDir, 'fixtures', 'agg-script.sql'), 'utf8'), 'psql-agg');
+                lines.push('  aggregate transcript matches pg16 byte for byte');
+            });
+
             await check('psql/tx-visibility', async () => {
                 await sameStreams(batchTxVis, visibilityScript(batchTxVis), 'psql-tx-vis');
                 lines.push('  read committed and repeatable read visibility matches pg16 byte for byte');
@@ -2537,8 +2543,8 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             // 98 before batch 11, plus the GUC, binary, `pg_cursors`, temp-table
             // and structured-error checks, the system-catalog meta sweep, the
             // transaction transcript, visibility, serialization, deadlock and
-            // disconnect checks, and the join transcript.
-            floor: 115,
+            // disconnect checks, and the join and aggregate transcripts.
+            floor: 116,
         };
     } finally {
         await trust.close();
@@ -2559,5 +2565,6 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batchTxDeadlock.close();
         await batchTxDisc.close();
         await batchJoin.close();
+        await batchAgg.close();
     }
 }

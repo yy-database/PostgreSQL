@@ -1,0 +1,159 @@
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 6
+ count | count | count 
+-------+-------+-------
+     6 |     5 |     2
+(1 row)
+
+ sum | sum | sum  
+-----+-----+------
+  12 | 120 | 13.5
+(1 row)
+
+        avg         |         avg         | avg 
+--------------------+---------------------+-----
+ 2.4000000000000000 | 24.0000000000000000 | 2.7
+(1 row)
+
+ min | max |    min     |    max     | min | max 
+-----+-----+------------+------------+-----+-----
+  -3 |   7 | 2024-01-01 | 2024-03-01 | a   | b
+(1 row)
+
+ g | count | count | sum |          avg           
+---+-------+-------+-----+------------------------
+ a |     3 |     2 |   3 |     1.5000000000000000
+ b |     2 |     2 |   2 | 1.00000000000000000000
+   |     1 |     1 |   7 |     7.0000000000000000
+(3 rows)
+
+ g | count 
+---+-------
+ a |     3
+ b |     2
+(2 rows)
+
+ g | count 
+---+-------
+ a |     3
+ b |     2
+   |     1
+(3 rows)
+
+ u  | count 
+----+-------
+ a! |     3
+ b! |     2
+    |     1
+(3 rows)
+
+ label | count 
+-------+-------
+ a!    |     3
+ b!    |     2
+       |     1
+(3 rows)
+
+ label | count 
+-------+-------
+ a     |     3
+ b     |     2
+       |     1
+(3 rows)
+
+ g 
+---
+ a
+ b
+ 
+(3 rows)
+
+ g | c 
+---+---
+ a | 3
+ b | 2
+   | 1
+(3 rows)
+
+ count | sum | avg 
+-------+-----+-----
+     0 |     |    
+(1 row)
+
+ g | count 
+---+-------
+(0 rows)
+
+ count | sum |        avg         
+-------+-----+--------------------
+     5 |  12 | 2.4000000000000000
+(1 row)
+
+ string_agg 
+------------
+ a,a,a,b,b
+(1 row)
+
+ string_agg 
+------------
+ a,b
+(1 row)
+
+     array_agg     
+-------------------
+ {1,2,NULL,5,-3,7}
+(1 row)
+
+     array_agg     
+-------------------
+ {-3,1,2,5,7,NULL}
+(1 row)
+
+     array_agg     
+-------------------
+ {-3,1,2,5,7,NULL}
+(1 row)
+
+ bool_and | bool_or | every 
+----------+---------+-------
+ f        | t       | f
+(1 row)
+
+ count | sum 
+-------+-----
+     3 |   6
+(1 row)
+
+ g | count 
+---+-------
+ a |     2
+ b |     2
+   |     1
+(3 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 5
+ name  | count | sum 
+-------+-------+-----
+ db    |     2 | 150
+ empty |     0 |    
+ eng   |     2 | 220
+(3 rows)
+
+ name  | count 
+-------+-------
+ empty |     0
+(1 row)
+
+ name | sum 
+------+-----
+ eng  | 220
+(1 row)
+

@@ -1,0 +1,15 @@
+psql:<stdin>:35: ERROR:  GROUP BY position 0 is not in select list
+LINE 1: SELECT g FROM agg_t GROUP BY 0;
+                                     ^
+psql:<stdin>:36: ERROR:  GROUP BY position 9 is not in select list
+LINE 1: SELECT g FROM agg_t GROUP BY 9;
+                                     ^
+psql:<stdin>:37: ERROR:  GROUP BY "x" is ambiguous
+LINE 1: SELECT g AS x, n AS x FROM agg_t GROUP BY x;
+                                                  ^
+psql:<stdin>:38: ERROR:  aggregate functions are not allowed in GROUP BY
+LINE 1: SELECT count(*) FROM agg_t GROUP BY count(*);
+                                            ^
+psql:<stdin>:39: ERROR:  column "agg_t.n" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT g, n, count(*) FROM agg_t GROUP BY g;
+                  ^
