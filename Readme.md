@@ -41,9 +41,9 @@ catalog SQL `psql` sends for `\dt` and `\d`. Types are `int2`/`int4`/`int8`/
 `PRIMARY KEY` and `UNIQUE`.
 
 Still missing: `numeric`, cursors, `ALTER` beyond constraint operations, views
-and indexes outside `PRIMARY KEY`/`UNIQUE`, and user-table
-`JOIN`/aggregate acceptance (they
-work incidentally where the catalog queries exercise them but are not gated).
+and indexes outside `PRIMARY KEY`/`UNIQUE`, user-table aggregates, and
+`EXPLAIN`. `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL` joins with `ON` or
+`USING` are gated against a real `psql` transcript.
 `Connection.execute(sql)` still serialises the statement text and reads the
 reply; the acceptance suites for the client surfaces keep talking to PGlite as
 their independent reference.
@@ -413,7 +413,7 @@ pnpm test
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
 one shared corpus on both language surfaces. Floors: node 1203, python 1203,
-rust 0, consistency 396, native 4, server 114; TS and Python results must match
+rust 0, consistency 396, native 4, server 115; TS and Python results must match
 case by case; `skipped` must stay 0. With `PSQL_BIN` set the `server` stage
 additionally opens real `psql` sessions, including the 68-command
 system-catalog sweep described above.
