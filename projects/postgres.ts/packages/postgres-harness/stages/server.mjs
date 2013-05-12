@@ -2448,7 +2448,11 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
 
             await check('psql/tx-deadlock', async () => {
-                const sleep = '\\! powershell -NoProfile -Command "Start-Sleep -Milliseconds 400"';
+                // `\!` runs the command through the platform shell, so the pause
+                // must be spelled for the runner that executes the harness.
+                const sleep = process.platform === 'win32'
+                    ? '\\! powershell -NoProfile -Command "Start-Sleep -Milliseconds 400"'
+                    : '\\! sleep 0.4';
                 const body = (label, first, second) =>
                     `BEGIN;\nUPDATE dl SET v = '${label}' WHERE id = ${first};\n${sleep}\nUPDATE dl SET v = '${label}' WHERE id = ${second};\nCOMMIT;\n`;
                 const setup = await runStdinOn(
