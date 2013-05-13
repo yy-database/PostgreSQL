@@ -1353,6 +1353,150 @@ if (corpus.length !== options.count) {
 }
 
 // -------------------------------------------------------------------------------
+// Harness shadow comparison. `HARNESS_SHADOW=1` compares the existing path with
+// `database.harness` through the native addon and exits before any engine
+// starts. The repository keeps its existing path until the comparison is clean.
+// -------------------------------------------------------------------------------
+if (process.env.HARNESS_SHADOW === '1') {
+    const { createRequire } = await import('node:module');
+    const require = createRequire(import.meta.url);
+    const platformDirectory = path.join(
+        repositoryRoot,
+        'projects',
+        'postgres.ts',
+        'platforms',
+        `postgres-${process.platform}-${process.arch}`,
+    );
+    const addon = require(process.env.POSTGRES_NATIVE || platformDirectory);
+
+    const failures = [];
+    const compare = (label, legacy, candidate) => {
+        if (legacy !== candidate) failures.push({ label, legacy, candidate });
+    };
+
+    const stored = loadBaseline();
+    const identity = {
+        spec: { version: stored.version, seed: stored.seed, count: stored.count },
+        digest: stored.digest,
+    };
+    const entries = stored.entries.map((entry) => ({
+        key: entryKey(entry),
+        signal: entry.signal,
+        reason: entry.reason,
+    }));
+    const harnessBaseline = { identity, entries };
+
+    const legacyIdentityKind = (message) => {
+        if (message.startsWith('seed:')) return 'seed-drift';
+        if (message.startsWith('count:')) return 'count-drift';
+        if (message.startsWith('corpus digest:')) return 'digest-drift';
+        throw new Error(`unknown identity problem: ${message}`);
+    };
+    const legacyLedgerKind = (message) => {
+        if (message.startsWith('unexpected difference that the known-difference baseline does not explain')) return 'unlisted';
+        if (message.startsWith('known difference changed shape:')) return 'signal-changed';
+        if (message.startsWith('baseline entry no longer differs:')) return 'stale';
+        throw new Error(`unknown ledger problem: ${message}`);
+    };
+
+    const scenario = (label, currentIdentity, observedEntries) => {
+        const legacyIdentityProblems = identityProblems(stored, {
+            seed: currentIdentity.spec.seed,
+            count: currentIdentity.spec.count,
+            digest: currentIdentity.digest,
+        });
+        const legacyVerdict = checkBaseline(
+            stored.entries,
+            observedEntries.map((entry) => ({ entry, boundary: { statement: 'shadow probe' } })),
+        );
+        const verdict = JSON.parse(
+            addon.harnessCheckBaseline(
+                JSON.stringify(harnessBaseline),
+                JSON.stringify(currentIdentity),
+                JSON.stringify(observedEntries.map((entry) => ({
+                    key: entryKey(entry),
+                    signal: entry.signal,
+                    reason: entry.reason,
+                }))),
+            ),
+        );
+        const normalizedLegacy = JSON.stringify({
+            matched: legacyVerdict.matched,
+            problems: [
+                ...legacyIdentityProblems.map(legacyIdentityKind),
+                ...legacyVerdict.problems.map(legacyLedgerKind),
+            ],
+        });
+        const normalizedCandidate = JSON.stringify({
+            matched: verdict.matched,
+            problems: verdict.problems.map((problem) => problem.kind),
+        });
+        compare(`ledger/${label}`, normalizedLegacy, normalizedCandidate);
+        return { legacyVerdict, verdict, normalizedCandidate };
+    };
+
+    const cleanRun = scenario('clean', identity, stored.entries);
+
+    const unlistedEntry = {
+        kind: 'shadow',
+        id: 'shadow/unlisted',
+        name: 'shadow-unlisted',
+        statement: 'SELECT 1',
+        cluster: 'shadow',
+        reason: 'unlisted',
+        signal: ['shadow probe'],
+    };
+    const unlistedRun = scenario('unlisted', identity, [...stored.entries, unlistedEntry]);
+
+    const changed = { ...stored.entries[0], signal: [...stored.entries[0].signal, 'shadow-extra'] };
+    const changedRun = scenario('signal-changed', identity, [changed, ...stored.entries.slice(1)]);
+
+    const staleRun = scenario('stale', identity, stored.entries.slice(0, -1));
+
+    const driftRun = scenario('identity-drift', {
+        spec: { ...identity.spec, seed: identity.spec.seed + 1 },
+        digest: identity.digest,
+    }, stored.entries);
+
+    const nodeDigest = digest;
+    const harnessDigest = addon.harnessDigest(Buffer.from(JSON.stringify(corpus)));
+    compare('digest/node', nodeDigest, harnessDigest);
+    compare('digest/baseline', stored.digest, harnessDigest);
+
+    const legacyReport = {
+        version: 1,
+        command: 'corpus',
+        corpus: {
+            spec: identity.spec,
+            digest: harnessDigest,
+            matched: cleanRun.legacyVerdict.matched,
+            problems: [],
+            clean: true,
+        },
+    };
+    const legacyText = `${JSON.stringify(legacyReport, null, 2)}\n`;
+    const candidateText = addon.harnessRenderReport(JSON.stringify(legacyReport));
+    compare('report/corpus', legacyText, candidateText);
+
+    console.log(JSON.stringify({
+        digest: nodeDigest,
+        scenarios: {
+            clean: cleanRun.normalizedCandidate,
+            unlisted: unlistedRun.normalizedCandidate,
+            'signal-changed': changedRun.normalizedCandidate,
+            stale: staleRun.normalizedCandidate,
+            'identity-drift': driftRun.normalizedCandidate,
+        },
+        failures,
+    }, null, 2));
+    if (failures.length > 0) {
+        process.stderr.write(`harness shadow mismatch: ${failures.length} difference(s)\n`);
+        process.exit(1);
+    }
+    process.exit(0);
+}
+
+// -------------------------------------------------------------------------------
 // Known differences. The baseline is the only allowed set of differences. Each
 // entry names one case, why it is expected to differ and the exact signal seen
 // when the baseline was generated. `--check` runs this before any engine starts.

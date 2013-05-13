@@ -17,6 +17,9 @@ use database_client::pgsql::{
     error::{MessageField, Notice, PostgresError},
     psql::{PsqlOptions, format_results, parse_arguments},
 };
+use database::harness::{
+    Baseline, BaselineIdentity, DifferenceObservation, Digest, ReportEnvelope, check_baseline, render_json,
+};
 use database_protocol_pgsql as protocol;
 
 /// Where to connect and which identity to present.
@@ -1005,4 +1008,35 @@ impl ServerStore {
     pub fn lock_path(&self) -> Result<String> {
         with_server_store(&self.inner, |store| Ok(store.lock_path()))
     }
+}
+
+fn harness_error(error: impl std::fmt::Display) -> napi::Error {
+    napi::Error::from_reason(error.to_string())
+}
+
+/// 对给定字节取 SHA-256，返回小写十六进制。
+#[napi]
+pub fn harness_digest(bytes: Buffer) -> String {
+    Digest::of(bytes.as_ref()).to_hex()
+}
+
+/// 按已知差异台账判定一次语料运行。
+#[napi]
+pub fn harness_check_baseline(
+    baseline_json: String,
+    current_json: String,
+    observed_json: String,
+) -> Result<String> {
+    let baseline: Baseline = serde_json::from_str(&baseline_json).map_err(harness_error)?;
+    let current: BaselineIdentity = serde_json::from_str(&current_json).map_err(harness_error)?;
+    let observed: Vec<DifferenceObservation> = serde_json::from_str(&observed_json).map_err(harness_error)?;
+    let verdict = check_baseline(&baseline, &current, &observed);
+    serde_json::to_string(&verdict).map_err(harness_error)
+}
+
+/// 将报告信封渲染为稳定 JSON 文本。
+#[napi]
+pub fn harness_render_report(report_json: String) -> Result<String> {
+    let report: ReportEnvelope = serde_json::from_str(&report_json).map_err(harness_error)?;
+    render_json(&report).map_err(harness_error)
 }
