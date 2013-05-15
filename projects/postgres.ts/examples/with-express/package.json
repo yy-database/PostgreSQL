@@ -1,0 +1,12 @@
+{
+  "name": "@yydb/postgres-example-with-express",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Express 5 REST API backed by @yydb/postgres through the pg driver",
+  "license": "MPL-2.0",
+  "scripts": {
+    "start": "node ./src/server.mjs",
+    "test": "node ./tests/api.mjs"
+  }
+}

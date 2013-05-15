@@ -1,0 +1,12 @@
+{
+  "name": "@yydb/postgres-example-vs-js-libraries",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Conformance and benchmark of @yydb/postgres against the pg driver over one loopback server",
+  "license": "MPL-2.0",
+  "scripts": {
+    "test": "node ./tests/conformance.mjs",
+    "benchmark": "node ./tests/benchmark.mjs"
+  }
+}
