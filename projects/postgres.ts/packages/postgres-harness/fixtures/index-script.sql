@@ -1,0 +1,42 @@
+DROP TABLE IF EXISTS idx_t;
+CREATE TABLE idx_t (id int PRIMARY KEY, a int, b text, c int);
+INSERT INTO idx_t VALUES (1, 10, 'Ann', 1), (2, 20, 'bob', 2), (3, NULL, 'cid', 3);
+CREATE INDEX idx_a ON idx_t (a);
+CREATE UNIQUE INDEX idx_b ON idx_t (b);
+CREATE INDEX idx_multi ON idx_t (a DESC NULLS LAST, c);
+CREATE INDEX idx_nulls ON idx_t (a NULLS FIRST, c ASC NULLS LAST);
+CREATE INDEX idx_expr ON idx_t ((a + c));
+CREATE UNIQUE INDEX idx_expr_u ON idx_t ((a * 2));
+CREATE INDEX idx_nested ON idx_t (((a + c) * 2));
+CREATE INDEX idx_func ON idx_t (lower(b));
+CREATE INDEX idx_inc ON idx_t (a) INCLUDE (b, c);
+CREATE INDEX idx_part ON idx_t (c) WHERE c > 1;
+CREATE INDEX idx_hash ON idx_t USING hash (b);
+CREATE INDEX IF NOT EXISTS idx_a ON idx_t (a);
+DROP INDEX IF EXISTS idx_nope;
+\d idx_t
+\di
+SELECT indexrelid::regclass, indnatts, indnkeyatts, indkey, indoption, indisunique FROM pg_index WHERE indrelid = 'idx_t'::regclass ORDER BY indexrelid::regclass::text;
+SELECT indexrelid::regclass, pg_get_indexdef(indexrelid, 0, true) AS pretty, pg_get_indexdef(indexrelid, 0, false) AS raw FROM pg_index WHERE indrelid = 'idx_t'::regclass ORDER BY indexrelid::regclass::text;
+SELECT schemaname, tablename, indexname, tablespace, indexdef FROM pg_indexes WHERE tablename = 'idx_t' ORDER BY indexname;
+INSERT INTO idx_t VALUES (4, 30, 'Ann', 4);
+INSERT INTO idx_t VALUES (5, 10, 'dan', 5);
+INSERT INTO idx_t VALUES (6, 40, 'eve', 6);
+CREATE INDEX idx_bad ON idx_t (nope);
+CREATE INDEX idx_bad ON idx_nope (a);
+CREATE INDEX idx_a ON idx_t (a);
+CREATE INDEX idx_badinc ON idx_t (a) INCLUDE (nope);
+CREATE INDEX idx_badexpr ON idx_t ((nope + 1));
+CREATE INDEX idx_badmethod ON idx_t USING nope (a);
+CREATE INDEX idx_hash_u ON idx_t USING hash (a) INCLUDE (b);
+CREATE INDEX idx_hash_d ON idx_t USING hash (a DESC);
+CREATE INDEX idx_hash_n ON idx_t USING hash (a NULLS FIRST);
+CREATE UNIQUE INDEX idx_hash_uniq ON idx_t USING hash (a);
+CREATE INDEX CONCURRENTLY idx_conc ON idx_t (c);
+BEGIN;
+CREATE INDEX CONCURRENTLY idx_conc2 ON idx_t (a);
+COMMIT;
+DROP INDEX public.idx_a;
+DROP INDEX idx_multi, idx_part;
+DROP INDEX idx_t_pkey;
+\d idx_t

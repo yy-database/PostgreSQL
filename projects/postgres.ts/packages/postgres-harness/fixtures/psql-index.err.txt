@@ -1,0 +1,21 @@
+psql:<stdin>:15: NOTICE:  relation "idx_a" already exists, skipping
+psql:<stdin>:16: NOTICE:  index "idx_nope" does not exist, skipping
+psql:<stdin>:22: ERROR:  duplicate key value violates unique constraint "idx_b"
+DETAIL:  Key (b)=(Ann) already exists.
+psql:<stdin>:23: ERROR:  duplicate key value violates unique constraint "idx_expr_u"
+DETAIL:  Key ((a * 2))=(20) already exists.
+psql:<stdin>:25: ERROR:  column "nope" does not exist
+psql:<stdin>:26: ERROR:  relation "idx_nope" does not exist
+psql:<stdin>:27: ERROR:  relation "idx_a" already exists
+psql:<stdin>:28: ERROR:  column "nope" does not exist
+psql:<stdin>:29: ERROR:  column "nope" does not exist
+LINE 1: CREATE INDEX idx_badexpr ON idx_t ((nope + 1));
+                                            ^
+psql:<stdin>:30: ERROR:  access method "nope" does not exist
+psql:<stdin>:31: ERROR:  access method "hash" does not support included columns
+psql:<stdin>:32: ERROR:  access method "hash" does not support ASC/DESC options
+psql:<stdin>:33: ERROR:  access method "hash" does not support NULLS FIRST/LAST options
+psql:<stdin>:34: ERROR:  access method "hash" does not support unique indexes
+psql:<stdin>:37: ERROR:  CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+psql:<stdin>:41: ERROR:  cannot drop index idx_t_pkey because constraint idx_t_pkey on table idx_t requires it
+HINT:  You can drop constraint idx_t_pkey on table idx_t instead.

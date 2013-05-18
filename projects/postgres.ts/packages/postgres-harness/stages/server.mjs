@@ -307,6 +307,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batchTxDisc = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-tx-disc-')) });
     const batchJoin = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-join-')) });
     const batchAgg = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-agg-')) });
+    const batchIndex = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-index-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -2430,6 +2431,11 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 lines.push('  aggregate transcript matches pg16 byte for byte');
             });
 
+            await check('psql/index-script', async () => {
+                await sameStreams(batchIndex, fs.readFileSync(path.join(harnessDir, 'fixtures', 'index-script.sql'), 'utf8'), 'psql-index');
+                lines.push('  index transcript matches pg16 byte for byte');
+            });
+
             await check('psql/tx-visibility', async () => {
                 await sameStreams(batchTxVis, visibilityScript(batchTxVis), 'psql-tx-vis');
                 lines.push('  read committed and repeatable read visibility matches pg16 byte for byte');
@@ -2547,8 +2553,8 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             // 98 before batch 11, plus the GUC, binary, `pg_cursors`, temp-table
             // and structured-error checks, the system-catalog meta sweep, the
             // transaction transcript, visibility, serialization, deadlock and
-            // disconnect checks, and the join and aggregate transcripts.
-            floor: 116,
+            // disconnect checks, the join, aggregate and index transcripts.
+            floor: 117,
         };
     } finally {
         await trust.close();
@@ -2570,5 +2576,6 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batchTxDisc.close();
         await batchJoin.close();
         await batchAgg.close();
+        await batchIndex.close();
     }
 }
