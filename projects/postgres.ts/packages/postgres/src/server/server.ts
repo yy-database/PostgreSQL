@@ -1268,6 +1268,16 @@ class Session {
                 return this.runCreateDatabase(statement, topLevel);
             case 'drop-database':
                 return this.runDropDatabase(statement, topLevel);
+            case 'create-index':
+                if (statement.concurrently && (this.transaction !== null || !topLevel)) {
+                    throw new ServerError('25001', 'CREATE INDEX CONCURRENTLY cannot run inside a transaction block');
+                }
+                return runStatement(database, statement, parameters);
+            case 'drop-index':
+                if (statement.concurrently && (this.transaction !== null || !topLevel)) {
+                    throw new ServerError('25001', 'DROP INDEX CONCURRENTLY cannot run inside a transaction block');
+                }
+                return runStatement(database, statement, parameters);
             case 'create-table': {
                 const outcome = runStatement(database, statement, parameters);
                 if (statement.persistence === 't') this.tempTables.add(statement.table.name);

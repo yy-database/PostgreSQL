@@ -4,6 +4,8 @@ import { ServerError } from '../errors.ts';
 import {
     type CatalogDoc,
     type ColumnMeta,
+    type UserIndexKey,
+    type UserRelation,
     PUBLIC_NAMESPACE,
     SYSTEM_NAMESPACES,
     catalogTables,
@@ -2201,6 +2203,10 @@ function frameBoundPosition(
 // ---------------------------------------------------------------------------
 
 const BTREE_OID = 403;
+const HASH_OID = 405;
+
+/** Index access methods this server stores in the catalog. */
+const INDEX_METHODS: Record<string, number> = { btree: BTREE_OID, hash: HASH_OID };
 
 function allocateOid(catalog: CatalogDoc): number {
     const oid = catalog.nextOid;
@@ -2229,6 +2235,8 @@ interface IndexRecordOptions {
     primary: boolean;
     method?: string;
     predicate?: string | null;
+    /** Structured keys, stored only when the index carries an expression key. */
+    keys?: UserIndexKey[];
     /** When set, a `p`/`u` constraint backed by this index is created too. */
     constraintName?: string;
 }
@@ -2262,7 +2270,7 @@ function addIndexRecord(database: Database, relid: number, attnums: number[], op
         name: options.name,
         namespace: PUBLIC_NAMESPACE,
         relkind: 'i',
-        relam: BTREE_OID,
+        relam: INDEX_METHODS[(options.method ?? 'btree').toLowerCase()] ?? BTREE_OID,
         owner: currentRoleOid(database),
         relhasindex: false,
     });
@@ -2274,6 +2282,7 @@ function addIndexRecord(database: Database, relid: number, attnums: number[], op
         primary: options.primary,
         method: options.method ?? 'btree',
         indkey: attnums,
+        keys: options.keys,
         predicate: options.predicate ?? null,
         constraintOid,
     });
@@ -2556,6 +2565,68 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
     return { kind: 'command', tag: 'CREATE TABLE' };
 }
 
+/** Renders one index expression the way `pg_get_indexdef` does. */
+function deparseIndexExpression(expr: Expr, pretty: boolean): string | undefined {
+    switch (expr.kind) {
+        case 'column':
+            return (expr as ColumnExpr).name;
+        case 'literal': {
+            const literal = expr as LiteralExpr;
+            if (literal.value === null) return 'NULL';
+            if (typeof literal.value === 'boolean') return literal.value ? 'true' : 'false';
+            if (literal.numeric === true) return literal.text;
+            return `'${String(literal.value).replace(/'/g, "''")}'::text`;
+        }
+        case 'binary': {
+            const binary = expr as BinaryExpr;
+            const left = deparseIndexExpression(binary.left, pretty);
+            const right = deparseIndexExpression(binary.right, pretty);
+            if (left === undefined || right === undefined) return undefined;
+            return `(${left} ${binary.op} ${right})`;
+        }
+        case 'unary': {
+            const unary = expr as UnaryExpr;
+            const inner = deparseIndexExpression(unary.expr, pretty);
+            if (inner === undefined) return undefined;
+            return `(${unary.op} ${inner})`;
+        }
+        case 'cast': {
+            const cast = expr as CastExpr;
+            const inner = deparseIndexExpression(cast.expr, pretty);
+            if (inner === undefined) return undefined;
+            const target = formatType(cast.type);
+            return pretty ? `${inner}::${target}` : `(${inner})::${target}`;
+        }
+        case 'function': {
+            const call = expr as FunctionExpr;
+            if (call.star || call.schema !== undefined) return undefined;
+            const args = call.args.map((argument) => deparseIndexExpression(argument, pretty));
+            if (args.some((argument) => argument === undefined)) return undefined;
+            return `${call.name}(${args.join(', ')})`;
+        }
+        default:
+            return undefined;
+    }
+}
+
+/** Every column an index expression reads, including nested operands. */
+function indexExpressionColumns(expr: Expr): ColumnExpr[] {
+    const found: ColumnExpr[] = [];
+    const walk = (node: Expr): void => {
+        if (node.kind === 'column') found.push(node as ColumnExpr);
+        for (const child of expressionChildren(node)) walk(child);
+    };
+    walk(expr);
+    return found;
+}
+
+function checkIndexExpressionColumns(catalog: CatalogDoc, relid: number, expr: Expr): void {
+    for (const column of indexExpressionColumns(expr)) {
+        const exists = catalog.columns.some((candidate) => candidate.relid === relid && candidate.name === column.name);
+        if (!exists) throw new ServerError('42703', `column "${column.name}" does not exist`, undefined, column.start);
+    }
+}
+
 function createIndex(database: Database, statement: CreateIndexStatement): Outcome {
     const catalog = database.catalog;
     if (statement.table.schema !== undefined && statement.table.schema !== 'public') {
@@ -2564,28 +2635,72 @@ function createIndex(database: Database, statement: CreateIndexStatement): Outco
     const relation = relationByName(catalog, statement.table.name);
     if (!relation || relation.relkind !== 'r') throw new ServerError('42P01', `relation "${statement.table.name}" does not exist`);
     checkTableOwner(database, relation);
-    if (statement.method.toLowerCase() !== 'btree') {
-        throw new ServerError('0A000', 'feature not supported', `access method "${statement.method}" is not implemented`);
+    const method = statement.method.toLowerCase();
+    if (!(method in INDEX_METHODS)) {
+        if (['gist', 'spgist', 'gin', 'brin'].includes(method)) {
+            throw new ServerError('0A000', 'feature not supported', `access method "${method}" is not implemented`);
+        }
+        throw new ServerError('42704', `access method "${statement.method}" does not exist`);
     }
     if (catalog.relations.some((candidate) => candidate.name === statement.name)) {
-        if (statement.ifNotExists) return { kind: 'command', tag: 'CREATE INDEX' };
+        if (statement.ifNotExists) {
+            return {
+                kind: 'command',
+                tag: 'CREATE INDEX',
+                notices: [{ code: '00000', message: `relation "${statement.name}" already exists, skipping` }],
+            };
+        }
         throw new ServerError('42P07', `relation "${statement.name}" already exists`);
     }
-    const attnums = attnumsFor(catalog, relation.oid, statement.columns);
-    if (new Set(attnums).size !== attnums.length) {
-        throw new ServerError('42701', `column "${statement.columns[0]}" appears twice in the index definition`);
+    if (method === 'hash') {
+        if (statement.unique) throw new ServerError('0A000', 'access method "hash" does not support unique indexes');
+        if (statement.keys.some((key) => key.desc)) throw new ServerError('0A000', 'access method "hash" does not support ASC/DESC options');
+        if (statement.include.length > 0) throw new ServerError('0A000', 'access method "hash" does not support included columns');
+        if (statement.keys.some((key) => key.nulls !== undefined)) {
+            throw new ServerError('0A000', 'access method "hash" does not support NULLS FIRST/LAST options');
+        }
     }
+    const keys: UserIndexKey[] = [];
+    for (const key of statement.keys) {
+        let column = key.column;
+        if (key.expression !== undefined && key.expression.kind === 'column') column = (key.expression as ColumnExpr).name;
+        if (column !== undefined) {
+            const attnum = attnumsFor(catalog, relation.oid, [column])[0] ?? 0;
+            keys.push({ attnum, desc: key.desc, nullsFirst: key.nullsFirst });
+            continue;
+        }
+        const expression = key.expression;
+        if (expression === undefined) continue;
+        checkIndexExpressionColumns(catalog, relation.oid, expression);
+        const pretty = deparseIndexExpression(expression, true);
+        const raw = deparseIndexExpression(expression, false);
+        if (pretty === undefined || raw === undefined) {
+            throw new ServerError('0A000', 'feature not supported', 'index expressions of this form are not implemented');
+        }
+        keys.push({
+            attnum: 0,
+            expression: pretty,
+            pretty,
+            // Non-pretty output keeps one extra pair around operator-style expressions.
+            raw: expression.kind === 'function' ? raw : `(${raw})`,
+            desc: key.desc,
+            nullsFirst: key.nullsFirst,
+        });
+    }
+    const include = attnumsFor(catalog, relation.oid, statement.include);
+    const indkey = [...keys.map((key) => key.attnum), ...include];
     const predicate = statement.whereSource ?? null;
     if (statement.unique) {
-        const parsed = statement.where ? statement.where : null;
+        const shape = shapeForRelation(database, relation);
+        const labels = keys.map((key) => indexKeyLabel(shape, key)).join(', ');
+        const parsed = statement.where ?? null;
         const seen = new Set<string>();
         for (const values of database.table(relation.oid).values()) {
             if (parsed && evaluate(database, parsed, rowContext(relation, catalog, values), []) !== true) continue;
-            const key = attnums.map((attnum) => values[attnum - 1] ?? null);
+            const key = indexKeyValues(database, shape, keys, values);
             if (key.some((value) => value === null)) continue;
             const rendered = JSON.stringify(key.map((value) => formatValue(value, TEXT)));
             if (seen.has(rendered)) {
-                const labels = attnums.map((attnum) => catalog.columns.find((column) => column.relid === relation.oid && column.attnum === attnum)?.name ?? `attnum${attnum}`).join(', ');
                 throw new ServerError(
                     '23505',
                     `could not create unique index "${statement.name}"`,
@@ -2600,30 +2715,60 @@ function createIndex(database: Database, statement: CreateIndexStatement): Outco
             seen.add(rendered);
         }
     }
-    addIndexRecord(database, relation.oid, attnums, {
+    addIndexRecord(database, relation.oid, indkey, {
         name: statement.name,
         unique: statement.unique,
         primary: false,
-        method: 'btree',
+        method,
         predicate,
+        keys,
     });
     return { kind: 'command', tag: 'CREATE INDEX' };
 }
 
 function dropIndex(database: Database, statement: DropIndexStatement): Outcome {
-
     const catalog = database.catalog;
-    const relation = catalog.relations.find((candidate) => candidate.name === statement.name && candidate.relkind === 'i');
-    if (!relation) {
-        if (statement.ifExists) return { kind: 'command', tag: 'DROP INDEX' };
-        throw new ServerError('42704', `index "${statement.name}" does not exist`);
+    const notices: { code: string; message: string }[] = [];
+    // Resolve and validate every name before touching the catalog so a failing
+    // name in a multi-name statement leaves the earlier ones in place.
+    const targets: UserRelation[] = [];
+    for (const requested of statement.names) {
+        if (requested.schema !== undefined && requested.schema !== 'public') {
+            throw new ServerError('3F000', `schema "${requested.schema}" does not exist`);
+        }
+        const index = catalog.indexes.find((candidate) => candidate.name === requested.name);
+        const relation = index === undefined ? undefined : catalog.relations.find((candidate) => candidate.oid === index.oid);
+        if (!index || !relation) {
+            if (statement.ifExists) {
+                notices.push({ code: '00000', message: `index "${requested.name}" does not exist, skipping` });
+                continue;
+            }
+            throw new ServerError('42704', `index "${requested.name}" does not exist`);
+        }
+        checkTableOwner(database, relation);
+        if (index.constraintOid !== null) {
+            const constraint = catalog.constraints.find((candidate) => candidate.oid === index.constraintOid);
+            const table = catalog.relations.find((candidate) => candidate.oid === index.relid);
+            const constraintName = constraint?.name ?? requested.name;
+            const tableName = table?.name ?? '';
+            throw new ServerError(
+                '2BP01',
+                `cannot drop index ${requested.name} because constraint ${constraintName} on table ${tableName} requires it`,
+                undefined,
+                undefined,
+                `You can drop constraint ${constraintName} on table ${tableName} instead.`,
+            );
+        }
+        targets.push(relation);
     }
-    checkTableOwner(database, relation);
-    catalog.relations = catalog.relations.filter((candidate) => candidate.oid !== relation.oid);
-    catalog.indexes = catalog.indexes.filter((index) => index.oid !== relation.oid);
-    catalog.constraints = catalog.constraints.filter((constraint) => constraint.indexOid !== relation.oid);
-    database.markCatalogDirty();
-    return { kind: 'command', tag: 'DROP INDEX' };
+    if (targets.length > 0) {
+        const oids = new Set(targets.map((target) => target.oid));
+        catalog.relations = catalog.relations.filter((candidate) => !oids.has(candidate.oid));
+        catalog.indexes = catalog.indexes.filter((candidate) => !oids.has(candidate.oid));
+        catalog.constraints = catalog.constraints.filter((constraint) => constraint.indexOid === null || !oids.has(constraint.indexOid));
+        database.markCatalogDirty();
+    }
+    return notices.length === 0 ? { kind: 'command', tag: 'DROP INDEX' } : { kind: 'command', tag: 'DROP INDEX', notices };
 }
 
 function alterTable(database: Database, statement: AlterTableStatement): Outcome {
@@ -2713,7 +2858,11 @@ interface TableShape {
         sequenceOid: number | null;
         identity: string;
     }[];
-    uniqueIndexes: { name: string; attnums: number[]; predicate: Expr | null }[];
+    uniqueIndexes: {
+        name: string;
+        keys: { attnum: number; expression: Expr | null; pretty: string | null }[];
+        predicate: Expr | null;
+    }[];
     checks: { name: string; expr: Expr }[];
     foreignKeys: {
         name: string;
@@ -2744,11 +2893,18 @@ function shapeForRelation(database: Database, relation: { oid: number; name: str
         }));
     const uniqueIndexes = catalog.indexes
         .filter((index) => index.relid === relation.oid && index.unique)
-        .map((index) => ({
-            name: index.name,
-            attnums: index.indkey,
-            predicate: index.predicate === null ? null : parseExpression(index.predicate),
-        }));
+        .map((index) => {
+            const indexKeys: UserIndexKey[] = index.keys ?? index.indkey.map((attnum) => ({ attnum }));
+            return {
+                name: index.name,
+                keys: indexKeys.map((key) => ({
+                    attnum: key.attnum,
+                    expression: key.expression === undefined ? null : parseExpression(key.expression),
+                    pretty: key.pretty ?? null,
+                })),
+                predicate: index.predicate === null ? null : parseExpression(index.predicate),
+            };
+        });
     const checks = catalog.constraints
         .filter((constraint) => constraint.relid === relation.oid && constraint.contype === 'c' && constraint.checkSource !== null)
         .map((constraint) => ({ name: constraint.name, expr: parseExpression(constraint.checkSource ?? '') }));
@@ -3253,21 +3409,37 @@ function returningOutcome(
     return { kind: 'rows', fields, rows: output, tag };
 }
 
+/** Label PostgreSQL prints for one key in a unique-violation `DETAIL`. */
+function indexKeyLabel(shape: TableShape, key: { attnum: number; pretty?: string | null }): string {
+    if (key.pretty !== undefined && key.pretty !== null) return key.pretty;
+    return shape.columns.find((column) => column.attnum === key.attnum)?.name ?? `attnum${key.attnum}`;
+}
+
+/** Evaluates the key values of one row for a unique index. */
+function indexKeyValues(database: Database, shape: TableShape, keys: UserIndexKey[], values: SqlValue[]): SqlValue[] {
+    const context = rowContext(shape, database.catalog, values);
+    return keys.map((key) => key.expression === undefined
+        ? values[key.attnum - 1] ?? null
+        : evaluate(database, parseExpression(key.expression), context, []));
+}
+
 function checkUnique(database: Database, shape: TableShape, values: SqlValue[], skipKeys: Set<string>): void {
     const rows = database.table(shape.oid);
     for (const index of shape.uniqueIndexes) {
         if (index.predicate && evaluate(database, index.predicate, rowContext(shape, database.catalog, values), []) !== true) continue;
-        const candidate = index.attnums.map((attnum) => values[attnum - 1] ?? null);
+        const candidate = index.keys.map((key) => key.expression === null
+            ? values[key.attnum - 1] ?? null
+            : evaluate(database, key.expression, rowContext(shape, database.catalog, values), []));
         if (candidate.some((value) => value === null)) continue;
         for (const [key, other] of rows) {
             if (skipKeys.has(key)) continue;
-            const existing = index.attnums.map((attnum) => other[attnum - 1] ?? null);
+            const existing = index.keys.map((key2) => key2.expression === null
+                ? other[key2.attnum - 1] ?? null
+                : evaluate(database, key2.expression, rowContext(shape, database.catalog, other), []));
             if (existing.some((value) => value === null)) continue;
             const same = candidate.every((value, position) => compareValues(value, existing[position] ?? null) === 0);
             if (!same) continue;
-            const labels = index.attnums
-                .map((attnum) => shape.columns.find((column) => column.attnum === attnum)?.name ?? `attnum${attnum}`)
-                .join(', ');
+            const labels = index.keys.map((key2) => indexKeyLabel(shape, key2)).join(', ');
             const rendered = candidate.map((value) => formatValue(value, TEXT)).join(', ');
             throw new ServerError('23505', `duplicate key value violates unique constraint "${index.name}"`, `Key (${labels})=(${rendered}) already exists.`, undefined, undefined, undefined, index.name, {
                 schema: schemaNameOf(shape),

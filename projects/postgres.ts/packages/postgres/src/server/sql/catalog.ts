@@ -56,6 +56,19 @@ export interface UserColumn {
     identity: string;
 }
 
+export interface UserIndexKey {
+    /** `pg_index.indkey` entry, `0` for an expression key. */
+    attnum: number;
+    /** Parsed expression spelling used to evaluate a unique key. */
+    expression?: string;
+    /** Rendered key text when `pg_get_indexdef` is called with `pretty`. */
+    pretty?: string;
+    /** Rendered key text when `pg_get_indexdef` is called without `pretty`. */
+    raw?: string;
+    desc?: boolean;
+    nullsFirst?: boolean;
+}
+
 export interface UserIndex {
     oid: number;
     name: string;
@@ -63,7 +76,10 @@ export interface UserIndex {
     unique: boolean;
     primary: boolean;
     method: string;
+    /** Key entries followed by `INCLUDE` columns. */
     indkey: number[];
+    /** Structured keys for expression indexes, absent on constraint indexes. */
+    keys?: UserIndexKey[];
     /** Pretty predicate text of a partial index, or `null`. */
     predicate: string | null;
     constraintOid: number | null;
@@ -494,6 +510,18 @@ const SYSTEM_RELATIONS: SystemRelation[] = [
             ['rolpassword', text],
             ['rolvaliduntil', typeOf('timestamptz')],
             ['rolconfig', typeOf('text_array')],
+        ),
+    },
+    {
+        name: 'pg_indexes',
+        oid: 12043,
+        view: true,
+        columns: columns(
+            ['schemaname', name],
+            ['tablename', name],
+            ['indexname', name],
+            ['tablespace', name],
+            ['indexdef', text],
         ),
     },
     {
@@ -1298,11 +1326,19 @@ export function catalogTables(
     }
 
     for (const index of doc.indexes) {
+        const keyCount = index.keys?.length ?? index.indkey.length;
+        // `indoption` only carries the key columns, not `INCLUDE` columns.
+        const options: string[] = [];
+        for (let position = 0; position < keyCount; position++) {
+            const key = index.keys?.[position];
+            options.push(key === undefined ? '0' : String((key.desc === true ? 1 : 0) | (key.nullsFirst === true ? 2 : 0)));
+        }
+        const zeros = index.indkey.map(() => '0').join(' ');
         push('pg_index', {
             indexrelid: index.oid,
             indrelid: index.relid,
             indnatts: index.indkey.length,
-            indnkeyatts: index.indkey.length,
+            indnkeyatts: keyCount,
             indisunique: index.unique,
             indnullsnotdistinct: false,
             indisprimary: index.primary,
@@ -1315,9 +1351,16 @@ export function catalogTables(
             indislive: true,
             indisreplident: false,
             indkey: index.indkey.join(' '),
-            indcollation: '0 0 0',
-            indclass: '0 0 0',
-            indoption: '0 0 0',
+            indcollation: zeros,
+            indclass: zeros,
+            indoption: options.join(' '),
+        });
+        push('pg_indexes', {
+            schemaname: 'public',
+            tablename: relationByOid(doc, index.relid)?.name ?? null,
+            indexname: index.name,
+            tablespace: null,
+            indexdef: pgGetIndexDef(doc, index.oid, false),
         });
     }
 
@@ -1480,11 +1523,34 @@ export function pgGetIndexDef(doc: CatalogDoc, indexOid: SqlValue, pretty = true
     const index = doc.indexes.find((candidate) => candidate.oid === indexOid);
     const relation = index ? relationByOid(doc, index.relid) : undefined;
     if (!index || !relation) return null;
-    const names = index.indkey.map((attnum) => doc.columns.find((column) => column.relid === index.relid && column.attnum === attnum)?.name ?? `attnum${attnum}`);
+    const keyCount = index.keys?.length ?? index.indkey.length;
+    const entries: string[] = [];
+    for (let position = 0; position < keyCount; position++) {
+        const key = index.keys?.[position];
+        let entry: string;
+        if (key?.expression !== undefined) {
+            entry = pretty ? key.pretty ?? `(${key.expression})` : key.raw ?? `((${key.expression}))`;
+        }
+        else {
+            const attnum = key?.attnum ?? index.indkey[position];
+            entry = doc.columns.find((column) => column.relid === index.relid && column.attnum === attnum)?.name ?? `attnum${attnum}`;
+        }
+        if (key !== undefined) {
+            const desc = key.desc === true;
+            const nullsFirst = key.nullsFirst === true;
+            if (desc) entry += ' DESC';
+            if (desc !== nullsFirst) entry += nullsFirst ? ' NULLS FIRST' : ' NULLS LAST';
+        }
+        entries.push(entry);
+    }
+    const include = index.keys === undefined ? [] : index.indkey.slice(keyCount);
+    const includeText = include.length === 0
+        ? ''
+        : ` INCLUDE (${columnNames(doc, index.relid, include).join(', ')})`;
     const unique = index.unique ? 'UNIQUE ' : '';
     const table = pretty ? relation.name : `public.${relation.name}`;
     const predicate = index.predicate === null ? '' : pretty ? ` WHERE ${index.predicate}` : ` WHERE (${index.predicate})`;
-    return `CREATE ${unique}INDEX ${index.name} ON ${table} USING ${index.method} (${names.join(', ')})${predicate}`;
+    return `CREATE ${unique}INDEX ${index.name} ON ${table} USING ${index.method} (${entries.join(', ')})${includeText}${predicate}`;
 }
 
 function columnNames(doc: CatalogDoc, relid: number, attnums: number[]): string[] {

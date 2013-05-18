@@ -353,14 +353,29 @@ export interface DropTableStatement {
     cascade: boolean;
 }
 
+export interface IndexKey {
+    /** Column name for a plain key, absent for an expression key. */
+    column?: string;
+    /** Expression parsed out of `( ... )`, absent for a plain key. */
+    expression?: Expr;
+    /** `DESC` when true, `ASC` otherwise. */
+    desc: boolean;
+    /** Effective null placement, defaulting to `NULLS FIRST` for `DESC`. */
+    nullsFirst: boolean;
+    /** Explicit `NULLS FIRST`/`NULLS LAST` spelling, absent otherwise. */
+    nulls?: 'FIRST' | 'LAST';
+}
+
 export interface CreateIndexStatement {
     kind: 'create-index';
     name: string;
     table: RelationRef;
     unique: boolean;
+    concurrently: boolean;
     ifNotExists: boolean;
     method: string;
-    columns: string[];
+    keys: IndexKey[];
+    include: string[];
     where: Expr | undefined;
     /** Source spelling of the predicate, rendered by `pg_get_indexdef`. */
     whereSource: string | undefined;
@@ -368,7 +383,9 @@ export interface CreateIndexStatement {
 
 export interface DropIndexStatement {
     kind: 'drop-index';
-    name: string;
+    /** Every name in `DROP INDEX a, b`, each optionally schema-qualified. */
+    names: { schema: string | undefined; name: string }[];
+    concurrently: boolean;
     ifExists: boolean;
     cascade: boolean;
 }
@@ -2221,6 +2238,7 @@ class Parser {
     private parseCreateIndex(): CreateIndexStatement {
         const unique = this.accept('UNIQUE');
         this.expect('INDEX');
+        const concurrently = this.accept('CONCURRENTLY');
         const ifNotExists = this.at('IF') ? (this.next(), this.expect('NOT'), this.expect('EXISTS'), true) : false;
         const name = this.identifier();
         this.expect('ON');
@@ -2231,13 +2249,45 @@ class Parser {
             method = this.identifier();
         }
         this.expect('(');
-        const columns: string[] = [];
+        const keys: IndexKey[] = [];
         do {
-            columns.push(this.identifier());
-            this.accept('ASC');
-            this.accept('DESC');
+            let key: IndexKey;
+            if (this.at('(')) {
+                this.next();
+                const expression = this.parseExpr();
+                this.expect(')');
+                key = expression.kind === 'column'
+                    ? { column: (expression as ColumnExpr).name, desc: false, nullsFirst: false }
+                    : { expression, desc: false, nullsFirst: false };
+            }
+            else if (this.peek(1).value === '(') {
+                key = { expression: this.parseExpr(), desc: false, nullsFirst: false };
+            }
+            else {
+                key = { column: this.identifier(), desc: false, nullsFirst: false };
+            }
+            if (this.accept('DESC')) key.desc = true;
+            else this.accept('ASC');
+            if (this.at('NULLS')) {
+                this.next();
+                key.nullsFirst = this.accept('FIRST');
+                key.nulls = key.nullsFirst ? 'FIRST' : 'LAST';
+                if (!key.nullsFirst) this.expect('LAST');
+            }
+            else {
+                key.nullsFirst = key.desc;
+            }
+            keys.push(key);
         } while (this.accept(','));
         this.expect(')');
+        const include: string[] = [];
+        if (this.accept('INCLUDE')) {
+            this.expect('(');
+            do {
+                include.push(this.identifier());
+            } while (this.accept(','));
+            this.expect(')');
+        }
         let where: Expr | undefined;
         let whereSource: string | undefined;
         if (this.at('WHERE')) {
@@ -2246,7 +2296,7 @@ class Parser {
             where = this.parseExpr();
             whereSource = this.sourceSince(start);
         }
-        return { kind: 'create-index', name, table, unique, ifNotExists, method, columns, where, whereSource };
+        return { kind: 'create-index', name, table, unique, concurrently, ifNotExists, method, keys, include, where, whereSource };
     }
 
     private parseColumnDef(): ColumnDef {
@@ -2528,11 +2578,22 @@ class Parser {
         if (this.at('ROLE')) return this.parseDropRole();
         if (this.at('INDEX')) {
             this.next();
+            const concurrently = this.accept('CONCURRENTLY');
             const ifExists = this.at('IF') ? (this.next(), this.expect('EXISTS'), true) : false;
-            const name = this.identifier();
+            const names: { schema: string | undefined; name: string }[] = [];
+            do {
+                let schema: string | undefined;
+                let name = this.identifier();
+                if (this.at('.')) {
+                    this.next();
+                    schema = name;
+                    name = this.identifier();
+                }
+                names.push({ schema, name });
+            } while (this.accept(','));
             const cascade = this.accept('CASCADE');
             this.accept('RESTRICT');
-            return { kind: 'drop-index', name, ifExists, cascade };
+            return { kind: 'drop-index', names, concurrently, ifExists, cascade };
         }
         this.expect('TABLE');
         const ifExists = this.at('IF') ? (this.next(), this.expect('EXISTS'), true) : false;
