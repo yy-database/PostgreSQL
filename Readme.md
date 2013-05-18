@@ -40,13 +40,17 @@ catalog SQL `psql` sends for `\dt` and `\d`. Types are `int2`/`int4`/`int8`/
 `timestamptz`/`uuid`; constraints are `NOT NULL`, literal `DEFAULT`,
 `PRIMARY KEY` and `UNIQUE`.
 
-Still missing: `numeric`, cursors, `ALTER` beyond constraint operations, views
-and indexes outside `PRIMARY KEY`/`UNIQUE`, `EXPLAIN`, grouping by a primary
-key's functional dependency, and ordered-set aggregates.
+Still missing: `numeric`, cursors, `ALTER` beyond constraint operations, views,
+`EXPLAIN`, grouping by a primary key's functional dependency, and ordered-set
+aggregates.
 `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL` joins with `ON` or `USING`, and
 `count`/`sum`/`avg`/`min`/`max`/`string_agg`/`array_agg`/`bool_and`/`bool_or`/
 `every` with `DISTINCT`, `FILTER` and aggregate `ORDER BY`, are gated against
 real `psql` transcripts.
+`CREATE INDEX`/`DROP INDEX` cover `btree` and `hash`, expression keys,
+`INCLUDE`, `DESC`/`NULLS FIRST`/`NULLS LAST`, partial predicates, the
+`IF NOT EXISTS`/`IF EXISTS` notices, and `pg_get_indexdef`/`pg_indexes`
+rendering, also gated against real `psql` transcripts.
 `Connection.execute(sql)` still serialises the statement text and reads the
 reply; the acceptance suites for the client surfaces keep talking to PGlite as
 their independent reference.
@@ -416,7 +420,7 @@ pnpm test
 The harness starts PGlite, builds the native binding, packs and installs the
 TypeScript packages into a throwaway application, builds a wheel, and replays
 one shared corpus on both language surfaces. Floors: node 1203, python 1203,
-rust 0, consistency 396, native 4, server 116; TS and Python results must match
+rust 0, consistency 396, native 4, server 117; TS and Python results must match
 case by case; `skipped` must stay 0. With `PSQL_BIN` set the `server` stage
 additionally opens real `psql` sessions, including the 68-command
 system-catalog sweep described above.
