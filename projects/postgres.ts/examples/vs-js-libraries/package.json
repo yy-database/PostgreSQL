@@ -7,6 +7,7 @@
   "license": "MPL-2.0",
   "scripts": {
     "test": "node ./tests/conformance.mjs",
-    "benchmark": "node ./tests/benchmark.mjs"
+    "benchmark": "node ./tests/benchmark.mjs",
+    "benchmark:postgres16": "node ./tests/benchmark-vs-postgres16.mjs"
   }
 }

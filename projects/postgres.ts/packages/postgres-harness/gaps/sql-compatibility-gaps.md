@@ -68,6 +68,22 @@ These wire features are rejected on purpose and are not counted as defects.
 - **listen-notify** (NotificationResponse): unsupported PostgreSQL response tag 65
 - **copy-in** (COPY FROM STDIN): unsupported PostgreSQL response tag 71
 
+## Benchmark gaps against PostgreSQL 16
+
+Measured by `projects/postgres.ts/examples/vs-js-libraries/tests/benchmark-vs-postgres16.mjs`
+against a local PostgreSQL 16.15 on the same machine, same dataset, same statements,
+5 rounds median plus p95. Report: `examples/vs-js-libraries/reports/benchmark-vs-postgres16.md`.
+The SQL-diff corpus above does not cover these rows; they are recorded here so the next
+engine batch can pick them up without re-measuring.
+
+| # | gap | observed | real PostgreSQL | evidence | owner | status |
+|---|---|---|---|---|---|---|
+| 1 | read path never uses an index | `WHERE id = ?` 13.532ms/statement and `WHERE uk = ?` 13.915ms/statement, both about 13ms above the `SELECT 1` floor | primary key and unique index seek, about 0.25ms/statement | report `point-pk` / `point-uk` rows and phase table | `PostgreSQL` repository engine (query planner and read path) | open, not scheduled |
+| 2 | range, sort and group scan the whole table | `range-limit` 14.597ms, `order-limit` 18.05ms, `group-by` 16.26ms per statement for 1000 rows | index range scan and pushed-down aggregate, about 0.3-0.6ms/statement | report phase table | `PostgreSQL` repository engine (query planner and execution) | open, not scheduled |
+| 3 | every autocommit insert pays one commit flush | `insert-single` 12.496ms/statement against 0.374ms; `tx-commit` amortises to 2.138ms/row | 0.374ms/statement with default `synchronous_commit=on` on the same machine | report `insert-single` / `tx-commit` rows | `PostgreSQL` repository engine (write path and commit) | open, not scheduled |
+| 4 | conditional update and delete are scan plus per-row rewrite | `update-many` 0.485ms/row, `delete-many` 0.162ms/row | 0.015ms/row and 0.007ms/row | report `update-many` / `delete-many` rows | `PostgreSQL` repository engine (write path) | open, not scheduled |
+| 5 | `BETWEEN` is rejected | `WHERE id BETWEEN 6 AND 46` returns `42601: syntax error at or near "BETWEEN"` | returns 41 rows | report semantics table, probe fixed at ids 1..100 | `PostgreSQL` repository engine (parser) | open, not scheduled |
+
 ## Gate
 
 - fixed seed `20261106` and count `295`, corpus digest `425917a64504d0650f710bcb69fcfd40c2a9aa30fbc4b3e84799f7dc3a5d31f3`
