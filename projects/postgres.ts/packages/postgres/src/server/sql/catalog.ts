@@ -83,6 +83,12 @@ export interface UserIndex {
     /** Pretty predicate text of a partial index, or `null`. */
     predicate: string | null;
     constraintOid: number | null;
+    /**
+     * `true` when this index has durable entries under `pg_index.<oid>`.
+     * Indexes created before the access-path work lack the flag and are
+     * re-read as full table scans rather than trusted blindly.
+     */
+    materialized?: boolean;
 }
 
 export interface UserConstraint {

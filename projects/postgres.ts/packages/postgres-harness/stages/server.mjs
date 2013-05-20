@@ -2436,6 +2436,8 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 lines.push('  index transcript matches pg16 byte for byte');
             });
 
+            await checkFixture('psql/between-script', 'psql-between', 'between-script.sql', batchIndex);
+
             await check('psql/tx-visibility', async () => {
                 await sameStreams(batchTxVis, visibilityScript(batchTxVis), 'psql-tx-vis');
                 lines.push('  read committed and repeatable read visibility matches pg16 byte for byte');
@@ -2508,6 +2510,87 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         }
 
+        // Batch 13: BETWEEN 的三值逻辑与读路径的索引访问。
+        await check('b13/between-literals', async () => {
+            await withClient(batchIndex, async (client) => {
+                const result = await client.query(
+                    'SELECT 5 BETWEEN 1 AND 10 AS a, 5 NOT BETWEEN 1 AND 10 AS b, NULL BETWEEN 1 AND 10 AS c, 5 BETWEEN NULL AND 10 AS d, 5 NOT BETWEEN NULL AND 10 AS e, 5 BETWEEN NULL AND 3 AS f, 5 NOT BETWEEN NULL AND 3 AS g, NOT 5 BETWEEN 1 AND 10 AS h',
+                );
+                const expected = { a: true, b: false, c: null, d: null, e: null, f: false, g: true, h: false };
+                assert(JSON.stringify(result.rows[0]) === JSON.stringify(expected), `BETWEEN 三值逻辑是 ${JSON.stringify(result.rows[0])}`);
+            });
+        });
+
+        await check('b13/index-plan', async () => {
+            await withClient(batchIndex, async (client) => {
+                await client.query('CREATE TABLE explain_t (id int PRIMARY KEY, uk int, v int)');
+                await client.query('CREATE UNIQUE INDEX explain_t_uk_idx ON explain_t (uk)');
+                await client.query('INSERT INTO explain_t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300), (4, 40, 400)');
+                const planOf = async (sql) => (await client.query(sql)).rows.map((row) => row['QUERY PLAN']);
+                const expectPlan = async (sql, expected, label) => {
+                    const actual = await planOf(sql);
+                    assert(JSON.stringify(actual) === JSON.stringify(expected), `${label} 的计划是 ${JSON.stringify(actual)}`);
+                };
+                const idsOf = async (where) =>
+                    (await client.query(`SELECT id FROM explain_t WHERE ${where} ORDER BY id`)).rows.map((row) => row.id);
+                const expectIds = async (where, expected, label) => {
+                    const ids = await idsOf(where);
+                    assert(JSON.stringify(ids) === JSON.stringify(expected), `${label} 的结果是 ${JSON.stringify(ids)}`);
+                };
+                // 全表结果作为索引路径的交叉校验基准。
+                assert(JSON.stringify(await idsOf('id > 0')) === '[1,2,3,4]', '基准行集不完整');
+
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM explain_t WHERE id = 2', [
+                    'Index Scan using explain_t_pkey on explain_t (keys scanned=1, rows fetched=1)',
+                    '  Index Cond: (id = 2)',
+                ], '主键点查');
+                await expectIds('id = 2', [2], '主键点查');
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM explain_t WHERE uk = 30', [
+                    'Index Scan using explain_t_uk_idx on explain_t (keys scanned=1, rows fetched=1)',
+                    '  Index Cond: (uk = 30)',
+                ], '唯一键点查');
+                await expectIds('uk = 30', [3], '唯一键点查');
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM explain_t WHERE id BETWEEN 2 AND 3', [
+                    'Index Scan using explain_t_pkey on explain_t (keys scanned=2, rows fetched=2)',
+                    '  Index Cond: (id >= 2) AND (id <= 3)',
+                ], '范围');
+                await expectIds('id BETWEEN 2 AND 3', [2, 3], '范围');
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM explain_t WHERE id = 99', [
+                    'Index Scan using explain_t_pkey on explain_t (keys scanned=0, rows fetched=0)',
+                    '  Index Cond: (id = 99)',
+                ], '未命中');
+                // 无索引可用时如实退回全表扫，不硬撑索引。
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM explain_t WHERE v = 200', [
+                    'Seq Scan on explain_t',
+                    '  Filter: (v = 200)',
+                ], '无索引谓词');
+                const expressionPlan = await planOf('EXPLAIN (ANALYZE) SELECT id FROM explain_t WHERE v + 1 = 201');
+                assert(expressionPlan[0] === 'Seq Scan on explain_t', `表达式谓词计划是 ${JSON.stringify(expressionPlan)}`);
+                assert(expressionPlan.some((line) => line.startsWith('  Filter: ')), `表达式谓词缺少过滤条件: ${JSON.stringify(expressionPlan)}`);
+                // 不带 ANALYZE 时计划本身也必须指向索引访问。
+                await expectPlan('EXPLAIN SELECT id FROM explain_t WHERE id = 2', [
+                    'Index Scan using explain_t_pkey on explain_t',
+                    '  Index Cond: (id = 2)',
+                ], '仅计划');
+
+                // 索引必须随 UPDATE/DELETE 同步，旧键与新键的计数都要对。
+                await client.query('UPDATE explain_t SET uk = 55 WHERE id = 2');
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM explain_t WHERE uk = 55', [
+                    'Index Scan using explain_t_uk_idx on explain_t (keys scanned=1, rows fetched=1)',
+                    '  Index Cond: (uk = 55)',
+                ], '更新后的键');
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM explain_t WHERE uk = 20', [
+                    'Index Scan using explain_t_uk_idx on explain_t (keys scanned=0, rows fetched=0)',
+                    '  Index Cond: (uk = 20)',
+                ], '更新前的键');
+                await client.query('DELETE FROM explain_t WHERE id = 3');
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM explain_t WHERE id = 3', [
+                    'Index Scan using explain_t_pkey on explain_t (keys scanned=0, rows fetched=0)',
+                    '  Index Cond: (id = 3)',
+                ], '已删除的键');
+            });
+        });
+
         // Batch 12: a client that dies mid-transaction must not leave rows
         // behind, and a commit already on the wire must complete exactly once.
         await check('tx/disconnect-rollback', async () => {
@@ -2553,8 +2636,9 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             // 98 before batch 11, plus the GUC, binary, `pg_cursors`, temp-table
             // and structured-error checks, the system-catalog meta sweep, the
             // transaction transcript, visibility, serialization, deadlock and
-            // disconnect checks, the join, aggregate and index transcripts.
-            floor: 117,
+            // disconnect checks, the join, aggregate and index transcripts,
+            // the BETWEEN transcript and the index-plan checks.
+            floor: 120,
         };
     } finally {
         await trust.close();

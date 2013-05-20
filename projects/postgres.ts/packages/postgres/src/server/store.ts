@@ -5,6 +5,7 @@ import {
     CATALOG_KEY,
     CATALOG_NAMESPACE,
     DATA_NAMESPACE_PREFIX,
+    INDEX_NAMESPACE_PREFIX,
     SEQUENCE_STATE_NAMESPACE,
     type Storage,
     type StoredChange,
@@ -17,8 +18,20 @@ const decoder = new TextDecoder();
 /** One `ServerStore` handle exposed as the engine's narrow storage interface. */
 export function storageFor(store: ServerStore): Storage {
     return {
-        scan(namespace: string): StoredRow[] {
-            return store.scan(namespace, EMPTY, null, null, 0);
+        scan(
+            namespace: string,
+            prefix?: Uint8Array,
+            after?: Uint8Array | null,
+            before?: Uint8Array | null,
+            limit?: number,
+        ): StoredRow[] {
+            return store.scan(
+                namespace,
+                prefix === undefined ? EMPTY : Buffer.from(prefix),
+                after === undefined || after === null ? null : Buffer.from(after),
+                before === undefined || before === null ? null : Buffer.from(before),
+                limit ?? 0,
+            );
         },
         commitChanges(changes: StoredChange[]): void {
             store.commitChanges(
@@ -41,8 +54,14 @@ export function databasePrefix(name: string): string {
 /** One database's slice of the shared store, addressed by the `db:<name>:` prefix. */
 export function scopedStorage(storage: Storage, prefix: string): Storage {
     return {
-        scan(namespace: string): StoredRow[] {
-            return storage.scan(prefix + namespace);
+        scan(
+            namespace: string,
+            scanPrefix?: Uint8Array,
+            after?: Uint8Array | null,
+            before?: Uint8Array | null,
+            limit?: number,
+        ): StoredRow[] {
+            return storage.scan(prefix + namespace, scanPrefix, after, before, limit);
         },
         commitChanges(changes: StoredChange[]): void {
             storage.commitChanges(
@@ -56,10 +75,16 @@ export function scopedStorage(storage: Storage, prefix: string): Storage {
 function relationOids(storage: Storage): number[] {
     const row = storage.scan(CATALOG_NAMESPACE).find((candidate) => decoder.decode(candidate.key) === CATALOG_KEY);
     if (!row) return [];
-    const doc = JSON.parse(decoder.decode(row.value)) as { relations?: { oid?: unknown }[] };
+    const doc = JSON.parse(decoder.decode(row.value)) as {
+        relations?: { oid?: unknown }[];
+        indexes?: { oid?: unknown }[];
+    };
     const oids: number[] = [];
     for (const relation of doc.relations ?? []) {
         if (typeof relation.oid === 'number') oids.push(relation.oid);
+    }
+    for (const index of doc.indexes ?? []) {
+        if (typeof index.oid === 'number') oids.push(index.oid);
     }
     return oids;
 }
@@ -69,7 +94,7 @@ function databaseNamespaces(storage: Storage): string[] {
     return [
         CATALOG_NAMESPACE,
         SEQUENCE_STATE_NAMESPACE,
-        ...relationOids(storage).map((oid) => `${DATA_NAMESPACE_PREFIX}${oid}`),
+        ...relationOids(storage).flatMap((oid) => [`${DATA_NAMESPACE_PREFIX}${oid}`, `${INDEX_NAMESPACE_PREFIX}${oid}`]),
     ];
 }
 

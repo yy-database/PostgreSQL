@@ -27,7 +27,7 @@ import {
     systemRelationOidForName,
     typeByOid,
 } from './catalog.ts';
-import type { Database } from './database.ts';
+import type { Database, IndexScanStat } from './database.ts';
 import { type ClusterRole, findRole, hasDatabasePrivilege, roleIsSuperuser } from './cluster.ts';
 import { defaultAcl, defaultNamespaceAcl, formatAcl, grantAcl, parseAcl, privilegeLetters, revokeAcl } from './acl.ts';
 import {
@@ -53,6 +53,7 @@ import {
     type DeleteStatement,
     type DropIndexStatement,
     type DropTableStatement,
+    type ExplainStatement,
     type Expr,
     type FrameBound,
     type FromItem,
@@ -178,6 +179,8 @@ export function runStatement(database: Database, statement: Statement, params: S
             const result = executeSelect(database, statement, params, undefined);
             return { kind: 'rows', fields: result.fields, rows: result.rows, tag: `SELECT ${result.rows.length}` };
         }
+        case 'explain':
+            return explainStatement(database, statement, params);
         case 'create-table':
             return createTable(database, statement);
         case 'drop-table':
@@ -538,7 +541,7 @@ function executeCore(
         const entries = valuesList.map((row) => ({ values: row.map((expr) => evaluate(database, expr, emptyContext(), params)), keys: [] as SqlValue[] }));
         return { fields, entries };
     }
-    const from = buildFrom(database, core.from, params, outer);
+    const from = buildFrom(database, core.from, params, outer, core.where);
     const targets = expandTargets(database, core.targets, from.columns);
     const scope: Scope = { columns: from.columns, outer: outer ? { columns: outer.columns, outer: undefined } : undefined };
     const fields: Field[] = targets.map((target) => ({ name: targetName(target), type: fieldType(database, target.expr, scope, params) }));
@@ -1069,8 +1072,12 @@ function emptyContext(): Context {
     return { columns: [], row: [], outer: undefined };
 }
 
-function buildFrom(database: Database, from: FromItem[], params: SqlValue[], outer: Context | undefined): RowSet {
+function buildFrom(database: Database, from: FromItem[], params: SqlValue[], outer: Context | undefined, where?: Expr): RowSet {
     if (from.length === 0) return { columns: [], rows: [[]] };
+    if (from.length === 1 && from[0]!.kind === 'relation' && from[0]!.args === undefined && where !== undefined) {
+        // 单表带 WHERE 时把谓词交给访问路径选择器，索引扫描与全表扫描在这里分岔。
+        return buildRelation(database, from[0]!, params, outer, where);
+    }
     let current = buildItem(database, from[0]!, params, outer);
     for (const item of from.slice(1)) {
         if (item.kind === 'relation' && item.args !== undefined) {
@@ -1283,7 +1290,7 @@ function crossJoin(left: RowSet, right: RowSet): RowSet {
     return { columns, rows };
 }
 
-function buildRelation(database: Database, ref: RelationRef, params: SqlValue[], context?: Context): RowSet {
+function buildRelation(database: Database, ref: RelationRef, params: SqlValue[], context?: Context, where?: Expr): RowSet {
     const alias = ref.alias ?? ref.name;
     if (ref.args === undefined) {
         for (let index = cteScopes.length - 1; index >= 0; index -= 1) {
@@ -1333,6 +1340,19 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
         .filter((column) => column.relid === relation.oid)
         .sort((left, right) => left.attnum - right.attnum)
         .map((column) => ({ name: column.name, type: typeByOid(column.typeOid, column.typmod) }));
+    if (where !== undefined) {
+        const indexColumns = indexColumnsOf(database, relation.oid);
+        const aliases = new Set([ref.name.toLowerCase(), relation.name.toLowerCase(), alias.toLowerCase()]);
+        const plan = planRelationAccess(
+            database,
+            materializedIndexesOf(database.catalog, relation.oid),
+            indexColumns,
+            aliases,
+            where,
+            params,
+        );
+        if (plan !== null) return scanIndexRows(database, relation, columns, alias, plan);
+    }
     const rows = [...database.table(relation.oid).values()].map((row) => [...row, relation.oid]);
     return {
         columns: [
@@ -2285,7 +2305,11 @@ function addIndexRecord(database: Database, relid: number, attnums: number[], op
         keys: options.keys,
         predicate: options.predicate ?? null,
         constraintOid,
+        materialized: false,
     });
+    const record = catalog.indexes[catalog.indexes.length - 1]!;
+    // 只有编码器支持的 btree 索引才落盘维护，其余索引如实退回全表扫描。
+    record.materialized = materializedIndexKeys(catalog, record) !== null;
     database.markCatalogDirty();
     return indexOid;
 }
@@ -2715,7 +2739,7 @@ function createIndex(database: Database, statement: CreateIndexStatement): Outco
             seen.add(rendered);
         }
     }
-    addIndexRecord(database, relation.oid, indkey, {
+    const indexOid = addIndexRecord(database, relation.oid, indkey, {
         name: statement.name,
         unique: statement.unique,
         primary: false,
@@ -2723,6 +2747,11 @@ function createIndex(database: Database, statement: CreateIndexStatement): Outco
         predicate,
         keys,
     });
+    const record = database.catalog.indexes.find((candidate) => candidate.oid === indexOid);
+    const materialized = record === undefined ? null : materializedIndexKeys(database.catalog, record);
+    if (record !== undefined && materialized !== null) {
+        backfillIndex(database, relation, { oid: record.oid, name: record.name, unique: record.unique, keys: materialized });
+    }
     return { kind: 'command', tag: 'CREATE INDEX' };
 }
 
@@ -2763,6 +2792,7 @@ function dropIndex(database: Database, statement: DropIndexStatement): Outcome {
     }
     if (targets.length > 0) {
         const oids = new Set(targets.map((target) => target.oid));
+        for (const oid of oids) purgeIndexEntries(database, oid);
         catalog.relations = catalog.relations.filter((candidate) => !oids.has(candidate.oid));
         catalog.indexes = catalog.indexes.filter((candidate) => !oids.has(candidate.oid));
         catalog.constraints = catalog.constraints.filter((constraint) => constraint.indexOid === null || !oids.has(constraint.indexOid));
@@ -2827,6 +2857,7 @@ function dropTable(database: Database, statement: DropTableStatement): Outcome {
         );
     }
     const indexOids = catalog.indexes.filter((index) => index.relid === relation.oid).map((index) => index.oid);
+    for (const indexOid of indexOids) purgeIndexEntries(database, indexOid);
     const sequenceOids = catalog.sequences.filter((sequence) => sequence.relid === relation.oid).map((sequence) => sequence.oid);
     catalog.relations = catalog.relations.filter((candidate) => candidate.oid !== relation.oid && !indexOids.includes(candidate.oid) && !sequenceOids.includes(candidate.oid));
     catalog.columns = catalog.columns.filter((column) => column.relid !== relation.oid);
@@ -2863,6 +2894,8 @@ interface TableShape {
         keys: { attnum: number; expression: Expr | null; pretty: string | null }[];
         predicate: Expr | null;
     }[];
+    /** Materialized btree indexes whose leading keys the planner may use. */
+    indexes: MaterializedIndex[];
     checks: { name: string; expr: Expr }[];
     foreignKeys: {
         name: string;
@@ -2919,7 +2952,7 @@ function shapeForRelation(database: Database, relation: { oid: number; name: str
             confdeltype: constraint.confdeltype,
             confmatchtype: constraint.confmatchtype ?? 's',
         }));
-    return { oid: relation.oid, name: relation.name, namespace: relation.namespace, columns, uniqueIndexes, checks, foreignKeys };
+    return { oid: relation.oid, name: relation.name, namespace: relation.namespace, columns, uniqueIndexes, indexes: materializedIndexesOf(catalog, relation.oid), checks, foreignKeys };
 }
 
 /** The schema name PostgreSQL reports in `s` for a relation-level error. */
@@ -2943,6 +2976,424 @@ function tableShape(database: Database, ref: RelationRef): TableShape {
     }
     return shapeForRelation(database, relation);
 }
+
+/* ------------------------------------------------------------------------- *
+ * 索引访问路径
+ *
+ * 只有满足以下条件的 btree 索引才落盘维护并参与计划：键全是普通列、类型有
+ * 可比较的字节编码、不是部分索引。其余索引如实退回全表扫描，不假装可用。
+ * 条目键 = 排序编码后的键值 + 0x00 + 行号，值为整行数据（覆盖索引），因此
+ * 索引扫描不读取堆表。EXPLAIN 与执行器共用 `planRelationAccess`。
+ * ------------------------------------------------------------------------- */
+
+interface IndexKeyShape {
+    attnum: number;
+    type: DataType;
+    desc: boolean;
+    nullsFirst: boolean;
+}
+
+interface MaterializedIndex {
+    oid: number;
+    name: string;
+    unique: boolean;
+    keys: IndexKeyShape[];
+}
+
+interface IndexScanPlan {
+    index: MaterializedIndex;
+    /** 前导列的等值约束，按索引键顺序。 */
+    equality: SqlValue[];
+    lower: { value: SqlValue; inclusive: boolean } | null;
+    upper: { value: SqlValue; inclusive: boolean } | null;
+    /** 真正交给索引的谓词文本，用于 EXPLAIN 的 Index Cond。 */
+    conditions: string[];
+}
+
+/** 只有这些类型能编码成与 `compareValues` 同序的字节串。 */
+function isIndexScanType(type: DataType): boolean {
+    switch (type.key) {
+        case 'bool':
+        case 'int2':
+        case 'int4':
+        case 'int8':
+        case 'oid':
+        case 'date':
+        case 'timestamp':
+        case 'timestamptz':
+        case 'uuid':
+            return true;
+        default:
+            return false;
+    }
+}
+
+function materializedIndexKeys(catalog: CatalogDoc, index: { relid: number; method: string; predicate: string | null; indkey: number[]; keys?: { attnum: number; desc?: boolean; nullsFirst?: boolean; expression?: string }[] }): IndexKeyShape[] | null {
+    if (index.method.toLowerCase() !== 'btree' || index.predicate !== null) return null;
+    const source: { attnum: number; desc?: boolean; nullsFirst?: boolean; expression?: string }[] =
+        index.keys ?? index.indkey.map((attnum) => ({ attnum }));
+    if (source.length === 0) return null;
+    const keys: IndexKeyShape[] = [];
+    for (const key of source) {
+        if (key.attnum <= 0 || key.expression !== undefined) return null;
+        const column = catalog.columns.find((candidate) => candidate.relid === index.relid && candidate.attnum === key.attnum);
+        if (!column) return null;
+        const type = typeByOid(column.typeOid, column.typmod);
+        if (!isIndexScanType(type)) return null;
+        keys.push({ attnum: key.attnum, type, desc: key.desc === true, nullsFirst: key.nullsFirst === true });
+    }
+    return keys;
+}
+
+function materializedIndexesOf(catalog: CatalogDoc, relid: number): MaterializedIndex[] {
+    const indexes: MaterializedIndex[] = [];
+    for (const index of catalog.indexes) {
+        if (index.relid !== relid || index.materialized !== true) continue;
+        const keys = materializedIndexKeys(catalog, index);
+        if (keys === null) continue;
+        indexes.push({ oid: index.oid, name: index.name, unique: index.unique, keys });
+    }
+    return indexes;
+}
+
+function indexInt64(value: SqlValue): bigint {
+    if (typeof value === 'number') return BigInt(Math.trunc(value));
+    if (typeof value === 'boolean') return value ? 1n : 0n;
+    return BigInt(String(value).trim());
+}
+
+/** 键值的负载字节：同一类型内保持与 SQL 排序一致。 */
+function indexPayload(value: SqlValue, type: DataType): number[] {
+    switch (type.key) {
+        case 'bool':
+            return [value === true || value === 't' || value === 'true' ? 0x01 : 0x00];
+        case 'int2':
+        case 'int4':
+        case 'int8':
+        case 'oid': {
+            const sortable = BigInt.asUintN(64, indexInt64(value)) ^ 0x8000000000000000n;
+            const bytes: number[] = [];
+            for (let shift = 56n; shift >= 0n; shift -= 8n) bytes.push(Number((sortable >> shift) & 0xffn));
+            return bytes;
+        }
+        default: {
+            // UTF-8 字节序与字符串比较同序；0x00 转义、0x00 0x00 结尾保证前缀无关。
+            const bytes: number[] = [];
+            for (const byte of Buffer.from(String(value), 'utf8')) {
+                bytes.push(byte);
+                if (byte === 0x00) bytes.push(0x01);
+            }
+            bytes.push(0x00, 0x00);
+            return bytes;
+        }
+    }
+}
+
+function encodeIndexValues(values: SqlValue[], keys: IndexKeyShape[]): Uint8Array {
+    const bytes: number[] = [];
+    for (let position = 0; position < keys.length; position += 1) {
+        const key = keys[position]!;
+        const value = values[position] ?? null;
+        if (value === null) {
+            bytes.push(key.nullsFirst ? 0x00 : 0xff);
+            continue;
+        }
+        bytes.push(key.nullsFirst ? 0x01 : 0xfe);
+        for (const byte of indexPayload(value, key.type)) bytes.push(key.desc ? 0xff - byte : byte);
+    }
+    return new Uint8Array(bytes);
+}
+
+function appendIndexBound(bytes: Uint8Array, extra: number[]): Uint8Array {
+    const merged = new Uint8Array(bytes.length + extra.length);
+    merged.set(bytes, 0);
+    merged.set(extra, bytes.length);
+    return merged;
+}
+
+function indexEntryKey(index: MaterializedIndex, rowKey: string, values: SqlValue[]): string {
+    const keyValues = index.keys.map((key) => values[key.attnum - 1] ?? null);
+    const bytes = encodeIndexValues(keyValues, index.keys);
+    return Buffer.concat([Buffer.from(bytes), Buffer.from([0x00]), Buffer.from(rowKey, 'latin1')]).toString('latin1');
+}
+
+function maintainIndexInsert(database: Database, shape: TableShape, rowKey: string, values: SqlValue[]): void {
+    for (const index of shape.indexes) database.putIndexEntry(index.oid, indexEntryKey(index, rowKey, values), values);
+}
+
+function maintainIndexDelete(database: Database, shape: TableShape, rowKey: string, values: SqlValue[]): void {
+    for (const index of shape.indexes) database.deleteIndexEntry(index.oid, indexEntryKey(index, rowKey, values));
+}
+
+function backfillIndex(database: Database, relation: { oid: number }, index: MaterializedIndex): void {
+    for (const [rowKey, values] of database.table(relation.oid)) {
+        database.putIndexEntry(index.oid, indexEntryKey(index, rowKey, values), values);
+    }
+}
+
+function purgeIndexEntries(database: Database, indexOid: number): void {
+    for (const entry of database.scanIndex(indexOid, null, null, null)) database.deleteIndexEntry(indexOid, entry.key);
+}
+
+function flattenConjuncts(expr: Expr): Expr[] {
+    if (expr.kind === 'binary' && expr.op === 'and') return [...flattenConjuncts(expr.left), ...flattenConjuncts(expr.right)];
+    return [expr];
+}
+
+/** 不含列引用、子查询或窗口的子表达式，可以安全地在计划阶段求值。 */
+function isConstantExpr(expr: Expr): boolean {
+    switch (expr.kind) {
+        case 'column':
+        case 'star':
+        case 'default':
+        case 'subquery':
+        case 'exists':
+            return false;
+        case 'in':
+            return isConstantExpr(expr.expr) && expr.select === undefined && expr.list.every(isConstantExpr);
+        case 'any':
+            return isConstantExpr(expr.left) && isConstantExpr(expr.array);
+        case 'function':
+            return !expr.star && expr.over === undefined && expr.args.every(isConstantExpr) && (expr.filter === undefined || isConstantExpr(expr.filter));
+        default:
+            return expressionChildren(expr).every(isConstantExpr);
+    }
+}
+
+interface IndexColumn {
+    attnum: number;
+    name: string;
+    type: DataType;
+}
+
+function indexColumnOf(expr: Expr, columns: IndexColumn[], aliases: Set<string>): IndexColumn | null {
+    if (expr.kind !== 'column') return null;
+    if (expr.qualifier !== undefined && !aliases.has(expr.qualifier.toLowerCase())) return null;
+    return columns.find((column) => column.name === expr.name) ?? null;
+}
+
+interface IndexCondition {
+    column: IndexColumn;
+    op: '=' | '>' | '>=' | '<' | '<=';
+    value: SqlValue;
+    text: string;
+}
+
+function flipComparison(op: string): IndexCondition['op'] | null {
+    switch (op) {
+        case '=':
+            return '=';
+        case '<':
+            return '>';
+        case '<=':
+            return '>=';
+        case '>':
+            return '<';
+        case '>=':
+            return '<=';
+        default:
+            return null;
+    }
+}
+
+function indexConditionOf(
+    database: Database,
+    conjunct: Expr,
+    columns: IndexColumn[],
+    aliases: Set<string>,
+    params: SqlValue[],
+): IndexCondition | null {
+    if (conjunct.kind !== 'binary') return null;
+    const op = conjunct.op;
+    if (op !== '=' && op !== '<' && op !== '<=' && op !== '>' && op !== '>=') return null;
+    const left = indexColumnOf(conjunct.left, columns, aliases);
+    const right = indexColumnOf(conjunct.right, columns, aliases);
+    let column: IndexColumn | null = null;
+    let constant: Expr | null = null;
+    let effective: IndexCondition['op'] = op;
+    if (left !== null && right === null && isConstantExpr(conjunct.right)) {
+        column = left;
+        constant = conjunct.right;
+    }
+    else if (right !== null && left === null && isConstantExpr(conjunct.left)) {
+        column = right;
+        constant = conjunct.left;
+        // `5 < id` 与 `id > 5` 等价，常量在左侧时翻转比较方向。
+        effective = flipComparison(op) ?? op;
+    }
+    if (column === null || constant === null) return null;
+    let value: SqlValue;
+    try {
+        value = coerce(evaluate(database, constant, emptyContext(), params), column.type);
+    }
+    catch {
+        // 常量本身无法转换时交给普通 WHERE 求值报错，计划阶段不吞错也不硬撑。
+        return null;
+    }
+    const text = deparseIndexExpression(conjunct, true);
+    return { column, op: effective, value, text: text ?? `(${column.name} ${effective} ...)` };
+}
+
+/** 为单表 WHERE 选一条索引访问路径；没有可用索引时返回 `null` 表示全表扫描。 */
+function planRelationAccess(
+    database: Database,
+    indexes: MaterializedIndex[],
+    columns: IndexColumn[],
+    aliases: Set<string>,
+    where: Expr,
+    params: SqlValue[],
+): IndexScanPlan | null {
+    if (indexes.length === 0) return null;
+    const conditions: IndexCondition[] = [];
+    for (const conjunct of flattenConjuncts(where)) {
+        const condition = indexConditionOf(database, conjunct, columns, aliases, params);
+        if (condition !== null) conditions.push(condition);
+    }
+    if (conditions.length === 0) return null;
+    let best: IndexScanPlan | null = null;
+    let bestScore = -1;
+    for (const index of indexes) {
+        let equalityCount = 0;
+        let lower: IndexScanPlan['lower'] = null;
+        let upper: IndexScanPlan['upper'] = null;
+        const used: string[] = [];
+        for (let position = 0; position < index.keys.length; position += 1) {
+            const key = index.keys[position]!;
+            const matching = conditions.filter((condition) => condition.column.attnum === key.attnum);
+            if (matching.length === 0) break;
+            const equality = matching.find((condition) => condition.op === '=');
+            if (position === equalityCount && equality) {
+                used.push(equality.text);
+                equalityCount += 1;
+                continue;
+            }
+            if (position !== equalityCount) break;
+            for (const condition of matching) {
+                if (condition.op === '>') lower = { value: condition.value, inclusive: false };
+                else if (condition.op === '>=') lower = { value: condition.value, inclusive: true };
+                else if (condition.op === '<') upper = { value: condition.value, inclusive: false };
+                else if (condition.op === '<=') upper = { value: condition.value, inclusive: true };
+                else continue;
+                used.push(condition.text);
+            }
+            break;
+        }
+        if (equalityCount === 0 && lower === null && upper === null) continue;
+        // 等值前缀越长越优先，其次唯一索引，再其次有范围界。
+        const score = equalityCount * 10 + (index.unique ? 2 : 0) + (lower !== null || upper !== null ? 1 : 0);
+        if (score <= bestScore) continue;
+        const equality: SqlValue[] = [];
+        for (let position = 0; position < equalityCount; position += 1) {
+            const key = index.keys[position]!;
+            const condition = conditions.find((candidate) => candidate.column.attnum === key.attnum && candidate.op === '=')!;
+            equality.push(condition.value);
+        }
+        best = { index, equality, lower, upper, conditions: used };
+        bestScore = score;
+    }
+    return best;
+}
+
+function scanIndexRows(database: Database, relation: { oid: number; name: string }, columns: ColumnMeta[], alias: string, plan: IndexScanPlan): RowSet {
+    const keys = plan.index.keys;
+    const prefix = plan.equality.length > 0 ? encodeIndexValues(plan.equality, keys.slice(0, plan.equality.length)) : null;
+    let after: Uint8Array | null = null;
+    let before: Uint8Array | null = null;
+    const boundKeys = keys.slice(0, plan.equality.length + 1);
+    if (plan.lower) {
+        const bound = encodeIndexValues([...plan.equality, plan.lower.value], boundKeys);
+        // 闭下界用键本身作游标：条目键始终是 键+0x00+行号，必然大于键。
+        after = plan.lower.inclusive ? bound : appendIndexBound(bound, [0x00, 0xff]);
+    }
+    if (plan.upper) {
+        const bound = encodeIndexValues([...plan.equality, plan.upper.value], boundKeys);
+        before = plan.upper.inclusive ? appendIndexBound(bound, [0x00, 0xff]) : bound;
+    }
+    const entries = database.scanIndex(plan.index.oid, prefix, after, before);
+    database.scanStats.push({
+        relation: relation.name,
+        indexOid: plan.index.oid,
+        index: plan.index.name,
+        indexCond: plan.conditions.join(' AND '),
+        keysScanned: entries.length,
+        rowsFetched: entries.length,
+    });
+    const bindings: Binding[] = columns.map((column) => ({ alias, name: column.name, type: column.type }));
+    bindings.push({ alias, name: 'tableoid', type: typeOf('oid'), hidden: true });
+    return { columns: bindings, rows: entries.map((entry) => [...entry.values, relation.oid]) };
+}
+
+function indexColumnsOf(database: Database, relid: number): IndexColumn[] {
+    return database.catalog.columns
+        .filter((column) => column.relid === relid)
+        .sort((left, right) => left.attnum - right.attnum)
+        .map((column) => ({ attnum: column.attnum, name: column.name, type: typeByOid(column.typeOid, column.typmod) }));
+}
+
+function explainLines(database: Database, statement: SelectStatement, params: SqlValue[], analyze: boolean): string[] {
+    if (statement.core.from.length === 0) return ['Result'];
+    if (
+        statement.core.from.length !== 1
+        || statement.unions.length > 0
+        || statement.with !== undefined
+        || statement.core.values !== undefined
+        || statement.core.groupBy.length > 0
+        || statement.core.having !== undefined
+        || statement.core.distinct
+    ) {
+        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for a single-relation SELECT without grouping or set operations');
+    }
+    const item = statement.core.from[0];
+    if (item === undefined || item.kind !== 'relation' || item.args !== undefined) {
+        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for a single-relation SELECT without grouping or set operations');
+    }
+    const ref = item;
+    if (ref.schema !== undefined && ref.schema !== 'public') {
+        throw new ServerError('3F000', `schema "${ref.schema}" does not exist`, undefined, ref.start);
+    }
+    const relation = relationByName(database.catalog, ref.name);
+    if (!relation || relation.relkind !== 'r') {
+        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for user tables only', ref.start);
+    }
+    const alias = ref.alias ?? ref.name;
+    const columns = indexColumnsOf(database, relation.oid);
+    const aliases = new Set([ref.name.toLowerCase(), relation.name.toLowerCase(), alias.toLowerCase()]);
+    const plan = statement.core.where
+        ? planRelationAccess(database, materializedIndexesOf(database.catalog, relation.oid), columns, aliases, statement.core.where, params)
+        : null;
+    let head = plan ? `Index Scan using ${plan.index.name} on ${relation.name}` : `Seq Scan on ${relation.name}`;
+    let stat: IndexScanStat | undefined;
+    if (analyze) {
+        database.scanStats.length = 0;
+        executeSelect(database, statement, params, undefined);
+        stat = plan ? database.scanStats.find((candidate) => candidate.indexOid === plan.index.oid) : undefined;
+        if (plan && !stat) {
+            throw new ServerError('XX000', 'internal error', 'the executor did not consume the planned index scan');
+        }
+        if (stat) head += ` (keys scanned=${stat.keysScanned}, rows fetched=${stat.rowsFetched})`;
+    }
+    const lines = [head];
+    if (plan && plan.conditions.length > 0) lines.push(`  Index Cond: ${plan.conditions.join(' AND ')}`);
+    if (!plan && statement.core.where) {
+        const filter = deparseIndexExpression(statement.core.where, true);
+        lines.push(`  Filter: ${filter ?? '(expression)'}`);
+    }
+    return lines;
+}
+
+function explainStatement(database: Database, statement: ExplainStatement, params: SqlValue[]): Outcome {
+    if (statement.statement.kind !== 'select') {
+        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for SELECT only');
+    }
+    const lines = explainLines(database, statement.statement, params, statement.analyze);
+    return {
+        kind: 'rows',
+        fields: [{ name: 'QUERY PLAN', type: TEXT }],
+        rows: lines.map((line) => [line]),
+        tag: 'EXPLAIN',
+    };
+}
+
 
 function rowContext(shape: { oid: number; name: string }, catalog: CatalogDoc, values: SqlValue[]): Context {
     const columns: Binding[] = catalog.columns
@@ -3114,6 +3565,7 @@ function insertRows(database: Database, statement: InsertStatement, params: SqlV
         enforceChecks(database, shape, values);
         enforceForeignKeys(database, shape, values);
         const key = database.insertRow(shape.oid, values);
+        maintainIndexInsert(database, shape, key, values);
         inserted.push({ key, values });
         checkUnique(database, shape, values, new Set([key]));
     }
@@ -3159,7 +3611,9 @@ function removeRow(database: Database, shape: TableShape, key: string, values: S
                 const next = [...childValues];
                 for (const attnum of constraint.conkey) next[attnum - 1] = null;
                 validateRowShape(database, child, next);
+                maintainIndexDelete(database, child, childKey, childValues);
                 database.updateRow(child.oid, childKey, next);
+                maintainIndexInsert(database, child, childKey, next);
                 checkUnique(database, child, next, new Set([childKey]));
             }
             continue;
@@ -3172,7 +3626,9 @@ function removeRow(database: Database, shape: TableShape, key: string, values: S
                     next[attnum - 1] = column ? columnDefault(database, column) : null;
                 }
                 validateRowShape(database, child, next);
+                maintainIndexDelete(database, child, childKey, childValues);
                 database.updateRow(child.oid, childKey, next);
+                maintainIndexInsert(database, child, childKey, next);
                 checkUnique(database, child, next, new Set([childKey]));
             }
             continue;
@@ -3190,6 +3646,7 @@ function removeRow(database: Database, shape: TableShape, key: string, values: S
             { schema: schemaNameOf(shape), table: shape.name },
         );
     }
+    maintainIndexDelete(database, shape, key, values);
     database.deleteRow(shape.oid, key);
 }
 
@@ -3228,7 +3685,11 @@ function updateRows(database: Database, statement: UpdateStatement, params: SqlV
         validateRowShape(database, shape, next);
         updated.push({ key, values: next });
     }
-    for (const row of updated) database.updateRow(shape.oid, row.key, row.values);
+    for (const row of updated) {
+        maintainIndexDelete(database, shape, row.key, original.get(row.key) ?? row.values);
+        database.updateRow(shape.oid, row.key, row.values);
+        maintainIndexInsert(database, shape, row.key, row.values);
+    }
     propagateParentUpdates(database, shape, updated, original);
     for (const row of updated) checkUnique(database, shape, row.values, new Set([row.key]));
     return returningOutcome(database, statement.returning, shape, updated, params, `UPDATE ${updated.length}`);
@@ -3262,7 +3723,9 @@ function propagateParentUpdates(
                         next[attnum - 1] = newKey[position] ?? null;
                     });
                     validateRowShape(database, child, next);
+                    maintainIndexDelete(database, child, childKey, childValues);
                     database.updateRow(child.oid, childKey, next);
+                    maintainIndexInsert(database, child, childKey, next);
                     checkUnique(database, child, next, new Set([childKey]));
                     continue;
                 }
@@ -3270,7 +3733,9 @@ function propagateParentUpdates(
                     const next = [...childValues];
                     for (const attnum of constraint.conkey) next[attnum - 1] = null;
                     validateRowShape(database, child, next);
+                    maintainIndexDelete(database, child, childKey, childValues);
                     database.updateRow(child.oid, childKey, next);
+                    maintainIndexInsert(database, child, childKey, next);
                     checkUnique(database, child, next, new Set([childKey]));
                     continue;
                 }
@@ -3281,7 +3746,9 @@ function propagateParentUpdates(
                         next[attnum - 1] = column ? columnDefault(database, column) : null;
                     }
                     validateRowShape(database, child, next);
+                    maintainIndexDelete(database, child, childKey, childValues);
                     database.updateRow(child.oid, childKey, next);
+                    maintainIndexInsert(database, child, childKey, next);
                     checkUnique(database, child, next, new Set([childKey]));
                     continue;
                 }

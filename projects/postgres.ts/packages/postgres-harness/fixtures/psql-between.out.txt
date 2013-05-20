@@ -1,0 +1,61 @@
+DROP TABLE
+CREATE TABLE
+INSERT 0 5
+ a | b | c | d | e | f | g | h 
+---+---+---+---+---+---+---+---
+ t | f |   |   |   | f | t | f
+(1 row)
+
+ id | in_range | out_range 
+----+----------+-----------
+  1 | t        | f
+  2 | t        | f
+  3 |          | 
+  4 | f        | t
+  5 | f        | t
+(5 rows)
+
+ id 
+----
+  1
+  2
+(2 rows)
+
+ id 
+----
+  4
+  5
+(2 rows)
+
+ id 
+----
+  1
+  2
+(2 rows)
+
+ id 
+----
+  1
+  2
+  4
+(3 rows)
+
+ id 
+----
+  1
+  2
+(2 rows)
+
+ id 
+----
+  1
+  2
+  4
+(3 rows)
+
+ id 
+----
+  1
+  2
+(2 rows)
+

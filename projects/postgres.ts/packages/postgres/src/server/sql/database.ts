@@ -24,7 +24,13 @@ export interface StoredChange {
 
 /** The native `ServerStore` surface the engine writes through. */
 export interface Storage {
-    scan(namespace: string): StoredRow[];
+    scan(
+        namespace: string,
+        prefix?: Uint8Array,
+        after?: Uint8Array | null,
+        before?: Uint8Array | null,
+        limit?: number,
+    ): StoredRow[];
     commitChanges(changes: StoredChange[]): void;
 }
 
@@ -33,9 +39,25 @@ export const CATALOG_KEY = 'catalog';
 export const DATA_NAMESPACE_PREFIX = 'pg_data.';
 /** Non-transactional `nextval` high-water marks, one key per sequence oid. */
 export const SEQUENCE_STATE_NAMESPACE = 'pg_sequence_state';
+/** Secondary index entries, one namespace per index oid. */
+export const INDEX_NAMESPACE_PREFIX = 'pg_index.';
 
 export function dataNamespace(relOid: number): string {
     return `${DATA_NAMESPACE_PREFIX}${relOid}`;
+}
+
+export function indexNamespace(indexOid: number): string {
+    return `${INDEX_NAMESPACE_PREFIX}${indexOid}`;
+}
+
+/** One index access path consumed by the current statement, for `EXPLAIN ANALYZE`. */
+export interface IndexScanStat {
+    relation: string;
+    indexOid: number;
+    index: string;
+    indexCond: string;
+    keysScanned: number;
+    rowsFetched: number;
 }
 
 const encoder = new TextEncoder();
@@ -47,6 +69,15 @@ function encode(text: string): Uint8Array {
 
 function decode(bytes: Uint8Array): string {
     return decoder.decode(bytes);
+}
+
+/** Lossless byte <-> string mapping: latin1 code units compare like raw bytes. */
+function encodeKeyBytes(bytes: Uint8Array): string {
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1');
+}
+
+function decodeKeyBytes(text: string): Uint8Array {
+    return Buffer.from(text, 'latin1');
 }
 
 /** Loads the catalog, or returns an empty one on a fresh data directory. */
@@ -102,6 +133,10 @@ export class Database {
     private readonly storage: Storage;
     private readonly tables = new Map<number, Map<string, SqlValue[]>>();
     private readonly writes = new Map<number, Map<string, SqlValue[] | null>>();
+    /** Index entries written by this message, keyed by index oid then encoded key. */
+    private readonly indexWrites = new Map<number, Map<string, SqlValue[] | null>>();
+    /** Index access paths the executor really consumed in the current statement. */
+    readonly scanStats: IndexScanStat[] = [];
     private catalogDirty = false;
     private rolesDirty = false;
     private clusterDirty = false;
@@ -157,6 +192,7 @@ export class Database {
         copy.databaseAcls = new Map(this.databaseAcls);
         for (const [relOid, rows] of this.tables) copy.tables.set(relOid, new Map(rows));
         for (const [relOid, rows] of this.writes) copy.writes.set(relOid, new Map(rows));
+        for (const [indexOid, rows] of this.indexWrites) copy.indexWrites.set(indexOid, new Map(rows));
         copy.catalogDirty = this.catalogDirty;
         copy.rolesDirty = this.rolesDirty;
         copy.clusterDirty = this.clusterDirty;
@@ -246,6 +282,65 @@ export class Database {
         this.changesFor(relOid).set(key, null);
     }
 
+    /**
+     * Reads one index slice: committed entries from storage plus this message's
+     * pending writes, so a statement sees uncommitted rows of its own transaction.
+     * Keys are latin1 strings, whose code-unit order is raw byte order.
+     */
+    scanIndex(
+        indexOid: number,
+        prefix: Uint8Array | null,
+        after: Uint8Array | null,
+        before: Uint8Array | null,
+    ): { key: string; values: SqlValue[] }[] {
+        const namespace = indexNamespace(indexOid);
+        const pending = this.indexWrites.get(indexOid);
+        const prefixText = prefix === null ? null : encodeKeyBytes(prefix);
+        const lower = after === null ? null : encodeKeyBytes(after);
+        const upper = before === null ? null : encodeKeyBytes(before);
+        const rows = new Map<string, SqlValue[]>();
+        for (const stored of this.storage.scan(namespace, prefix ?? undefined, after, before, 0)) {
+            const key = encodeKeyBytes(stored.key);
+            const change = pending?.get(key);
+            if (change === null) continue;
+            if (change !== undefined) {
+                rows.set(key, change);
+                continue;
+            }
+            rows.set(key, JSON.parse(decode(stored.value)) as SqlValue[]);
+        }
+        if (pending) {
+            for (const [key, values] of pending) {
+                if (values === null || rows.has(key)) continue;
+                if (prefixText !== null && !key.startsWith(prefixText)) continue;
+                if (lower !== null && !(key > lower)) continue;
+                if (upper !== null && !(key < upper)) continue;
+                rows.set(key, values);
+            }
+        }
+        return [...rows.entries()]
+            .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+            .map(([key, values]) => ({ key, values }));
+    }
+
+    putIndexEntry(indexOid: number, key: string, values: SqlValue[]): void {
+        let entries = this.indexWrites.get(indexOid);
+        if (!entries) {
+            entries = new Map();
+            this.indexWrites.set(indexOid, entries);
+        }
+        entries.set(key, values);
+    }
+
+    deleteIndexEntry(indexOid: number, key: string): void {
+        let entries = this.indexWrites.get(indexOid);
+        if (!entries) {
+            entries = new Map();
+            this.indexWrites.set(indexOid, entries);
+        }
+        entries.set(key, null);
+    }
+
     markCatalogDirty(): void {
         this.catalogDirty = true;
     }
@@ -271,6 +366,8 @@ export class Database {
         for (const [relOid, rows] of other.tables) this.tables.set(relOid, rows);
         this.writes.clear();
         for (const [relOid, rows] of other.writes) this.writes.set(relOid, rows);
+        this.indexWrites.clear();
+        for (const [indexOid, rows] of other.indexWrites) this.indexWrites.set(indexOid, rows);
         this.catalogDirty = other.catalogDirty;
         this.rolesDirty = other.rolesDirty;
         this.clusterDirty = other.clusterDirty;
@@ -319,6 +416,16 @@ export class Database {
                 });
             }
         }
+        for (const [indexOid, entries] of this.indexWrites) {
+            for (const [key, values] of entries) {
+                changes.push({
+                    kind: values === null ? 'delete' : 'put',
+                    namespace: indexNamespace(indexOid),
+                    key: decodeKeyBytes(key),
+                    value: values === null ? undefined : encode(serializeRow(values)),
+                });
+            }
+        }
         if (this.catalogDirty) {
             changes.push({
                 kind: 'put',
@@ -342,6 +449,7 @@ export class Database {
             throw new ServerError('58030', 'could not write to the data directory', error instanceof Error ? error.message : String(error));
         }
         this.writes.clear();
+        this.indexWrites.clear();
         this.catalogDirty = false;
         this.rolesDirty = false;
         this.clusterDirty = false;

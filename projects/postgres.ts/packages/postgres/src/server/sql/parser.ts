@@ -556,6 +556,13 @@ export interface NotifyStatement {
     payload: string | undefined;
 }
 
+export interface ExplainStatement {
+    kind: 'explain';
+    analyze: boolean;
+    verbose: boolean;
+    statement: Statement;
+}
+
 export type Statement =
     | SelectStatement
     | InsertStatement
@@ -578,6 +585,7 @@ export type Statement =
     | CursorStatement
     | PrepareStatement
     | ExecuteStatement
+    | ExplainStatement
     | DeallocateStatement
     | ListenStatement
     | NotifyStatement;
@@ -924,6 +932,7 @@ class Parser {
         if (token.upper === 'CLOSE') return this.parseClose();
         if (token.upper === 'PREPARE') return this.parsePrepare();
         if (token.upper === 'EXECUTE') return this.parseExecute();
+        if (token.upper === 'EXPLAIN') return this.parseExplain();
         if (token.upper === 'DEALLOCATE') return this.parseDeallocate();
         if (token.upper === 'LISTEN') return this.parseListen();
         if (token.upper === 'UNLISTEN') return this.parseUnlisten();
@@ -942,6 +951,42 @@ class Parser {
         if (token.kind !== 'number' || !/^\d+$/.test(token.value)) throw syntax('syntax error: expected an integer', token);
         this.next();
         return sign * Number(token.value);
+    }
+
+    private parseExplain(): ExplainStatement {
+        this.expect('EXPLAIN');
+        let analyze = false;
+        let verbose = false;
+        const optionValue = (): boolean => {
+            if (this.accept('FALSE') || this.accept('OFF')) return false;
+            this.accept('TRUE');
+            this.accept('ON');
+            return true;
+        };
+        if (this.accept('(')) {
+            for (;;) {
+                if (this.accept('ANALYZE') || this.accept('ANALYSE')) {
+                    analyze = optionValue();
+                }
+                else if (this.accept('VERBOSE')) {
+                    verbose = optionValue();
+                }
+                else if (this.accept('FORMAT')) {
+                    const format = this.identifier().toLowerCase();
+                    if (format !== 'text') {
+                        throw new ServerError('0A000', 'feature not supported', `EXPLAIN FORMAT ${format.toUpperCase()} is not implemented`);
+                    }
+                }
+                else throw syntax('syntax error: unsupported EXPLAIN option', this.peek());
+                if (!this.accept(',')) break;
+            }
+            this.expect(')');
+        }
+        else {
+            if (this.accept('ANALYZE') || this.accept('ANALYSE')) analyze = true;
+            if (this.accept('VERBOSE')) verbose = true;
+        }
+        return { kind: 'explain', analyze, verbose, statement: this.parseStatement() };
     }
 
     private parseCopy(): CopyStatement {
@@ -1696,6 +1741,22 @@ class Parser {
                 const negated = this.accept('NOT');
                 this.expect('NULL');
                 left = { kind: 'isnull', expr: left, negated } satisfies IsNullExpr;
+                continue;
+            }
+            if (this.at('BETWEEN') || (this.at('NOT') && this.peek(1).upper === 'BETWEEN')) {
+                const negated = this.at('NOT');
+                if (negated) this.next();
+                this.next();
+                // 边界按 PostgreSQL 的 `b_expr` 层解析，避免把尾随的 `AND` 吞进上界。
+                const low = this.parseAdditive();
+                this.expect('AND');
+                const high = this.parseAdditive();
+                // PostgreSQL 把 BETWEEN 展开成两个范围比较而不是对整体取反：
+                // `a BETWEEN x AND y` 即 `a >= x AND a <= y`，
+                // `a NOT BETWEEN x AND y` 即 `a < x OR a > y`，NULL 结果因此不同。
+                const lower: BinaryExpr = { kind: 'binary', op: negated ? '<' : '>=', left, right: low };
+                const upper: BinaryExpr = { kind: 'binary', op: negated ? '>' : '<=', left, right: high };
+                left = { kind: 'binary', op: negated ? 'or' : 'and', left: lower, right: upper } satisfies BinaryExpr;
                 continue;
             }
             if (this.at('IN') || (this.at('NOT') && this.peek(1).upper === 'IN')) {

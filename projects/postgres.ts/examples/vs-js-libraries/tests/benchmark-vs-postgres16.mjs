@@ -175,7 +175,7 @@ const WORKLOADS = [
       await seed(connection, datasetStatements());
     },
     async run(connection) {
-      // 本仓不支持 `BETWEEN`，统一用 `> AND <=` 表达同一个 20 行窗口。
+      // 用 `> AND <=` 表达 20 行窗口，和 `BETWEEN` 走同一组索引下界与上界。
       const span = Math.floor((DATASET - 20) / RANGE_OPS);
       for (let index = 0; index < RANGE_OPS; index += 1) {
         const from = ID_BASE + index * span;
@@ -344,7 +344,7 @@ async function measureReal(workload) {
   }
 }
 
-// 语义探针：本仓不支持 `BETWEEN`，这里固定记录该差异，不参与性能比值。
+// 语义探针：`BETWEEN` 与等价的 `> AND <=` 必须给出同一结果，不参与性能比值。
 async function probeSemantics() {
   const insert = `INSERT INTO semantics VALUES ${Array.from({ length: 100 }, (_, index) => `(${index + 1})`).join(", ")}`;
   const queries = {
@@ -460,16 +460,17 @@ function markdownReport(samples, version, semantics) {
   lines.push("");
   const pkOurs = median(samples.get("point-pk").ours) / POINT_OPS;
   const ukOurs = median(samples.get("point-uk").ours) / POINT_OPS;
+  const rangeOurs = median(samples.get("range-limit").ours) / RANGE_OPS;
   const orderOurs = median(samples.get("order-limit").ours) / ORDER_OPS;
   const groupOurs = median(samples.get("group-by").ours) / GROUP_OPS;
   lines.push(
     `- **每语句固定地板**：\`baseline-select1\` 本仓 ${floorOurs.toFixed(3)}ms/语句，真库 ${floorReal.toFixed(3)}ms。地板本身不高，差距主要来自读路径。`,
   );
   lines.push(
-    `- **点查没有走索引**：\`point-pk\` ${pkOurs.toFixed(3)}ms/语句、\`point-uk\` ${ukOurs.toFixed(3)}ms/语句，两者几乎相同且都远高于地板，说明主键与唯一键都没有参与定位，读路径是整表扫描；${DATASET} 行扫描约 ${(pkOurs - floorOurs).toFixed(1)}ms。`,
+    `- **点查走索引**：\`point-pk\` ${pkOurs.toFixed(3)}ms/语句、\`point-uk\` ${ukOurs.toFixed(3)}ms/语句，扣掉地板后为 ${(pkOurs - floorOurs).toFixed(3)}ms 与 ${(ukOurs - floorOurs).toFixed(3)}ms，剩余是索引条目解码与逐行过滤的固定成本，不再随行数整表扫描。`,
   );
   lines.push(
-    `- **范围、排序与分组都含整表扫描**：\`range-limit\` ${(median(samples.get("range-limit").ours) / RANGE_OPS).toFixed(3)}ms/语句、\`order-limit\` ${orderOurs.toFixed(2)}ms/语句、\`group-by\` ${groupOurs.toFixed(2)}ms/语句，扫描之后再叠加排序与聚合成本。`,
+    `- **范围走索引、排序与分组仍整表扫**：\`range-limit\` ${rangeOurs.toFixed(3)}ms/语句按索引区间取 20 行后逐行过滤；\`order-limit\` ${orderOurs.toFixed(2)}ms/语句、\`group-by\` ${groupOurs.toFixed(2)}ms/语句，\`val\`/\`grp\` 没有索引，仍整表扫描后排序与聚合。`,
   );
   lines.push(
     `- **写入成本集中在每次提交的落盘**：\`insert-single\` ${(median(samples.get("insert-single").ours) / INSERT_SINGLE).toFixed(3)}ms/语句，比真库多 ${(median(samples.get("insert-single").ours) / INSERT_SINGLE - median(samples.get("insert-single").real) / INSERT_SINGLE).toFixed(1)}ms；\`tx-commit\` 摊到 ${(median(samples.get("tx-commit").ours) / (TX_COUNT * TX_ROWS)).toFixed(3)}ms/行，说明单条插入把整次提交的落盘成本整笔付一次。同机真实库保持默认 \`synchronous_commit=on\`，口径一致。`,

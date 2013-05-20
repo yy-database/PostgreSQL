@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS between_t;
+CREATE TABLE between_t (id int PRIMARY KEY, n int, d date, s text);
+INSERT INTO between_t VALUES (1, 5, '2024-01-05'::date, 'apple'), (2, 10, '2024-01-10'::date, 'banana'), (3, NULL, NULL, NULL), (4, 1, '2023-12-31'::date, 'cherry'), (5, 20, '2024-02-01'::date, 'date');
+SELECT 5 BETWEEN 1 AND 10 AS a, 5 NOT BETWEEN 1 AND 10 AS b, NULL BETWEEN 1 AND 10 AS c, 5 BETWEEN NULL AND 10 AS d, 5 NOT BETWEEN NULL AND 10 AS e, 5 BETWEEN NULL AND 3 AS f, 5 NOT BETWEEN NULL AND 3 AS g, NOT 5 BETWEEN 1 AND 10 AS h;
+SELECT id, n BETWEEN 2 AND 15 AS in_range, n NOT BETWEEN 2 AND 15 AS out_range FROM between_t ORDER BY id;
+SELECT id FROM between_t WHERE n BETWEEN 2 AND 15 ORDER BY id;
+SELECT id FROM between_t WHERE n NOT BETWEEN 2 AND 15 ORDER BY id;
+SELECT id FROM between_t WHERE n BETWEEN 2 AND 15 AND s IS NOT NULL ORDER BY id;
+SELECT id FROM between_t WHERE n BETWEEN 2 AND 15 OR id = 4 ORDER BY id;
+SELECT id FROM between_t WHERE d BETWEEN '2024-01-01'::date AND '2024-01-31'::date ORDER BY id;
+SELECT id FROM between_t WHERE s BETWEEN 'apple' AND 'cherry' ORDER BY id;
+SELECT id FROM between_t WHERE n BETWEEN 2 AND 15 AND s BETWEEN 'a' AND 'banana' ORDER BY id;
