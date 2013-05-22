@@ -2437,6 +2437,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
 
             await checkFixture('psql/between-script', 'psql-between', 'between-script.sql', batchIndex);
+            await checkFixture('psql/order-script', 'psql-order', 'order-script.sql', batchIndex);
 
             await check('psql/tx-visibility', async () => {
                 await sameStreams(batchTxVis, visibilityScript(batchTxVis), 'psql-tx-vis');
@@ -2591,6 +2592,64 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         });
 
+        // Batch 13: 无 `WHERE` 的 `ORDER BY` 命中索引键序时走有序索引扫描，取够 `LIMIT` 即停。
+        await check('b13/ordered-plan', async () => {
+            await withClient(batchIndex, async (client) => {
+                await client.query('CREATE TABLE ord_plan_t (id int, val int, note text)');
+                await client.query('CREATE INDEX ord_plan_t_val_idx ON ord_plan_t (val DESC, id)');
+                await client.query(
+                    "INSERT INTO ord_plan_t VALUES (1, 5, 'a'), (2, 7, 'b'), (3, 5, 'c'), (4, NULL, 'd'), (5, 7, 'e'), (6, 1, 'f'), (7, NULL, 'g')",
+                );
+                const planOf = async (sql) => (await client.query(sql)).rows.map((row) => row['QUERY PLAN']);
+                const expectPlan = async (sql, expected, label) => {
+                    const actual = await planOf(sql);
+                    assert(JSON.stringify(actual) === JSON.stringify(expected), `${label} 的计划是 ${JSON.stringify(actual)}`);
+                };
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id, val FROM ord_plan_t ORDER BY val DESC, id LIMIT 3', [
+                    'Index Scan using ord_plan_t_val_idx on ord_plan_t (keys scanned=3, rows fetched=3)',
+                ], '有序索引扫描');
+                // `LIMIT` 与 `OFFSET` 一起下推，取够 `LIMIT + OFFSET` 行即停。
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id, val FROM ord_plan_t ORDER BY val DESC, id LIMIT 3 OFFSET 3', [
+                    'Index Scan using ord_plan_t_val_idx on ord_plan_t (keys scanned=6, rows fetched=6)',
+                ], '有序索引扫描加偏移');
+                // NULL 位置或排序方向与索引不符时如实退回排序。
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id, val FROM ord_plan_t ORDER BY val DESC NULLS LAST, id LIMIT 3', [
+                    'Seq Scan on ord_plan_t',
+                ], 'NULL 位置不符');
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM ord_plan_t ORDER BY note LIMIT 3', [
+                    'Seq Scan on ord_plan_t',
+                ], '无索引排序键');
+                await expectPlan('EXPLAIN (ANALYZE) SELECT id FROM ord_plan_t ORDER BY val ASC, id LIMIT 3', [
+                    'Seq Scan on ord_plan_t',
+                ], '方向不符');
+                // 不带 `ANALYZE` 的计划同样指向有序索引扫描。
+                await expectPlan('EXPLAIN SELECT id, val FROM ord_plan_t ORDER BY val DESC, id LIMIT 3', [
+                    'Index Scan using ord_plan_t_val_idx on ord_plan_t',
+                ], '仅计划');
+                const rows = await client.query('SELECT id, val FROM ord_plan_t ORDER BY val DESC, id LIMIT 3');
+                assert(
+                    JSON.stringify(rows.rows) === '[{"id":4,"val":null},{"id":7,"val":null},{"id":2,"val":7}]',
+                    `有序扫描结果是 ${JSON.stringify(rows.rows)}`,
+                );
+                const offsetRows = await client.query('SELECT id, val FROM ord_plan_t ORDER BY val DESC, id LIMIT 3 OFFSET 3');
+                assert(
+                    JSON.stringify(offsetRows.rows) === '[{"id":5,"val":7},{"id":1,"val":5},{"id":3,"val":5}]',
+                    `有序扫描偏移结果是 ${JSON.stringify(offsetRows.rows)}`,
+                );
+                // 分组与窗口函数需要全部输入行，`LIMIT` 不能下推成扫描截断。
+                const grouped = await client.query('SELECT val, count(*) AS n FROM ord_plan_t GROUP BY val ORDER BY val DESC LIMIT 2');
+                assert(
+                    JSON.stringify(grouped.rows) === '[{"val":null,"n":"2"},{"val":7,"n":"2"}]',
+                    `分组结果被提前截断 ${JSON.stringify(grouped.rows)}`,
+                );
+                const windowed = await client.query('SELECT id, sum(val) OVER () AS s FROM ord_plan_t ORDER BY val DESC, id LIMIT 2');
+                assert(
+                    JSON.stringify(windowed.rows) === '[{"id":4,"s":"25"},{"id":7,"s":"25"}]',
+                    `窗口结果被提前截断 ${JSON.stringify(windowed.rows)}`,
+                );
+            });
+        });
+
         // Batch 12: a client that dies mid-transaction must not leave rows
         // behind, and a commit already on the wire must complete exactly once.
         await check('tx/disconnect-rollback', async () => {
@@ -2637,8 +2696,9 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             // and structured-error checks, the system-catalog meta sweep, the
             // transaction transcript, visibility, serialization, deadlock and
             // disconnect checks, the join, aggregate and index transcripts,
-            // the BETWEEN transcript and the index-plan checks.
-            floor: 120,
+            // the BETWEEN and ORDER BY transcripts, and the index and ordered
+            // plan checks.
+            floor: 122,
         };
     } finally {
         await trust.close();

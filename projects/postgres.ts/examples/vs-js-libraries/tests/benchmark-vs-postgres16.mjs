@@ -225,6 +225,8 @@ const WORKLOADS = [
     ops: ORDER_OPS,
     async setup(connection) {
       await seed(connection, datasetStatements());
+      // 双方都建同一条索引，`ORDER BY ... LIMIT` 才能走有序索引扫描而不是内存排序。
+      await connection.query("CREATE INDEX bench_val_idx ON bench (val DESC, id)");
     },
     async run(connection) {
       for (let index = 0; index < ORDER_OPS; index += 1) {
@@ -405,6 +407,8 @@ function markdownReport(samples, version, semantics) {
   );
   lines.push(`轮次：1 轮热身 + ${ROUNDS} 轮测量，取中位数并记 p95；数据集 ${DATASET} 行，固定 seed。`);
   lines.push("比值 = 本仓耗时 / 真实库耗时，小于 1 表示本仓更快。");
+  lines.push("口径：`connect` 一项真实库每次都做认证与初始化握手，本仓连接是极简实现，两者不可比，该行不能当作性能结论。");
+  lines.push("口径：`order-limit` 在双方都先建同一条 `(val DESC, id)` 索引，测的是有序索引扫描加 `LIMIT` 提前停止，不是无索引内存排序。");
   lines.push("");
   lines.push("## 按差距排序");
   lines.push("");
@@ -470,7 +474,7 @@ function markdownReport(samples, version, semantics) {
     `- **点查走索引**：\`point-pk\` ${pkOurs.toFixed(3)}ms/语句、\`point-uk\` ${ukOurs.toFixed(3)}ms/语句，扣掉地板后为 ${(pkOurs - floorOurs).toFixed(3)}ms 与 ${(ukOurs - floorOurs).toFixed(3)}ms，剩余是索引条目解码与逐行过滤的固定成本，不再随行数整表扫描。`,
   );
   lines.push(
-    `- **范围走索引、排序与分组仍整表扫**：\`range-limit\` ${rangeOurs.toFixed(3)}ms/语句按索引区间取 20 行后逐行过滤；\`order-limit\` ${orderOurs.toFixed(2)}ms/语句、\`group-by\` ${groupOurs.toFixed(2)}ms/语句，\`val\`/\`grp\` 没有索引，仍整表扫描后排序与聚合。`,
+    `- **范围与有序访问走索引、排序与分组仍整表扫**：\`range-limit\` ${rangeOurs.toFixed(3)}ms/语句按索引区间取 20 行后逐行过滤；\`order-limit\` ${orderOurs.toFixed(3)}ms/语句在双方同建的 \`(val DESC, id)\` 上做有序索引扫描，取够 \`LIMIT\` 即停，不再整表排序；\`group-by\` ${groupOurs.toFixed(2)}ms/语句，\`grp\` 没有索引，仍整表扫描后聚合。`,
   );
   lines.push(
     `- **写入成本集中在每次提交的落盘**：\`insert-single\` ${(median(samples.get("insert-single").ours) / INSERT_SINGLE).toFixed(3)}ms/语句，比真库多 ${(median(samples.get("insert-single").ours) / INSERT_SINGLE - median(samples.get("insert-single").real) / INSERT_SINGLE).toFixed(1)}ms；\`tx-commit\` 摊到 ${(median(samples.get("tx-commit").ours) / (TX_COUNT * TX_ROWS)).toFixed(3)}ms/行，说明单条插入把整次提交的落盘成本整笔付一次。同机真实库保持默认 \`synchronous_commit=on\`，口径一致。`,

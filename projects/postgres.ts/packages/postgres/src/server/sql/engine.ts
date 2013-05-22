@@ -127,6 +127,14 @@ function matchesAlias(binding: Binding, qualifier: string): boolean {
 interface RowSet {
     columns: Binding[];
     rows: SqlValue[][];
+    /** 行已按 `ORDER BY` 要求的键序产出，外层无需再排序。 */
+    ordered?: boolean;
+}
+
+/** 单表有序访问：`items` 来自 `ORDER BY`，`limit` 是允许提前停止的行数，0 表示不限。 */
+interface OrderedAccess {
+    items: OrderItem[];
+    limit: number;
 }
 
 interface Context {
@@ -302,8 +310,11 @@ function executeSelect(database: Database, select: SelectStatement, params: SqlV
 function executeSelectBody(database: Database, select: SelectStatement, params: SqlValue[], outer: Context | undefined): SelectResult {
     const orderBy = select.orderBy;
     const ops = select.unions;
-    const results: { fields: Field[]; entries: Entry[] }[] = [
-        executeCore(database, select.core, params, outer, ops.length === 0 ? orderBy : []),
+    const orderedAccess = ops.length === 0 && orderBy.length > 0 && rowPreserving(select.core, orderBy)
+        ? scanWindow(database, select, params)
+        : undefined;
+    const results: { fields: Field[]; entries: Entry[]; ordered?: boolean }[] = [
+        executeCore(database, select.core, params, outer, ops.length === 0 ? orderBy : [], orderedAccess),
     ];
     if (ops.length === 0) return finishSelect(database, results[0]!, select, params);
     for (const op of ops) results.push(executeCore(database, op.core, params, outer, []));
@@ -341,9 +352,30 @@ function executeSelectBody(database: Database, select: SelectStatement, params: 
     return finishSelect(database, combined, select, params);
 }
 
-function finishSelect(database: Database, result: { fields: Field[]; entries: Entry[] }, select: SelectStatement, params: SqlValue[]): SelectResult {
+/**
+ * `LIMIT` 能否下推到扫描：分组、聚合、去重与窗口函数都会改变行数或依赖全部输入行，
+ * 这类查询只允许按索引键序扫描，不允许提前停止。
+ */
+function rowPreserving(core: SelectStatement['core'], orderBy: OrderItem[]): boolean {
+    if (core.groupBy.length > 0 || core.having !== undefined || core.distinct) return false;
+    const exprs = [...core.targets.map((target) => target.expr), ...orderBy.map((item) => item.expr)];
+    return !exprs.some((expr) => containsAggregate(expr)) && collectWindows(exprs).length === 0;
+}
+
+/** `ORDER BY` 需要的行数与偏移；只有常量且非负时才允许提前截断扫描。 */
+function scanWindow(database: Database, select: SelectStatement, params: SqlValue[]): OrderedAccess {
+    let limit = 0;
+    if (select.limit !== undefined) limit = Number(evaluate(database, select.limit, emptyContext(), params));
+    let offset = 0;
+    if (select.offset !== undefined) offset = Number(evaluate(database, select.offset, emptyContext(), params));
+    const usable = Number.isFinite(limit) && Number.isFinite(offset) && limit >= 0 && offset >= 0;
+    return { items: select.orderBy, limit: usable ? limit + offset : 0 };
+}
+
+function finishSelect(database: Database, result: { fields: Field[]; entries: Entry[]; ordered?: boolean }, select: SelectStatement, params: SqlValue[]): SelectResult {
     const entries = result.entries;
-    if (select.orderBy.length > 0) {
+    // 有序索引扫描已经按 `ORDER BY` 产出，再排序只会白付一次全量比较。
+    if (select.orderBy.length > 0 && result.ordered !== true) {
         if (select.unions.length === 0) entries.sort((left, right) => compareEntries(left, right, select.orderBy));
         else {
             const keyed = entries.map((entry) => ({
@@ -530,7 +562,8 @@ function executeCore(
     params: SqlValue[],
     outer: Context | undefined,
     orderBy: OrderItem[],
-): { fields: Field[]; entries: Entry[] } {
+    orderedAccess?: OrderedAccess,
+): { fields: Field[]; entries: Entry[]; ordered?: boolean } {
     const valuesList = core.values;
     if (valuesList) {
         const width = valuesList[0]?.length ?? 0;
@@ -541,7 +574,7 @@ function executeCore(
         const entries = valuesList.map((row) => ({ values: row.map((expr) => evaluate(database, expr, emptyContext(), params)), keys: [] as SqlValue[] }));
         return { fields, entries };
     }
-    const from = buildFrom(database, core.from, params, outer, core.where);
+    const from = buildFrom(database, core.from, params, outer, core.where, orderedAccess);
     const targets = expandTargets(database, core.targets, from.columns);
     const scope: Scope = { columns: from.columns, outer: outer ? { columns: outer.columns, outer: undefined } : undefined };
     const fields: Field[] = targets.map((target) => ({ name: targetName(target), type: fieldType(database, target.expr, scope, params) }));
@@ -598,7 +631,7 @@ function executeCore(
         }
         entries.splice(0, entries.length, ...kept);
     }
-    return { fields, entries };
+    return { fields, entries, ordered: grouped ? undefined : from.ordered };
 }
 
 const AGGREGATE_NAMES = new Set(['count', 'sum', 'avg', 'min', 'max', 'string_agg', 'array_agg', 'bool_and', 'bool_or', 'every']);
@@ -1072,11 +1105,12 @@ function emptyContext(): Context {
     return { columns: [], row: [], outer: undefined };
 }
 
-function buildFrom(database: Database, from: FromItem[], params: SqlValue[], outer: Context | undefined, where?: Expr): RowSet {
+function buildFrom(database: Database, from: FromItem[], params: SqlValue[], outer: Context | undefined, where?: Expr, ordered?: OrderedAccess): RowSet {
     if (from.length === 0) return { columns: [], rows: [[]] };
-    if (from.length === 1 && from[0]!.kind === 'relation' && from[0]!.args === undefined && where !== undefined) {
-        // 单表带 WHERE 时把谓词交给访问路径选择器，索引扫描与全表扫描在这里分岔。
-        return buildRelation(database, from[0]!, params, outer, where);
+    const item = from.length === 1 ? from[0] : undefined;
+    if (item !== undefined && item.kind === 'relation' && item.args === undefined && (where !== undefined || ordered !== undefined)) {
+        // 单表时把谓词与 `ORDER BY` 交给访问路径选择器，索引扫描与全表扫描在这里分岔。
+        return buildRelation(database, item, params, outer, where, ordered);
     }
     let current = buildItem(database, from[0]!, params, outer);
     for (const item of from.slice(1)) {
@@ -1290,7 +1324,7 @@ function crossJoin(left: RowSet, right: RowSet): RowSet {
     return { columns, rows };
 }
 
-function buildRelation(database: Database, ref: RelationRef, params: SqlValue[], context?: Context, where?: Expr): RowSet {
+function buildRelation(database: Database, ref: RelationRef, params: SqlValue[], context?: Context, where?: Expr, ordered?: OrderedAccess): RowSet {
     const alias = ref.alias ?? ref.name;
     if (ref.args === undefined) {
         for (let index = cteScopes.length - 1; index >= 0; index -= 1) {
@@ -1352,6 +1386,16 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
             params,
         );
         if (plan !== null) return scanIndexRows(database, relation, columns, alias, plan);
+    }
+    else if (ordered !== undefined && ordered.items.length > 0) {
+        // 纯 `ORDER BY` 查询：索引键序与排序要求一致时按序扫描，取够 `LIMIT` 即停。
+        const plan = planOrderedAccess(
+            materializedIndexesOf(database.catalog, relation.oid),
+            indexColumnsOf(database, relation.oid),
+            new Set([ref.name.toLowerCase(), relation.name.toLowerCase(), alias.toLowerCase()]),
+            ordered.items,
+        );
+        if (plan !== null) return scanIndexRows(database, relation, columns, alias, plan, ordered.limit, true);
     }
     const rows = [...database.table(relation.oid).values()].map((row) => [...row, relation.oid]);
     return {
@@ -3294,22 +3338,61 @@ function planRelationAccess(
     return best;
 }
 
-function scanIndexRows(database: Database, relation: { oid: number; name: string }, columns: ColumnMeta[], alias: string, plan: IndexScanPlan): RowSet {
+/**
+ * 为无 WHERE 的 `ORDER BY` 选一条有序索引路径。
+ * 要求 `ORDER BY` 的每一项都逐位对上索引键的方向与 NULL 位置，否则如实返回 `null`。
+ */
+function planOrderedAccess(
+    indexes: MaterializedIndex[],
+    columns: IndexColumn[],
+    aliases: Set<string>,
+    items: OrderItem[],
+): IndexScanPlan | null {
+    if (items.length === 0) return null;
+    let best: IndexScanPlan | null = null;
+    for (const index of indexes) {
+        if (items.length > index.keys.length) continue;
+        let matched = true;
+        for (let position = 0; position < items.length; position += 1) {
+            const item = items[position]!;
+            const key = index.keys[position]!;
+            const column = indexColumnOf(item.expr, columns, aliases);
+            const descending = item.direction === 'DESC';
+            // 未写 NULLS 时按 PG 默认：升序 NULLS LAST，降序 NULLS FIRST。
+            const nullsFirst = item.nulls === undefined ? descending : item.nulls === 'FIRST';
+            if (column === null || column.attnum !== key.attnum || descending !== key.desc || nullsFirst !== key.nullsFirst) {
+                matched = false;
+                break;
+            }
+        }
+        if (!matched) continue;
+        if (best === null || index.keys.length < best.index.keys.length) {
+            best = { index, equality: [], lower: null, upper: null, conditions: [] };
+        }
+    }
+    return best;
+}
+
+function scanIndexRows(database: Database, relation: { oid: number; name: string }, columns: ColumnMeta[], alias: string, plan: IndexScanPlan, limit = 0, ordered = false): RowSet {
     const keys = plan.index.keys;
     const prefix = plan.equality.length > 0 ? encodeIndexValues(plan.equality, keys.slice(0, plan.equality.length)) : null;
     let after: Uint8Array | null = null;
     let before: Uint8Array | null = null;
     const boundKeys = keys.slice(0, plan.equality.length + 1);
+    // 降序键的字节是反码，索引里的升序方向对应值的大小反向，上下界要互换。
+    const descendingBound = keys[plan.equality.length]?.desc === true;
     if (plan.lower) {
         const bound = encodeIndexValues([...plan.equality, plan.lower.value], boundKeys);
         // 闭下界用键本身作游标：条目键始终是 键+0x00+行号，必然大于键。
-        after = plan.lower.inclusive ? bound : appendIndexBound(bound, [0x00, 0xff]);
+        if (descendingBound) before = plan.lower.inclusive ? appendIndexBound(bound, [0x00, 0xff]) : bound;
+        else after = plan.lower.inclusive ? bound : appendIndexBound(bound, [0x00, 0xff]);
     }
     if (plan.upper) {
         const bound = encodeIndexValues([...plan.equality, plan.upper.value], boundKeys);
-        before = plan.upper.inclusive ? appendIndexBound(bound, [0x00, 0xff]) : bound;
+        if (descendingBound) after = plan.upper.inclusive ? bound : appendIndexBound(bound, [0x00, 0xff]);
+        else before = plan.upper.inclusive ? appendIndexBound(bound, [0x00, 0xff]) : bound;
     }
-    const entries = database.scanIndex(plan.index.oid, prefix, after, before);
+    const entries = database.scanIndex(plan.index.oid, prefix, after, before, limit);
     database.scanStats.push({
         relation: relation.name,
         indexOid: plan.index.oid,
@@ -3320,7 +3403,7 @@ function scanIndexRows(database: Database, relation: { oid: number; name: string
     });
     const bindings: Binding[] = columns.map((column) => ({ alias, name: column.name, type: column.type }));
     bindings.push({ alias, name: 'tableoid', type: typeOf('oid'), hidden: true });
-    return { columns: bindings, rows: entries.map((entry) => [...entry.values, relation.oid]) };
+    return { columns: bindings, rows: entries.map((entry) => [...entry.values, relation.oid]), ordered };
 }
 
 function indexColumnsOf(database: Database, relid: number): IndexColumn[] {
@@ -3360,7 +3443,9 @@ function explainLines(database: Database, statement: SelectStatement, params: Sq
     const aliases = new Set([ref.name.toLowerCase(), relation.name.toLowerCase(), alias.toLowerCase()]);
     const plan = statement.core.where
         ? planRelationAccess(database, materializedIndexesOf(database.catalog, relation.oid), columns, aliases, statement.core.where, params)
-        : null;
+        : statement.orderBy.length > 0
+            ? planOrderedAccess(materializedIndexesOf(database.catalog, relation.oid), columns, aliases, statement.orderBy)
+            : null;
     let head = plan ? `Index Scan using ${plan.index.name} on ${relation.name}` : `Seq Scan on ${relation.name}`;
     let stat: IndexScanStat | undefined;
     if (analyze) {

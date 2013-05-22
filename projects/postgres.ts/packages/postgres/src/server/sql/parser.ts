@@ -1418,15 +1418,17 @@ class Parser {
         const orderBy = this.at('ORDER') ? this.parseOrderBy() : [];
         let limit: Expr | undefined;
         let offset: Expr | undefined;
-        if (this.at('OFFSET')) {
-            this.next();
-            offset = this.parseExpr();
-            this.accept('ROW');
-            this.accept('ROWS');
-        }
-        if (this.at('LIMIT')) {
-            this.next();
-            limit = this.accept('ALL') ? undefined : this.parseExpr();
+        // PostgreSQL 允许 `LIMIT` 与 `OFFSET` 任意先后，两种顺序都要接受。
+        while (this.at('OFFSET') || this.at('LIMIT')) {
+            if (this.accept('OFFSET')) {
+                offset = this.parseExpr();
+                this.accept('ROW');
+                this.accept('ROWS');
+            }
+            else {
+                this.next();
+                limit = this.accept('ALL') ? undefined : this.parseExpr();
+            }
         }
         return { kind: 'select', core, unions, orderBy, limit, offset };
     }

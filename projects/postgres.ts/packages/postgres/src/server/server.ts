@@ -402,7 +402,7 @@ class Session {
         | {
               statement: CopyStatement;
               database: Database;
-              snapshot: Database;
+              snapshot: Database | null;
               statements: string[];
               nextIndex: number;
               chunks: Buffer[];
@@ -789,10 +789,15 @@ class Session {
                 }
                 const database = this.transaction !== null ? this.transaction.database : (implicit ??= this.openImplicit());
                 this.statementStarted(database);
-                const before = database.clone();
+                let before: Database | null = null;
                 let parsed: Statement | null = null;
                 try {
                     parsed = parseStatement(statement);
+                    // 隐式批次只在末尾提交，出错时整批丢弃，只读语句无需逐条快照。
+                    // 显式事务要支持语句级回滚，写入语句也可能因等锁中断后重放。
+                    if (this.transaction !== null || (parsed.kind !== 'select' && parsed.kind !== 'explain')) {
+                        before = database.clone();
+                    }
                     if (parsed.kind === 'copy' && parsed.direction === 'from') {
                         const columns = copyColumnCount(database, parsed);
                         for (const outcome of outcomes) this.emitOutcome(outcome);
@@ -809,7 +814,7 @@ class Session {
                     }
                     outcomes.push(this.runParsed(state, database, parsed, [], statements.length === 1));
                 } catch (error) {
-                    database.restore(before);
+                    if (before !== null) database.restore(before);
                     if (error instanceof ServerError && error.position !== undefined && error.position >= 0) {
                         error.position += this.statementOffsets[index] ?? 0;
                     }
@@ -920,7 +925,7 @@ class Session {
             this.socket.write(commandComplete(`COPY ${count}`));
             this.runSimpleBatch(copy.statements, copy.nextIndex, [], this.transaction === null ? copy.database : null);
         } catch (error) {
-            copy.database.restore(copy.snapshot);
+            if (copy.snapshot !== null) copy.database.restore(copy.snapshot);
             this.pending.length = 0;
             if (this.transaction !== null) this.abortTransaction();
             else if (this.implicitHandle !== null) {
@@ -1711,9 +1716,12 @@ class Session {
             this.socket.write(commandComplete(outcome.tag));
             return;
         }
-        if (!described) this.socket.write(rowDescription(wireFields(outcome.fields)));
-        for (const values of wireRows(outcome)) this.socket.write(dataRow(values));
-        this.socket.write(commandComplete(outcome.tag));
+        // 一条语句的协议消息合并成一次写入，减少往返中的小包与系统调用。
+        const parts: Buffer[] = [];
+        if (!described) parts.push(rowDescription(wireFields(outcome.fields)));
+        for (const values of wireRows(outcome)) parts.push(dataRow(values));
+        parts.push(commandComplete(outcome.tag));
+        this.socket.write(parts.length === 1 ? parts[0]! : Buffer.concat(parts));
     }
 
     private sendError(error: unknown): void {

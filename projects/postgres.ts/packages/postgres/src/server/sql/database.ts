@@ -174,11 +174,14 @@ export class Database {
         const catalog = loadCatalog(storage);
         // `nextval` survives statement rollback and separate sessions, so the
         // journal below is authoritative whenever it is ahead of the catalog.
-        for (const stored of storage.scan(SEQUENCE_STATE_NAMESPACE)) {
-            const oid = Number(decode(stored.key));
-            const value = Number(decode(stored.value));
-            const sequence = catalog.sequences.find((candidate) => candidate.oid === oid);
-            if (sequence && Number.isFinite(value) && value > sequence.lastValue) sequence.lastValue = value;
+        // 没有序列时该命名空间必然为空，省掉一次原生扫描。
+        if (catalog.sequences.length > 0) {
+            for (const stored of storage.scan(SEQUENCE_STATE_NAMESPACE)) {
+                const oid = Number(decode(stored.key));
+                const value = Number(decode(stored.value));
+                const sequence = catalog.sequences.find((candidate) => candidate.oid === oid);
+                if (sequence && Number.isFinite(value) && value > sequence.lastValue) sequence.lastValue = value;
+            }
         }
         return new Database(storage, catalog, session, cluster);
     }
@@ -292,6 +295,7 @@ export class Database {
         prefix: Uint8Array | null,
         after: Uint8Array | null,
         before: Uint8Array | null,
+        limit = 0,
     ): { key: string; values: SqlValue[] }[] {
         const namespace = indexNamespace(indexOid);
         const pending = this.indexWrites.get(indexOid);
@@ -299,7 +303,8 @@ export class Database {
         const lower = after === null ? null : encodeKeyBytes(after);
         const upper = before === null ? null : encodeKeyBytes(before);
         const rows = new Map<string, SqlValue[]>();
-        for (const stored of this.storage.scan(namespace, prefix ?? undefined, after, before, 0)) {
+        // 有未提交写入时先取全量再合并，避免限流截断尚未覆盖的键。
+        for (const stored of this.storage.scan(namespace, prefix ?? undefined, after, before, pending ? 0 : limit)) {
             const key = encodeKeyBytes(stored.key);
             const change = pending?.get(key);
             if (change === null) continue;
@@ -318,9 +323,10 @@ export class Database {
                 rows.set(key, values);
             }
         }
-        return [...rows.entries()]
+        const entries = [...rows.entries()]
             .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
             .map(([key, values]) => ({ key, values }));
+        return limit > 0 ? entries.slice(0, limit) : entries;
     }
 
     putIndexEntry(indexOid: number, key: string, values: SqlValue[]): void {
