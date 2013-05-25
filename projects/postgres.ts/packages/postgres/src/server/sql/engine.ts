@@ -3392,7 +3392,12 @@ function scanIndexRows(database: Database, relation: { oid: number; name: string
         if (descendingBound) after = plan.upper.inclusive ? bound : appendIndexBound(bound, [0x00, 0xff]);
         else before = plan.upper.inclusive ? appendIndexBound(bound, [0x00, 0xff]) : bound;
     }
-    const entries = database.scanIndex(plan.index.oid, prefix, after, before, limit);
+    // 唯一索引的全键等值查找最多命中一行，给原生扫描一个上限，避免它走完整段索引。
+    const singleRow = plan.index.unique
+        && plan.lower === null
+        && plan.upper === null
+        && plan.equality.length === plan.index.keys.length;
+    const entries = database.scanIndex(plan.index.oid, prefix, after, before, limit > 0 ? limit : singleRow ? 1 : 0);
     database.scanStats.push({
         relation: relation.name,
         indexOid: plan.index.oid,
@@ -4050,7 +4055,8 @@ function createRole(database: Database, statement: CreateRoleStatement): Outcome
     if (statement.options.rolreplication && !actor.rolsuper) throw new ServerError('42501', 'must be superuser to create replication users');
     if (findRole(database.roles, statement.name)) throw new ServerError('42710', `role "${statement.name}" already exists`);
     const oid = Math.max(database.cluster.nextRoleOid(), ...database.roles.map((role) => role.oid + 1));
-    database.roles.push({
+    // 角色表默认与集群目录共享，追加必须先拿到本消息的可写副本。
+    database.mutableRoles().push({
         oid,
         rolname: statement.name,
         rolsuper: statement.options.rolsuper ?? false,
@@ -4101,6 +4107,8 @@ function renameAclReferences(database: Database, oldName: string, newName: strin
 }
 
 function alterRole(database: Database, statement: AlterRoleStatement): Outcome {
+    // 后面的改名与选项写入是原地修改，先从共享的集群角色表切出可写副本。
+    database.mutableRoles();
     const actor = currentRole(database);
     const target = roleOrThrow(database, statement.name);
     if (!actor.rolsuper && (!actor.rolcreaterole || target.rolsuper)) {

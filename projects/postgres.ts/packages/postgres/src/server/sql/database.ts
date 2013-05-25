@@ -82,7 +82,8 @@ function decodeKeyBytes(text: string): Uint8Array {
 
 /** Loads the catalog, or returns an empty one on a fresh data directory. */
 export function loadCatalog(storage: Storage): CatalogDoc {
-    const rows = storage.scan(CATALOG_NAMESPACE);
+    // 目录命名空间只存 `CATALOG_KEY` 一行，取一行就够，不必让原生扫描走完整段。
+    const rows = storage.scan(CATALOG_NAMESPACE, undefined, undefined, undefined, 1);
     const row = rows.find((candidate) => decode(candidate.key) === CATALOG_KEY);
     if (!row) return emptyCatalog();
     return assertCatalog(JSON.parse(decode(row.value)) as unknown);
@@ -119,8 +120,6 @@ export class Database {
     readonly session: SessionRuntime;
     /** Cluster store shared with every session on the store. */
     readonly cluster: ClusterStore;
-    /** This message's working copy of `pg_roles`, persisted on commit. */
-    roles: ClusterRole[];
     /**
      * Called before a statement changes an existing row, so the session can take
      * the row lock that keeps two writers from touching it at the same time.
@@ -140,14 +139,57 @@ export class Database {
     private catalogDirty = false;
     private rolesDirty = false;
     private clusterDirty = false;
+    /** `pg_roles` working copy; shared with the cluster directory until a write clones it. */
+    private rolesValue: ClusterRole[] = [];
+    private rolesShared = false;
 
     private constructor(storage: Storage, catalog: CatalogDoc, session: SessionRuntime, cluster: ClusterStore) {
         this.storage = storage;
         this.catalog = catalog;
         this.session = session;
         this.cluster = cluster;
-        this.roles = structuredClone(cluster.doc.roles);
+        // 角色表在绝大多数语句里只读，先共享集群目录那一份，写时再复制。
+        this.rolesValue = cluster.doc.roles;
+        this.rolesShared = true;
         for (const row of cluster.doc.databases) this.databaseAcls.set(row.datname, row.datacl);
+    }
+
+    /** This message's view of `pg_roles`; persisted on commit only when it was written. */
+    get roles(): ClusterRole[] {
+        return this.rolesValue;
+    }
+
+    set roles(value: ClusterRole[]) {
+        this.rolesValue = value;
+        this.rolesShared = false;
+    }
+
+    /**
+     * Writable `pg_roles` working copy.
+     *
+     * `roles` aliases the cluster directory's array, so a write must go through
+     * here first: the first write clones it, later writes reuse the copy. Without
+     * this, `ALTER ROLE` would mutate rows other sessions still read and would
+     * bypass both the commit batch and rollback.
+     */
+    mutableRoles(): ClusterRole[] {
+        if (this.rolesShared) {
+            this.rolesValue = structuredClone(this.rolesValue);
+            this.rolesShared = false;
+        }
+        return this.rolesValue;
+    }
+
+    /**
+     * Takes another working copy's roles into this one.
+     *
+     * A shared array stays shared: both sides copy before writing. An owned array
+     * is the other copy's snapshot, so it must be cloned to keep `ROLLBACK TO`
+     * from seeing later writes.
+     */
+    private adoptRoles(other: Database): void {
+        this.rolesValue = other.rolesShared ? other.rolesValue : structuredClone(other.rolesValue);
+        this.rolesShared = other.rolesShared;
     }
 
     /** Cluster-wide `pg_database` rows, with this message's `datacl` changes layered on top. */
@@ -191,7 +233,7 @@ export class Database {
         const copy = new Database(this.storage, structuredClone(this.catalog), this.session, this.cluster);
         copy.onWrite = this.onWrite;
         copy.readOnly = this.readOnly;
-        copy.roles = structuredClone(this.roles);
+        copy.adoptRoles(this);
         copy.databaseAcls = new Map(this.databaseAcls);
         for (const [relOid, rows] of this.tables) copy.tables.set(relOid, new Map(rows));
         for (const [relOid, rows] of this.writes) copy.writes.set(relOid, new Map(rows));
@@ -223,7 +265,10 @@ export class Database {
      */
     refreshCommitted(): void {
         if (!this.catalogDirty) this.catalog = loadCatalog(this.storage);
-        if (!this.rolesDirty) this.roles = structuredClone(this.cluster.doc.roles);
+        if (!this.rolesDirty) {
+            this.rolesValue = this.cluster.doc.roles;
+            this.rolesShared = true;
+        }
         if (!this.clusterDirty) {
             this.databaseAcls = new Map();
             for (const row of this.cluster.doc.databases) this.databaseAcls.set(row.datname, row.datacl);
@@ -299,6 +344,14 @@ export class Database {
     ): { key: string; values: SqlValue[] }[] {
         const namespace = indexNamespace(indexOid);
         const pending = this.indexWrites.get(indexOid);
+        // 没有未提交写入时，原生扫描本身就按键字节升序返回，且已按 `limit` 截断。
+        // 此前无条件建 Map 再全量排序，纯属把已排好的结果重排一遍。
+        if (!pending) {
+            return this.storage.scan(namespace, prefix ?? undefined, after, before, limit).map((stored) => ({
+                key: encodeKeyBytes(stored.key),
+                values: JSON.parse(decode(stored.value)) as SqlValue[],
+            }));
+        }
         const prefixText = prefix === null ? null : encodeKeyBytes(prefix);
         const lower = after === null ? null : encodeKeyBytes(after);
         const upper = before === null ? null : encodeKeyBytes(before);
@@ -366,7 +419,7 @@ export class Database {
     /** Replaces the working set with another snapshot, used by rollback. */
     restore(other: Database): void {
         this.catalog = other.catalog;
-        this.roles = structuredClone(other.roles);
+        this.adoptRoles(other);
         this.databaseAcls = new Map(other.databaseAcls);
         this.tables.clear();
         for (const [relOid, rows] of other.tables) this.tables.set(relOid, rows);

@@ -1878,6 +1878,34 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         });
 
+        // 角色表默认与集群目录共享，只有写入才复制：这里守住「未提交不外泄、
+        // 回滚与保存点各自还原」这条不变量，避免写时复制漏掉某个入口。
+        await check('roles/cow', async () => {
+            await withClient(batch9, async (client) => {
+                const limitOf = async (session) => {
+                    const rows = await session.query("SELECT rolconnlimit FROM pg_roles WHERE rolname = 'b9_bob'");
+                    return rows.rows[0].rolconnlimit;
+                };
+                assert((await limitOf(client)) === 5, 'b9_bob did not start at 5');
+                await client.query('BEGIN');
+                await client.query('ALTER ROLE b9_bob CONNECTION LIMIT 9');
+                assert((await limitOf(client)) === 9, 'in-transaction limit did not change');
+                const other = await connectAs(batch9, 'postgres', 'postgres');
+                try {
+                    assert((await limitOf(other)) === 5, 'uncommitted role change leaked to another session');
+                } finally {
+                    await other.end();
+                }
+                await client.query('SAVEPOINT role_cow');
+                await client.query('ALTER ROLE b9_bob CONNECTION LIMIT 11');
+                assert((await limitOf(client)) === 11, 'savepoint limit did not change');
+                await client.query('ROLLBACK TO SAVEPOINT role_cow');
+                assert((await limitOf(client)) === 9, 'rollback to savepoint did not restore 9');
+                await client.query('ROLLBACK');
+                assert((await limitOf(client)) === 5, 'rollback did not restore 5');
+            });
+        });
+
         await check('roles/startup', async () => {
             await withClient(batch9, async (client) => {
                 await client.query('CREATE ROLE b9_nologin NOLOGIN');
@@ -2696,9 +2724,9 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             // and structured-error checks, the system-catalog meta sweep, the
             // transaction transcript, visibility, serialization, deadlock and
             // disconnect checks, the join, aggregate and index transcripts,
-            // the BETWEEN and ORDER BY transcripts, and the index and ordered
-            // plan checks.
-            floor: 122,
+            // the BETWEEN and ORDER BY transcripts, the index and ordered
+            // plan checks, and the role copy-on-write isolation check.
+            floor: 123,
         };
     } finally {
         await trust.close();
