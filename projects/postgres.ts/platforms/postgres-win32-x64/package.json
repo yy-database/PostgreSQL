@@ -1,10 +1,14 @@
 {
     "name": "@yydb/postgres-win32-x64",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "license": "MPL-2.0",
     "description": "Native binding for @yydb/postgres on win32-x64",
-    "os": ["win32"],
-    "cpu": ["x64"],
+    "os": [
+        "win32"
+    ],
+    "cpu": [
+        "x64"
+    ],
     "main": "postgres.win32-x64.node",
     "files": [
         "postgres.win32-x64.node",
