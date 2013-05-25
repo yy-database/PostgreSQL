@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use database::harness::{
+    Baseline, BaselineIdentity, DifferenceObservation, Digest, ReportEnvelope, check_baseline, render_json,
+};
 use database_client::pgsql::{
     ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
     client::{ClientConfig, Column, Connection as CoreConnection, Param as PostgresParam, QueryResult},
     error::{MessageField, Notice, PostgresError},
     psql::{PsqlOptions, format_results, parse_arguments},
-};
-use database::harness::{
-    Baseline, BaselineIdentity, DifferenceObservation, Digest, ReportEnvelope, check_baseline, render_json,
 };
 use database_protocol_pgsql as protocol;
 
@@ -1022,11 +1022,7 @@ pub fn harness_digest(bytes: Buffer) -> String {
 
 /// 按已知差异台账判定一次语料运行。
 #[napi]
-pub fn harness_check_baseline(
-    baseline_json: String,
-    current_json: String,
-    observed_json: String,
-) -> Result<String> {
+pub fn harness_check_baseline(baseline_json: String, current_json: String, observed_json: String) -> Result<String> {
     let baseline: Baseline = serde_json::from_str(&baseline_json).map_err(harness_error)?;
     let current: BaselineIdentity = serde_json::from_str(&current_json).map_err(harness_error)?;
     let observed: Vec<DifferenceObservation> = serde_json::from_str(&observed_json).map_err(harness_error)?;
