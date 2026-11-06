@@ -52,7 +52,6 @@ jobs:
             py="$venv/bin/python"
             pip="$venv/bin/pip"
           fi
-          "$pip" install --upgrade pip
           wheel="$(ls "$dist"/*.whl | head -n 1)"
-          "$pip" install --no-input --disable-pip-version-check "$wheel"
+          "$py" -m pip install --no-input --disable-pip-version-check "$wheel"
           "$py" -c "import postgres_pyo3; print(postgres_pyo3.__name__)"
