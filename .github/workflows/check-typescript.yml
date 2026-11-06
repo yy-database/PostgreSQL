@@ -35,12 +35,16 @@ jobs:
         run: test ! -e projects/postgres.ts/platforms/postgres-linux-x64/lib/postgres-linux-x64-gnu.node
       - name: Install PostgreSQL test dependencies
         run: pnpm install --no-frozen-lockfile
+      - name: Install the psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client-16
       - name: Build the TypeScript packages
         run: pnpm run build:ts
       - name: Build the native binding
         run: node scripts/build-napi.mjs
       - name: Acceptance harness
         run: pnpm test
+        env:
+          PSQL_BIN: psql
       - name: Downstream TypeScript example
         run: pnpm examples:ts
 
