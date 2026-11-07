@@ -16,7 +16,8 @@ name = "postgres_napi"
 [dependencies]
 napi = { workspace = true }
 napi-derive = { workspace = true }
-postgres-client = { path = "../postgres-client" }
+database-client = { git = "https://github.com/oovm/database.rs.git", rev = "13ae964bdd1026517d7d9c7cb37a7bc811299a2e" }
+database-protocol-pgsql = { git = "https://github.com/oovm/database.rs.git", rev = "13ae964bdd1026517d7d9c7cb37a7bc811299a2e" }
 
 [build-dependencies]
 napi-build = { workspace = true }
