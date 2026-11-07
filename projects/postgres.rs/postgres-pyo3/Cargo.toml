@@ -16,3 +16,6 @@ name = "postgres_pyo3"
 [dependencies]
 pyo3 = { workspace = true }
 postgres-client = { path = "../postgres-client" }
+
+[build-dependencies]
+pyo3-build-config = "0.30.1"
