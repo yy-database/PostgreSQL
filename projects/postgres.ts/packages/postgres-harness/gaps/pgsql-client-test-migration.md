@@ -1,17 +1,24 @@
 # PostgreSQL client test migration ledger
 
-`postgres-client` dropped its local `src/protocol.rs` (1026 lines), `src/client.rs`
-(889 lines) and `src/error.rs` (120 lines) in `5f60187` and now re-exports
-`database-protocol-pgsql` plus `database-client`. Its two integration suites,
+`postgres-client` is gone. It dropped its local `src/protocol.rs` (1026 lines),
+`src/client.rs` (889 lines) and `src/error.rs` (120 lines) in `5f60187` and
+re-exported `database-protocol-pgsql` plus `database-client` instead. The
+remaining glue then followed the same route: `store.rs` became an adapter over
+`database-storage`'s `FileShard` and moved to `database.client/src/pgsql/store.rs`,
+the data directory and `postmaster.pid` lock moved to
+`database.client/src/pgsql/postmaster.rs`, and `psql.rs` moved to
+`database.client/src/pgsql/psql.rs`. Its two integration suites,
 `tests/robustness.rs` and `tests/roundtrip.rs`, moved to
 `database.client/tests/pgsql_robustness.rs` and `pgsql_live.rs` in the
-`database.rs` repository. The `rust` harness stage only runs
-`cargo test -p postgres-client`, so its executable test count fell from 60 to
-35 while the re-export landed and from 36 to 18 when the integration suites
-left.
+`database.rs` repository.
+
+The `rust` harness stage now runs `cargo test -p postgres-napi -p postgres-pyo3`.
+Those two crates only compile, so the stage's executable count is 0. The tests
+themselves run upstream: `cargo test --workspace` in `database.rs` covers them
+on the same three-OS matrix.
 
 This ledger accounts for every disappeared test. It is the basis for the
-`floor: 18` value in `stages/rust.mjs`, which cites this file.
+`floor: 0` value in `stages/rust.mjs`, which cites this file.
 
 ## Counts
 
@@ -20,9 +27,9 @@ This ledger accounts for every disappeared test. It is the basis for the
 | `src/protocol.rs` | 23 | 0 (file removed) | `database-protocol-pgsql/src/messages.rs` |
 | `src/client.rs` | 2 | 0 (file removed) | `database-client/src/pgsql/client.rs` |
 | `src/error.rs` | 0 | 0 (file removed) | `database-client/src/pgsql/error.rs` |
-| Other local unit tests | 18 | 18 | stayed (one write-path test left with `FileShard`) |
+| Other local unit tests | 18 | 0 (files removed) | `database-client/src/pgsql/{store,psql,postmaster}.rs` |
 | `tests/roundtrip.rs` + `tests/robustness.rs` | 18 | 0 (files removed) | `database.client/tests/pgsql_live.rs` and `pgsql_robustness.rs` |
-| Total | 60 | 18 | |
+| Total | 60 | 0 | |
 
 `error.rs` had no tests, so the whole 25-test drop comes from `protocol.rs` and
 `client.rs`.
@@ -111,14 +118,15 @@ The one local unit test that did not survive in place is the old
 now `database-storage`'s `FileShard`, which owns the atomic-replace contract
 and its own crash tests. Two local tests were added instead
 (`flush_removes_one_namespace_and_keeps_the_revision_counter` and
-`namespace_validation_stays_on_the_binding_side`), which is why the local
-count is 18 rather than 17.
+`namespace_validation_stays_on_the_binding_side`), so the eighteen local unit
+tests arrive upstream as fourteen `store.rs` tests, two `postmaster.rs` tests
+and three `psql.rs` tests.
 
 ## Upstream run evidence
 
 ```
 cargo test -p database-protocol-pgsql   -> 25 passed; 0 failed; 0 ignored
-cargo test -p database-client           ->  8 passed; 0 failed; 0 ignored
+cargo test -p database-client           -> 45 passed; 0 failed; 0 ignored
 cargo test -p database-client --test pgsql_robustness -> 16 passed; 0 failed
 POSTGRES_TEST_PORT=55433 cargo test -p database-client --test pgsql_live -> 2 passed; 0 failed
 ```
@@ -138,9 +146,12 @@ the 2 mapped tests plus 6 authentication tests.
   module was shared. Nothing was "no longer meaningful" and nothing is missing.
 - The 18 integration tests moved to `database.client/tests`, where 16 run
   always and 2 run in the `postgres-live` job against a `postgres:16` service.
-- This workspace's `rust` stage only runs `cargo test -p postgres-client`, so
-  its executable count legitimately fell from 60 to 35 and then to 18.
-- `stages/rust.mjs` therefore sets `floor: 18`, citing this ledger.
+- The crate itself was deleted. The two bindings now depend on `database-client`
+  and `database-protocol-pgsql` directly, pinned to one `database.rs` revision.
+- This workspace's `rust` stage runs `cargo test -p postgres-napi -p postgres-pyo3`,
+  which executes 0 tests, so the count fell from 60 to 0.
+- `stages/rust.mjs` therefore sets `floor: 0`, citing this ledger. The Rust
+  test gate moved to `cargo test --workspace` in `database.rs`.
 
 Recurring rule: **the floor may only move with per-item attribution.** Any
 commit that changes the executable test count must record which tests

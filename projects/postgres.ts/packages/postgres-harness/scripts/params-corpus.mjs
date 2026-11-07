@@ -3,7 +3,7 @@
  *
  * Every expectation is measured, not derived from this repository: the script
  * opens a PGlite instance, connects over TCP, and sends exactly the extended
- * protocol frames documented in `postgres-client::protocol`. Run it from
+ * protocol frames documented in `database_protocol_pgsql`. Run it from
  * `projects/postgres.ts/packages/postgres-harness`:
  *
  *     node scripts/params-corpus.mjs
