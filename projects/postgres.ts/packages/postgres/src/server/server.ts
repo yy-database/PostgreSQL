@@ -8,6 +8,7 @@ import { loadNative, type ServerStore } from '../native.ts';
 import { ServerError } from './errors.ts';
 import { cloneDatabase, databasePrefix, purgeDatabase, scopedStorage, storageFor } from './store.ts';
 import { createSessionRuntime, Database, type SessionRuntime, type Storage } from './sql/database.ts';
+import { SCHEMA_FILE, touchesSchema, writeSchemaExport } from './sql/schema_export.ts';
 import { type ClusterDatabase, ClusterStore, hasDatabasePrivilege } from './sql/cluster.ts';
 import { copyColumnCount, copyIn, copyOut } from './sql/copy.ts';
 import {
@@ -84,6 +85,8 @@ export interface PostgresServerHandle {
     port: number;
     /** Directory the server locked for this run. */
     dataDir: string;
+    /** Projection of the cluster catalogs, rewritten after every schema commit. */
+    schemaPath: string;
     /** Stops listening, destroys every open session and releases the lock. */
     close(): Promise<void>;
 }
@@ -1555,10 +1558,30 @@ export function startPostgresServer(options: PostgresServerOptions = {}): Promis
     let store: ServerStore;
     let storage: Storage;
     let cluster: ClusterStore;
+    let clusterReady = false;
     try {
         store = new (loadNative().ServerStore)(dataDir);
-        storage = storageFor(store);
+        const committed = storageFor(store);
+        // `local-0.yyds` remains the recovery truth. The projection is refreshed
+        // after the commit that changed schema metadata, so a reader never sees
+        // an export that is ahead of the catalog. A projection failure must not
+        // turn a committed statement into a client-visible error.
+        storage = {
+            scan: (namespace: string) => committed.scan(namespace),
+            commitChanges: (changes) => {
+                committed.commitChanges(changes);
+                if (!clusterReady || !changes.some((change) => touchesSchema(change.namespace))) return;
+                try {
+                    writeSchemaExport(dataDir, committed, cluster.doc.databases.map((database) => database.datname));
+                } catch {
+                    // The catalog commit already succeeded; the projection is
+                    // rebuilt by the next schema commit or restart.
+                }
+            },
+        };
         cluster = new ClusterStore(storage);
+        clusterReady = true;
+        writeSchemaExport(dataDir, storage, cluster.doc.databases.map((database) => database.datname));
     } catch (error) {
         return Promise.reject(error);
     }
@@ -1587,6 +1610,7 @@ export function startPostgresServer(options: PostgresServerOptions = {}): Promis
                 host,
                 port,
                 dataDir,
+                schemaPath: path.join(dataDir, SCHEMA_FILE),
                 close: () =>
                     new Promise<void>((done) => {
                         for (const socket of sockets) socket.destroy();
