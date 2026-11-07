@@ -166,6 +166,21 @@ export class Database {
         return rows;
     }
 
+    /** Byte footprint of one relation's stored rows, keys included. */
+    relationBytes(relOid: number): number {
+        let total = 0;
+        for (const stored of this.storage.scan(dataNamespace(relOid))) total += stored.key.byteLength + stored.value.byteLength;
+        return total;
+    }
+
+    /** Byte footprint of the catalog plus every user relation. */
+    storeBytes(): number {
+        let total = 0;
+        for (const stored of this.storage.scan(CATALOG_NAMESPACE)) total += stored.key.byteLength + stored.value.byteLength;
+        for (const relation of this.catalog.relations) total += this.relationBytes(relation.oid);
+        return total;
+    }
+
     nextRowId(relOid: number): string {
         const key = String(relOid);
         const next = this.catalog.nextRowId[key] ?? 1;

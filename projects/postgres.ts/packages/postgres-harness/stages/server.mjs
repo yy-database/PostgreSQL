@@ -299,6 +299,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batch9 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch9-')) });
     const batch9fixture = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch9-fixture-')) });
     const batch10 = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-batch10-')) });
+    const batchMeta = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-meta-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -947,6 +948,56 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 'SELECT * FROM missing_table',
                 'SELECT * FROM missing_table',
             );
+
+            // Batch 11: system-catalog meta commands against the same schema
+            // that seeded the real 16 oracle. Physical Size cells are masked
+            // because the two engines have different storage layouts, every
+            // other character has to match byte for byte.
+            const metaSetup = fs.readFileSync(path.join(harnessDir, 'fixtures', 'meta-setup.sql'), 'utf8');
+            await withClient(batchMeta, async (client) => {
+                for (const statement of metaSetup.split(';').map((part) => part.trim()).filter((part) => part.length > 0)) {
+                    await client.query(statement);
+                }
+            });
+            const normalizeMeta = (text) =>
+                text
+                    .split('\n')
+                    .map((line) => {
+                        if (/^[\s+-]+$/.test(line)) return '<rule>';
+                        if (!line.includes('|')) return line.trim();
+                        return line
+                            .split('|')
+                            .map((cell) => cell.replace(/\b\d+(?:\.\d+)? (?:bytes|kB|MB|GB|TB)\b/g, '<size>').trim())
+                            .join('|');
+                    })
+                    .join('\n');
+            const normalizeMessages = (text) =>
+                text
+                    .split('\n')
+                    .filter((line) => line.length > 0)
+                    .map((line) => line.replace(/^psql:.*:\d+: /, ''))
+                    .join('\n');
+            await check('psql/meta-commands', async () => {
+                const commands = fs
+                    .readFileSync(path.join(harnessDir, 'fixtures', 'psql-meta.sql'), 'utf8')
+                    .split('\n')
+                    .map((line) => line.trim())
+                    .filter((line) => line.length > 0 && !line.startsWith('--'));
+                const result = await runFileOn(batchMeta, path.join(harnessDir, 'fixtures', 'psql-meta.sql'));
+                assert(result.status === 0, `psql exited ${result.status}: ${result.stderr}`);
+                assert(!/ERROR:/.test(result.stderr), `the meta sweep raised a server error:\n${result.stderr}`);
+                const expected = fs.readFileSync(path.join(harnessDir, 'fixtures', 'psql-meta.txt'), 'utf8');
+                assert(
+                    normalizeMeta(result.stdout) === normalizeMeta(expected),
+                    `system catalog meta commands differ from the pg16 fixture:\n${result.stdout}`,
+                );
+                const expectedErr = fs.readFileSync(path.join(harnessDir, 'fixtures', 'psql-meta.err.txt'), 'utf8');
+                assert(
+                    normalizeMessages(result.stderr) === normalizeMessages(expectedErr),
+                    `meta command advisories differ from the pg16 fixture:\n${result.stderr}`,
+                );
+                lines.push(`  ${commands.length} meta commands match the pg16 fixture, Size cells masked`);
+            });
         }
 
         const capture = (promise) => promise.then(() => null, (error) => error);
@@ -2309,8 +2360,8 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
             // 98 before batch 11, plus the GUC, binary, `pg_cursors`, temp-table
-            // and structured-error checks.
-            floor: 107,
+            // and structured-error checks, plus the system-catalog meta sweep.
+            floor: 108,
         };
     } finally {
         await trust.close();
@@ -2324,5 +2375,6 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batch9.close();
         await batch9fixture.close();
         await batch10.close();
+        await batchMeta.close();
     }
 }

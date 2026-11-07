@@ -1,0 +1,371 @@
+        List of relations
+ Schema | Name | Type  |  Owner   
+--------+------+-------+----------
+ public | t    | table | postgres
+ public | u    | table | postgres
+(2 rows)
+
+                                   List of relations
+ Schema | Name | Type  |  Owner   | Persistence | Access method |  Size   | Description 
+--------+------+-------+----------+-------------+---------------+---------+-------------
+ public | t    | table | postgres | permanent   | heap          | 16 kB   | 
+ public | u    | table | postgres | permanent   | heap          | 0 bytes | 
+(2 rows)
+
+                     List of aggregate functions
+ Schema | Name | Result data type | Argument data types | Description 
+--------+------+------------------+---------------------+-------------
+(0 rows)
+
+                     List of aggregate functions
+ Schema | Name | Result data type | Argument data types | Description 
+--------+------+------------------+---------------------+-------------
+(0 rows)
+
+List of access methods
+  Name  | Type  
+--------+-------
+ brin   | Index
+ btree  | Index
+ gin    | Index
+ gist   | Index
+ hash   | Index
+ heap   | Table
+ spgist | Index
+(7 rows)
+
+                             List of access methods
+  Name  | Type  |       Handler        |              Description               
+--------+-------+----------------------+----------------------------------------
+ brin   | Index | brinhandler          | block range index (BRIN) access method
+ btree  | Index | bthandler            | b-tree index access method
+ gin    | Index | ginhandler           | GIN index access method
+ gist   | Index | gisthandler          | GiST index access method
+ hash   | Index | hashhandler          | hash index access method
+ heap   | Table | heap_tableam_handler | heap table access method
+ spgist | Index | spghandler           | SP-GiST index access method
+(7 rows)
+
+               List of conversions
+ Schema | Name | Source | Destination | Default? 
+--------+------+--------+-------------+----------
+(0 rows)
+
+               List of conversions
+ Schema | Name | Source | Destination | Default? 
+--------+------+--------+-------------+----------
+(0 rows)
+
+                        List of domains
+ Schema | Name | Type | Collation | Nullable | Default | Check 
+--------+------+------+-----------+----------+---------+-------
+(0 rows)
+
+                                         List of domains
+ Schema | Name | Type | Collation | Nullable | Default | Check | Access privileges | Description 
+--------+------+------+-----------+----------+---------+-------+-------------------+-------------
+(0 rows)
+
+         Object descriptions
+ Schema | Name | Object | Description 
+--------+------+--------+-------------
+(0 rows)
+
+         Object descriptions
+ Schema | Name | Object | Description 
+--------+------+--------+-------------
+(0 rows)
+
+                       List of functions
+ Schema | Name | Result data type | Argument data types | Type 
+--------+------+------------------+---------------------+------
+(0 rows)
+
+                                                                           List of functions
+ Schema | Name | Result data type | Argument data types | Type | Volatility | Parallel | Owner | Security | Access privileges | Language | Internal name | Description 
+--------+------+------------------+---------------------+------+------------+----------+-------+----------+-------------------+----------+---------------+-------------
+(0 rows)
+
+                             List of roles
+ Role name |                         Attributes                         
+-----------+------------------------------------------------------------
+ postgres  | Superuser, Create role, Create DB, Replication, Bypass RLS
+
+                                    List of roles
+ Role name |                         Attributes                         | Description 
+-----------+------------------------------------------------------------+-------------
+ postgres  | Superuser, Create role, Create DB, Replication, Bypass RLS | 
+
+      Large objects
+ ID | Owner | Description 
+----+-------+-------------
+(0 rows)
+
+                Large objects
+ ID | Owner | Access privileges | Description 
+----+-------+-------------------+-------------
+(0 rows)
+
+      List of schemas
+  Name  |       Owner       
+--------+-------------------
+ public | pg_database_owner
+(1 row)
+
+                                       List of schemas
+  Name  |       Owner       |           Access privileges            |      Description       
+--------+-------------------+----------------------------------------+------------------------
+ public | pg_database_owner | pg_database_owner=UC/pg_database_owner+| standard public schema
+        |                   | =U/pg_database_owner                   | 
+(1 row)
+
+                             List of operators
+ Schema | Name | Left arg type | Right arg type | Result type | Description 
+--------+------+---------------+----------------+-------------+-------------
+(0 rows)
+
+                                   List of operators
+ Schema | Name | Left arg type | Right arg type | Result type | Function | Description 
+--------+------+---------------+----------------+-------------+----------+-------------
+(0 rows)
+
+                            Access privileges
+ Schema | Name | Type  | Access privileges | Column privileges | Policies 
+--------+------+-------+-------------------+-------------------+----------
+ public | t    | table |                   |                   | 
+ public | u    | table |                   |                   | 
+(2 rows)
+
+    List of partitioned relations
+ Schema | Name | Owner | Type | Table 
+--------+------+-------+------+-------
+(0 rows)
+
+  List of partitioned indexes
+ Schema | Name | Owner | Table 
+--------+------+-------+-------
+(0 rows)
+
+                              List of publications
+ Name | Owner | All tables | Inserts | Updates | Deletes | Truncates | Via root 
+------+-------+------------+---------+---------+---------+-----------+----------
+(0 rows)
+
+        List of relations
+ Schema | Name | Type  |  Owner   
+--------+------+-------+----------
+ public | t    | table | postgres
+ public | u    | table | postgres
+(2 rows)
+
+                                   List of relations
+ Schema | Name | Type  |  Owner   | Persistence | Access method |  Size   | Description 
+--------+------+-------+----------+-------------+---------------+---------+-------------
+ public | t    | table | postgres | permanent   | heap          | 16 kB   | 
+ public | u    | table | postgres | permanent   | heap          | 0 bytes | 
+(2 rows)
+
+                 List of installed extensions
+  Name   | Version |   Schema   |         Description          
+---------+---------+------------+------------------------------
+ plpgsql | 1.0     | pg_catalog | PL/pgSQL procedural language
+(1 row)
+
+      Objects in extension "plpgsql"
+            Object description             
+-------------------------------------------
+ function plpgsql_call_handler()
+ function plpgsql_inline_handler(internal)
+ function plpgsql_validator(oid)
+ language plpgsql
+(4 rows)
+
+              List of event triggers
+ Name | Event | Owner | Enabled | Function | Tags 
+------+-------+-------+---------+----------+------
+(0 rows)
+
+                                                  List of databases
+   Name    |  Owner   | Encoding | Locale Provider | Collate | Ctype | ICU Locale | ICU Rules |   Access privileges   
+-----------+----------+----------+-----------------+---------+-------+------------+-----------+-----------------------
+ postgres  | postgres | UTF8     | libc            | C       | C     |            |           | 
+ template0 | postgres | UTF8     | libc            | C       | C     |            |           | =c/postgres          +
+           |          |          |                 |         |       |            |           | postgres=CTc/postgres
+ template1 | postgres | UTF8     | libc            | C       | C     |            |           | =c/postgres          +
+           |          |          |                 |         |       |            |           | postgres=CTc/postgres
+(3 rows)
+
+                                                                                    List of databases
+   Name    |  Owner   | Encoding | Locale Provider | Collate | Ctype | ICU Locale | ICU Rules |   Access privileges   |  Size   | Tablespace |                Description                 
+-----------+----------+----------+-----------------+---------+-------+------------+-----------+-----------------------+---------+------------+--------------------------------------------
+ postgres  | postgres | UTF8     | libc            | C       | C     |            |           |                       | 8127 kB | pg_default | default administrative connection database
+ template0 | postgres | UTF8     | libc            | C       | C     |            |           | =c/postgres          +| 7689 kB | pg_default | unmodifiable empty database
+           |          |          |                 |         |       |            |           | postgres=CTc/postgres |         |            | 
+ template1 | postgres | UTF8     | libc            | C       | C     |            |           | =c/postgres          +| 7919 kB | pg_default | default template for new databases
+           |          |          |                 |         |       |            |           | postgres=CTc/postgres |         |            | 
+(3 rows)
+
+                            Access privileges
+ Schema | Name | Type  | Access privileges | Column privileges | Policies 
+--------+------+-------+-------------------+-------------------+----------
+ public | t    | table |                   |                   | 
+ public | u    | table |                   |                   | 
+(2 rows)
+
+                            Access privileges
+ Schema | Name | Type  | Access privileges | Column privileges | Policies 
+--------+------+-------+-------------------+-------------------+----------
+ public | t    | table |                   |                   | 
+(1 row)
+
+                         Table "public.t"
+ Column |         Type          | Collation | Nullable |  Default  
+--------+-----------------------+-----------+----------+-----------
+ id     | integer               |           | not null | 
+ name   | character varying(20) |           | not null | 
+ amount | numeric(10,2)         |           |          | 
+ note   | text                  |           |          | 'n'::text
+Indexes:
+    "t_pkey" PRIMARY KEY, btree (id)
+    "t_amount" btree (amount)
+    "t_name" UNIQUE, btree (name)
+Referenced by:
+    TABLE "u" CONSTRAINT "u_parent_fkey" FOREIGN KEY (parent) REFERENCES t(id)
+
+                                                    Table "public.t"
+ Column |         Type          | Collation | Nullable |  Default  | Storage  | Compression | Stats target | Description 
+--------+-----------------------+-----------+----------+-----------+----------+-------------+--------------+-------------
+ id     | integer               |           | not null |           | plain    |             |              | 
+ name   | character varying(20) |           | not null |           | extended |             |              | 
+ amount | numeric(10,2)         |           |          |           | main     |             |              | 
+ note   | text                  |           |          | 'n'::text | extended |             |              | 
+Indexes:
+    "t_pkey" PRIMARY KEY, btree (id)
+    "t_amount" btree (amount)
+    "t_name" UNIQUE, btree (name)
+Referenced by:
+    TABLE "u" CONSTRAINT "u_parent_fkey" FOREIGN KEY (parent) REFERENCES t(id)
+Access method: heap
+
+              List of relations
+ Schema |   Name   | Type  |  Owner   | Table 
+--------+----------+-------+----------+-------
+ public | t_amount | index | postgres | t
+ public | t_name   | index | postgres | t
+ public | t_pkey   | index | postgres | t
+(3 rows)
+
+                                        List of relations
+ Schema |   Name   | Type  |  Owner   | Table | Persistence | Access method | Size  | Description 
+--------+----------+-------+----------+-------+-------------+---------------+-------+-------------
+ public | t_amount | index | postgres | t     | permanent   | btree         | 16 kB | 
+ public | t_name   | index | postgres | t     | permanent   | btree         | 16 kB | 
+ public | t_pkey   | index | postgres | t     | permanent   | btree         | 16 kB | 
+(3 rows)
+
+       List of tablespaces
+    Name    |  Owner   | Location 
+------------+----------+----------
+ pg_default | postgres | 
+ pg_global  | postgres | 
+(2 rows)
+
+                                  List of tablespaces
+    Name    |  Owner   | Location | Access privileges | Options |  Size  | Description 
+------------+----------+----------+-------------------+---------+--------+-------------
+ pg_default | postgres |          |                   |         | 23 MB  | 
+ pg_global  | postgres |          |                   |         | 567 kB | 
+(2 rows)
+
+       List of foreign servers
+ Name | Owner | Foreign-data wrapper 
+------+-------+----------------------
+(0 rows)
+
+   List of foreign-data wrappers
+ Name | Owner | Handler | Validator 
+------+-------+---------+-----------
+(0 rows)
+
+List of user mappings
+ Server | User name 
+--------+-----------
+(0 rows)
+
+     List of data types
+ Schema | Name | Description 
+--------+------+-------------
+(0 rows)
+
+                                    List of data types
+ Schema | Name | Internal name | Size | Elements | Owner | Access privileges | Description 
+--------+------+---------------+------+----------+-------+-------------------+-------------
+(0 rows)
+
+                      List of languages
+  Name   |  Owner   | Trusted |         Description          
+---------+----------+---------+------------------------------
+ plpgsql | postgres | t       | PL/pgSQL procedural language
+(1 row)
+
+                                                                                    List of languages
+  Name   |  Owner   | Trusted | Internal language |      Call handler      |       Validator        |          Inline handler          | Access privileges |         Description          
+---------+----------+---------+-------------------+------------------------+------------------------+----------------------------------+-------------------+------------------------------
+ plpgsql | postgres | t       | f                 | plpgsql_call_handler() | plpgsql_validator(oid) | plpgsql_inline_handler(internal) |                   | PL/pgSQL procedural language
+(1 row)
+
+                                  List of collations
+ Schema | Name | Provider | Collate | Ctype | ICU Locale | ICU Rules | Deterministic? 
+--------+------+----------+---------+-------+------------+-----------+----------------
+(0 rows)
+
+                                         List of collations
+ Schema | Name | Provider | Collate | Ctype | ICU Locale | ICU Rules | Deterministic? | Description 
+--------+------+----------+---------+-------+------------+-----------+----------------+-------------
+(0 rows)
+
+                 List of extended statistics
+ Schema | Name | Definition | Ndistinct | Dependencies | MCV 
+--------+------+------------+-----------+--------------+-----
+(0 rows)
+
+                 List of extended statistics
+ Schema | Name | Definition | Ndistinct | Dependencies | MCV 
+--------+------+------------+-----------+--------------+-----
+(0 rows)
+
+ List of foreign tables
+ Schema | Table | Server 
+--------+-------+--------
+(0 rows)
+
+               List of foreign tables
+ Schema | Table | Server | FDW options | Description 
+--------+-------+--------+-------------+-------------
+(0 rows)
+
+         Default access privileges
+ Owner | Schema | Type | Access privileges 
+-------+--------+------+-------------------
+(0 rows)
+
+            List of role grants
+ Role name | Member of | Options | Grantor 
+-----------+-----------+---------+---------
+(0 rows)
+
+        List of subscriptions
+ Name | Owner | Enabled | Publication 
+------+-------+---------+-------------
+(0 rows)
+
+      Large objects
+ ID | Owner | Description 
+----+-------+-------------
+(0 rows)
+
+                Large objects
+ ID | Owner | Access privileges | Description 
+----+-------+-------------------+-------------
+(0 rows)
+

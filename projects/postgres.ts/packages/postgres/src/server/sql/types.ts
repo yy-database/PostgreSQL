@@ -23,6 +23,11 @@ export type TypeKey =
     | 'regtype'
     | 'regnamespace'
     | 'regproc'
+    | 'regprocedure'
+    | 'regoperator'
+    | 'regdictionary'
+    | 'regconfig'
+    | 'regrole'
     | 'date'
     | 'timestamp'
     | 'timestamptz'
@@ -70,6 +75,11 @@ const TYPE_INFO: Record<TypeKey, TypeInfo> = {
     regtype: { oid: 2206, typlen: 4 },
     regnamespace: { oid: 4089, typlen: 4 },
     regproc: { oid: 24, typlen: 4 },
+    regprocedure: { oid: 2202, typlen: 4 },
+    regoperator: { oid: 2204, typlen: 4 },
+    regdictionary: { oid: 3735, typlen: 4 },
+    regconfig: { oid: 3734, typlen: 4 },
+    regrole: { oid: 4096, typlen: 4 },
     date: { oid: 1082, typlen: 4 },
     timestamp: { oid: 1114, typlen: 8 },
     timestamptz: { oid: 1184, typlen: 8 },
@@ -184,6 +194,16 @@ export function formatType(type: DataType): string {
             return 'regnamespace';
         case 'regproc':
             return 'regproc';
+        case 'regprocedure':
+            return 'regprocedure';
+        case 'regoperator':
+            return 'regoperator';
+        case 'regdictionary':
+            return 'regdictionary';
+        case 'regconfig':
+            return 'regconfig';
+        case 'regrole':
+            return 'regrole';
         case 'date':
             return 'date';
         case 'timestamp':
@@ -292,6 +312,16 @@ export function typeFromName(parts: string[], modifiers: number[]): DataType {
             return typeOf('regnamespace');
         case 'regproc':
             return typeOf('regproc');
+        case 'regprocedure':
+            return typeOf('regprocedure');
+        case 'regoperator':
+            return typeOf('regoperator');
+        case 'regdictionary':
+            return typeOf('regdictionary');
+        case 'regconfig':
+            return typeOf('regconfig');
+        case 'regrole':
+            return typeOf('regrole');
         case 'date':
             return typeOf('date');
         case 'timestamp':
@@ -629,16 +659,32 @@ function arrayText(type: DataType, text: string): string {
 export interface CastHooks {
     /** Relation name for an `oid` cast to `regclass`, or `null` when unknown. */
     relationName(oid: number): string | null;
+    /** Relation oid for a `regclass` input written as a name. */
+    relationOid?(text: string): number | null;
+    /** Function name for a `regproc`/`regprocedure` oid. */
+    functionName?(oid: number): string | null;
 }
 
 /** Casts one value while preserving PostgreSQL's text-first behaviour. */
 export function castValue(value: SqlValue, to: DataType, hooks: CastHooks): SqlValue {
     if (value === null) return null;
     if (to.key === 'regclass') {
-        return typeof value === 'number' ? hooks.relationName(value) ?? String(value) : String(value);
+        if (typeof value === 'number') return hooks.relationName(value) ?? String(value);
+        const text = String(value);
+        return (hooks.relationOid ? hooks.relationOid(text) : null) ?? text;
     }
-    if (to.key === 'regtype' || to.key === 'regnamespace' || to.key === 'regproc' || to.key === 'oid') {
-        return typeof value === 'number' ? value : parseLiteral(String(value), to);
+    if (to.key === 'regproc' || to.key === 'regprocedure' || to.key === 'regoperator') {
+        return typeof value === 'number' ? hooks.functionName?.(value) ?? value : String(value);
+    }
+    if (
+        to.key === 'regtype' ||
+        to.key === 'regnamespace' ||
+        to.key === 'regdictionary' ||
+        to.key === 'regconfig' ||
+        to.key === 'regrole' ||
+        to.key === 'oid'
+    ) {
+        return typeof value === 'number' ? value : String(value);
     }
     if (to.key === 'text' || to.key === 'name' || to.key === 'pg_node_tree' || to.key === 'int2vector' || to.key === 'oidvector') {
         if (typeof value === 'boolean') return value ? 'true' : 'false';
