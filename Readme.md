@@ -25,8 +25,11 @@ surfaces on top.
 - **Bindings and surfaces.** `postgres-napi`, `postgres-pyo3`, and the
   TypeScript and Python packages composed on top of them.
 - **`psql` surface.** Argument parsing and result rendering.
-- **Key/value store.** `Store` reads and writes the shared `.yyds` catalog and
-  `.yykv` shard contract from `yyds-formats`.
+- **Key/value store.** `Store` is a thin adapter over
+  `database-storage`'s `FileShard` and reads/writes the shared `.yyds` catalog
+  and `.yykv` shard contract from `database-formats`. It keeps the PostgreSQL
+  catalog file, shard-id selection, namespace validation and the user-facing
+  error wording; the snapshot write path is the shared one.
 
 ## What this repository does NOT implement
 
