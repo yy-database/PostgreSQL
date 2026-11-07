@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 
 import pg from 'pg';
 
@@ -93,6 +93,18 @@ async function connect(port, database = 'postgres') {
 function abandon(client) {
     client.on('error', () => {});
     client.connection.stream.destroy();
+}
+
+/** Makes the next commit fail and returns the undo step. */
+function denyCommit(directory) {
+    if (process.platform === 'win32') {
+        const shard = path.join(directory, 'local-0.yykv');
+        execFileSync('attrib', ['+R', shard]);
+        return () => execFileSync('attrib', ['-R', shard]);
+    }
+    const mode = fs.statSync(directory).mode & 0o777;
+    fs.chmodSync(directory, mode & ~0o222);
+    return () => fs.chmodSync(directory, mode);
 }
 
 export async function runDurabilityStage(_repositoryRoot, harnessDir) {
@@ -370,11 +382,43 @@ export async function runDurabilityStage(_repositoryRoot, harnessDir) {
             await stop(reopened);
         });
 
+        await check('errors/commit-failure', async () => {
+            const directory = temporary('postgres-durable-commit-');
+            const server = await start({ dataDir: directory });
+            const client = await connect(server.port);
+            await client.query('CREATE TABLE durable (id int PRIMARY KEY, note text)');
+            await client.query("INSERT INTO durable VALUES (1, 'kept')");
+            const restore = denyCommit(directory);
+            try {
+                const failure = await client.query("INSERT INTO durable VALUES (2, 'lost')").then(
+                    () => null,
+                    (error) => error,
+                );
+                assert(failure !== null, 'a failed commit reported success');
+                assert(failure.code === '58030', `failed commit code is ${failure.code}`);
+                assert((await client.query('SELECT count(*) AS total FROM durable')).rows[0].total === '1', 'a failed commit leaked rows into the session');
+                assert((await client.query('SELECT * FROM durable WHERE id = 2')).rows.length === 0, 'a failed commit leaked the row back');
+            } finally {
+                restore();
+            }
+            await client.query("INSERT INTO durable VALUES (3, 'after')");
+            assert((await client.query('SELECT count(*) AS total FROM durable')).rows[0].total === '2', 'storage did not recover after a failed commit');
+            await client.end();
+            await stop(server);
+
+            const reopened = await start({ dataDir: directory });
+            const reader = await connect(reopened.port);
+            const rows = await reader.query('SELECT id, note FROM durable ORDER BY id');
+            assert(JSON.stringify(rows.rows) === '[{"id":1,"note":"kept"},{"id":3,"note":"after"}]', `durability after a failed commit is ${JSON.stringify(rows.rows)}`);
+            await reader.end();
+            await stop(reopened);
+        });
+
         return {
             name: 'durability',
             output: lines.join('\n'),
             counts: { executed, skipped: 0, failed },
-            floor: 8,
+            floor: 9,
         };
     } finally {
         for (const server of servers.splice(0)) await server.close().catch(() => {});
