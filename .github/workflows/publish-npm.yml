@@ -72,7 +72,7 @@ jobs:
           POSTGRES_NATIVE_PLATFORM: ${{ matrix.short }}
         run: node scripts/build-napi.mjs
       - name: Upload native artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: native-${{ matrix.short }}
           path: projects/postgres.ts/platforms/postgres-${{ matrix.short }}/postgres.${{ matrix.short }}.node
