@@ -1,6 +1,6 @@
 {
     "name": "@yydb/postgres",
-    "version": "0.0.0",
+    "version": "0.0.2",
     "description": "PostgreSQL protocol-v3 client primitives, a protocol-v3 server and a psql-compatible command line",
     "license": "MPL-2.0",
     "type": "module",
@@ -40,10 +40,10 @@
         "node": ">=24.0.0"
     },
     "optionalDependencies": {
-        "@yydb/postgres-darwin-arm64": "0.0.0",
-        "@yydb/postgres-darwin-x64": "0.0.0",
-        "@yydb/postgres-linux-x64": "0.0.0",
-        "@yydb/postgres-win32-x64": "0.0.0"
+        "@yydb/postgres-darwin-arm64": "0.0.1",
+        "@yydb/postgres-darwin-x64": "0.0.1",
+        "@yydb/postgres-linux-x64": "0.0.1",
+        "@yydb/postgres-win32-x64": "0.0.1"
     },
     "repository": {
         "type": "git",
