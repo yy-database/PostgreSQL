@@ -141,7 +141,7 @@ impl ServerStore {
         limit: usize,
     ) -> Result<Vec<ServerRow>, PostgresError> {
         let records = self.shard.scan(&Namespace(namespace.to_owned()), prefix, after, before, limit).map_err(storage_error)?;
-        Ok(records
+        records
             .into_iter()
             .map(|record| {
                 let StoredValue::Inline(value) = record.value
@@ -150,7 +150,7 @@ impl ServerStore {
                 };
                 Ok(ServerRow { key: record.key.bytes, value: value.0 })
             })
-            .collect::<Result<Vec<_>, PostgresError>>()?)
+            .collect::<Result<Vec<_>, PostgresError>>()
     }
 
     /// Applies one statement's changes as a single durable atomic commit.
@@ -213,6 +213,17 @@ fn protocol(message: &str) -> PostgresError {
     PostgresError::Protocol(message.to_owned())
 }
 
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PostgresError> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    let mut file = fs::File::create(&temp).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
+    file.write_all(bytes).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
+    file.sync_all().map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
+    drop(file);
+    fs::rename(&temp, path).map_err(|error| io_error(format!("{} -> {}: {error}", temp.display(), path.display())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,15 +268,4 @@ mod tests {
         assert!(ServerStore::open(&dir).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PostgresError> {
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    let mut file = fs::File::create(&temp).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
-    file.write_all(bytes).map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
-    file.sync_all().map_err(|error| io_error(format!("{}: {error}", temp.display())))?;
-    drop(file);
-    fs::rename(&temp, path).map_err(|error| io_error(format!("{} -> {}: {error}", temp.display(), path.display())))
 }
