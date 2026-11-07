@@ -996,6 +996,17 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                     normalizeMessages(result.stderr) === normalizeMessages(expectedErr),
                     `meta command advisories differ from the pg16 fixture:\n${result.stderr}`,
                 );
+                const missing = await runOn(batchMeta, '\\d missing_relation');
+                assert(!/ERROR:/.test(missing.stderr), `a missing relation raised a server error:\n${missing.stderr}`);
+                assert(
+                    /Did not find any relation named "missing_relation"/.test(missing.stdout + missing.stderr),
+                    `a missing relation did not report the psql advisory:\n${missing.stdout}${missing.stderr}`,
+                );
+                const recovered = await runOn(batchMeta, 'SELECT 1');
+                assert(
+                    recovered.status === 0 && recovered.stdout.includes('(1 row)'),
+                    `the server did not answer after a missing relation:\n${recovered.stdout}${recovered.stderr}`,
+                );
                 lines.push(`  ${commands.length} meta commands match the pg16 fixture, Size cells masked`);
             });
         }
