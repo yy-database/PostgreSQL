@@ -19,8 +19,25 @@ __pycache__/
 target/
 Cargo.lock
 
-# Native bindings built from Cargo
-*.node
+# Local dependency overrides (CI resolves pinned git revisions only)
+.cargo/config.toml
+
+# Native bindings built from Cargo (not committed)
+projects/postgres.ts/platforms/*/*.node
 
 # TypeScript build output
 projects/postgres.ts/packages/postgres/dist/
+*.tgz
+
+# Local npm 2FA (never commit)
+.env.placeholder.local
+.env*.local
+
+# Nifty local cache
+.cache/
+
+# Runtime data
+data/
+*.yykv
+*.yyds
+.tmp/

@@ -1,31 +1,36 @@
+// Builds `postgres-napi` and drops the addon into the matching platform package.
 import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
-import path from 'node:path';
+import { copyFileSync, existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const repositoryRoot = path.resolve(import.meta.dirname, '..');
-const manifest = path.join(repositoryRoot, 'projects', 'postgres.rs', 'Cargo.toml');
+const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const crateDir = join(repo, 'projects', 'postgres.rs');
+const platform = process.env.POSTGRES_NATIVE_PLATFORM?.trim() || `${process.platform}-${process.arch}`;
+const packageDir = join(repo, 'projects', 'postgres.ts', 'platforms', `postgres-${platform}`);
+const nodeName = `postgres.${platform}.node`;
 
-const targets = {
-    'win32-x64': { artifact: 'postgres_napi.dll', binding: 'postgres-win32-x64-msvc.node' },
-    'linux-x64': { artifact: 'libpostgres_napi.so', binding: 'postgres-linux-x64-gnu.node' },
-    'darwin-x64': { artifact: 'libpostgres_napi.dylib', binding: 'postgres-darwin-x64.node' },
-    'darwin-arm64': { artifact: 'libpostgres_napi.dylib', binding: 'postgres-darwin-arm64.node' },
-};
+const artifact = {
+    'win32-x64': { name: 'postgres_napi.dll' },
+    'linux-x64': { name: 'libpostgres_napi.so' },
+    'darwin-x64': { name: 'libpostgres_napi.dylib' },
+    'darwin-arm64': { name: 'libpostgres_napi.dylib' },
+}[platform];
 
-const key = process.env.POSTGRES_NATIVE_PLATFORM?.trim() ?? `${process.platform}-${process.arch}`;
-const target = targets[key];
-if (!target) throw new Error(`no native binding target for ${key}`);
+if (!artifact) {
+    throw new Error(`unsupported platform ${platform}`);
+}
 
-execFileSync('cargo', ['build', '--manifest-path', manifest, '-p', 'postgres-napi', '--release'], {
-    cwd: repositoryRoot,
+execFileSync('cargo', ['build', '--release', '-p', 'postgres-napi'], {
+    cwd: crateDir,
     stdio: 'inherit',
 });
 
-const source = path.join(repositoryRoot, 'projects', 'postgres.rs', 'target', 'release', target.artifact);
-if (!fs.existsSync(source)) throw new Error(`native artifact is missing: ${source}`);
+const source = join(resolve(crateDir, process.env.CARGO_TARGET_DIR ?? 'target'), 'release', artifact.name);
+if (!existsSync(source)) {
+    throw new Error(`missing build artifact ${source}`);
+}
 
-const destinationDir = path.join(repositoryRoot, 'projects', 'postgres.ts', 'platforms', `postgres-${key}`, 'lib');
-fs.mkdirSync(destinationDir, { recursive: true });
-const destination = path.join(destinationDir, target.binding);
-fs.copyFileSync(source, destination);
-console.log(`native binding: ${path.relative(repositoryRoot, destination)}`);
+const dest = join(packageDir, nodeName);
+copyFileSync(source, dest);
+console.log(`napi addon -> ${dest}`);
