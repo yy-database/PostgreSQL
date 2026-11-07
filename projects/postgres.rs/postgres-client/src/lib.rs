@@ -21,11 +21,13 @@ pub mod protocol {
     pub use database_protocol_pgsql::*;
 }
 
-pub use database_client::pgsql::client::{
-    BackendKeyData, ClientConfig, Column, Connection, CopyInReport, CopyOutReport, Param, Portal, PortalReport, Prepared,
-    QueryResult, Report,
+pub use database_client::pgsql::{
+    client::{
+        BackendKeyData, ClientConfig, Column, Connection, CopyInReport, CopyOutReport, Param, Portal, PortalReport, Prepared,
+        QueryResult, Report,
+    },
+    error::{MessageField, Notice, PostgresError},
 };
-pub use database_client::pgsql::error::{MessageField, Notice, PostgresError};
 pub use psql::PsqlOptions;
 pub use server_store::{ServerChange, ServerRow, ServerStore};
 pub use store::Store;

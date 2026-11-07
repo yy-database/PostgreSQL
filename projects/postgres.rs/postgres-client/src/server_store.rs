@@ -13,9 +13,11 @@
 //! the shard. A stale lock from a crashed process is not detected here; deleting
 //! the lock file by hand is the documented recovery step.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use database_storage::cluster_kv::{FileShard, InlineValue, Key, KvStore, ShardChange, StoredValue};
 use database_types::cluster::Namespace;
@@ -42,16 +44,9 @@ pub struct ServerRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerChange {
     /// Insert or replace one row.
-    Put {
-        namespace: String,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
+    Put { namespace: String, key: Vec<u8>, value: Vec<u8> },
     /// Remove one row when present.
-    Delete {
-        namespace: String,
-        key: Vec<u8>,
-    },
+    Delete { namespace: String, key: Vec<u8> },
 }
 
 impl ServerChange {
@@ -145,14 +140,12 @@ impl ServerStore {
         before: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<ServerRow>, PostgresError> {
-        let records = self
-            .shard
-            .scan(&Namespace(namespace.to_owned()), prefix, after, before, limit)
-            .map_err(storage_error)?;
+        let records = self.shard.scan(&Namespace(namespace.to_owned()), prefix, after, before, limit).map_err(storage_error)?;
         Ok(records
             .into_iter()
             .map(|record| {
-                let StoredValue::Inline(value) = record.value else {
+                let StoredValue::Inline(value) = record.value
+                else {
                     return Err(protocol("server store holds an object reference that is not inline"));
                 };
                 Ok(ServerRow { key: record.key.bytes, value: value.0 })

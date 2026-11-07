@@ -11,8 +11,10 @@ use std::sync::{Arc, Mutex};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use postgres_client::psql::{format_results, parse_arguments, PsqlOptions};
-use postgres_client::{Column, MessageField, Notice, Param as PostgresParam, PostgresError, QueryResult};
+use postgres_client::{
+    Column, MessageField, Notice, Param as PostgresParam, PostgresError, QueryResult,
+    psql::{PsqlOptions, format_results, parse_arguments},
+};
 
 /// Where to connect and which identity to present.
 #[napi(object)]
@@ -213,10 +215,9 @@ impl Connection {
     pub fn backend_key_data(&self) -> Result<Option<BackendKeyDataInfo>> {
         let guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_ref().ok_or_else(closed_error)?;
-        Ok(connection.backend_key_data().map(|key| BackendKeyDataInfo {
-            process_id: key.process_id,
-            secret_key: key.secret_key,
-        }))
+        Ok(connection
+            .backend_key_data()
+            .map(|key| BackendKeyDataInfo { process_id: key.process_id, secret_key: key.secret_key }))
     }
 
     /// Sends a `CancelRequest` on a fresh socket and closes it.
@@ -270,10 +271,7 @@ impl Connection {
         let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
-        connection
-            .execute_prepared(&name, &values)
-            .map(|results| results.into_iter().map(statement).collect())
-            .map_err(native)
+        connection.execute_prepared(&name, &values).map(|results| results.into_iter().map(statement).collect()).map_err(native)
     }
 
     /// Closes a prepared statement by server-side name.
@@ -296,10 +294,8 @@ impl Connection {
         result_formats: Vec<u32>,
     ) -> Result<Vec<StatementResult>> {
         let owned = param_buffers(&params)?;
-        let values: Vec<PostgresParam<'_>> = owned
-            .iter()
-            .map(|(format, value)| PostgresParam { format: *format, value: value.as_deref() })
-            .collect();
+        let values: Vec<PostgresParam<'_>> =
+            owned.iter().map(|(format, value)| PostgresParam { format: *format, value: value.as_deref() }).collect();
         let formats = result_formats_u16(result_formats)?;
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
@@ -318,10 +314,8 @@ impl Connection {
         result_formats: Vec<u32>,
     ) -> Result<Vec<StatementResult>> {
         let owned = param_buffers(&params)?;
-        let values: Vec<PostgresParam<'_>> = owned
-            .iter()
-            .map(|(format, value)| PostgresParam { format: *format, value: value.as_deref() })
-            .collect();
+        let values: Vec<PostgresParam<'_>> =
+            owned.iter().map(|(format, value)| PostgresParam { format: *format, value: value.as_deref() }).collect();
         let formats = result_formats_u16(result_formats)?;
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
@@ -341,10 +335,8 @@ impl Connection {
         result_formats: Vec<u32>,
     ) -> Result<PortalInfo> {
         let owned = param_buffers(&params)?;
-        let values: Vec<PostgresParam<'_>> = owned
-            .iter()
-            .map(|(format, value)| PostgresParam { format: *format, value: value.as_deref() })
-            .collect();
+        let values: Vec<PostgresParam<'_>> =
+            owned.iter().map(|(format, value)| PostgresParam { format: *format, value: value.as_deref() }).collect();
         let formats = result_formats_u16(result_formats)?;
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
@@ -362,10 +354,7 @@ impl Connection {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
         let report = connection.execute_portal(&portal, max_rows).map_err(native)?;
-        Ok(PortalExecReport {
-            results: report.results.into_iter().map(statement).collect(),
-            suspended: report.suspended,
-        })
+        Ok(PortalExecReport { results: report.results.into_iter().map(statement).collect(), suspended: report.suspended })
     }
 
     /// Closes a portal by server-side name.
@@ -414,7 +403,8 @@ impl Connection {
     #[napi]
     pub fn close(&self) -> Result<()> {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
-        let Some(mut connection) = guard.take() else {
+        let Some(mut connection) = guard.take()
+        else {
             return Err(closed_error());
         };
         connection.disconnect().map_err(native)
@@ -525,9 +515,7 @@ pub fn encode_startup_packet(user: String, database: String) -> Buffer {
 /// Builds one simple-query `Query` message.
 #[napi]
 pub fn encode_query_packet(sql: String) -> Result<Buffer> {
-    postgres_client::protocol::query_packet(&sql)
-        .map(Buffer::from)
-        .map_err(native)
+    postgres_client::protocol::query_packet(&sql).map(Buffer::from).map_err(native)
 }
 
 /// Builds the 16-byte `CancelRequest` sent on its own connection.
@@ -583,9 +571,7 @@ pub fn decode_command_tag(payload: Buffer) -> Result<String> {
 /// an empty list lets the server infer every parameter.
 #[napi]
 pub fn encode_parse_message(name: String, sql: String, param_types: Vec<u32>) -> Result<Buffer> {
-    postgres_client::protocol::parse_packet(&name, &sql, &param_types)
-        .map(Buffer::from)
-        .map_err(native)
+    postgres_client::protocol::parse_packet(&name, &sql, &param_types).map(Buffer::from).map_err(native)
 }
 
 /// Builds one extended-protocol `Bind` message. Parameters are text values and
@@ -598,12 +584,9 @@ pub fn encode_bind_message(
     params: Vec<Option<String>>,
     result_format: u32,
 ) -> Result<Buffer> {
-    let format = u16::try_from(result_format)
-        .map_err(|_| Error::from_reason("result format does not fit 16 bits"))?;
+    let format = u16::try_from(result_format).map_err(|_| Error::from_reason("result format does not fit 16 bits"))?;
     let values: Vec<Option<&str>> = params.iter().map(|value| value.as_deref()).collect();
-    postgres_client::protocol::bind_packet(&portal, &statement, &values, format)
-        .map(Buffer::from)
-        .map_err(native)
+    postgres_client::protocol::bind_packet(&portal, &statement, &values, format).map(Buffer::from).map_err(native)
 }
 
 /// Builds one extended-protocol `Bind` message with explicit parameter and
@@ -629,18 +612,14 @@ pub fn encode_bind_message_with_formats(
 #[napi]
 pub fn encode_describe_message(target: String, name: String) -> Result<Buffer> {
     let kind = describe_target(&target)?;
-    postgres_client::protocol::describe_packet(kind, &name)
-        .map(Buffer::from)
-        .map_err(native)
+    postgres_client::protocol::describe_packet(kind, &name).map(Buffer::from).map_err(native)
 }
 
 /// Builds one extended-protocol `Execute` message. `maxRows` of `0` runs the
 /// portal to completion and a positive limit suspends it after that many rows.
 #[napi]
 pub fn encode_execute_message(portal: String, max_rows: i32) -> Result<Buffer> {
-    postgres_client::protocol::execute_packet(&portal, max_rows)
-        .map(Buffer::from)
-        .map_err(native)
+    postgres_client::protocol::execute_packet(&portal, max_rows).map(Buffer::from).map_err(native)
 }
 
 /// Builds the `Sync` message that ends an extended-protocol round trip.
@@ -653,9 +632,7 @@ pub fn encode_sync_message() -> Buffer {
 #[napi]
 pub fn encode_close_message(target: String, name: String) -> Result<Buffer> {
     let kind = describe_target(&target)?;
-    postgres_client::protocol::close_packet(kind, &name)
-        .map(Buffer::from)
-        .map_err(native)
+    postgres_client::protocol::close_packet(kind, &name).map(Buffer::from).map_err(native)
 }
 
 /// Decodes the parameter OIDs of a `ParameterDescription`.
@@ -667,9 +644,7 @@ pub fn decode_parameter_description(payload: Buffer) -> Result<Vec<u32>> {
 /// Builds one `CopyData` message carrying a chunk of the copy stream.
 #[napi]
 pub fn encode_copy_data(data: Buffer) -> Result<Buffer> {
-    postgres_client::protocol::copy_data_packet(data.as_ref())
-        .map(Buffer::from)
-        .map_err(native)
+    postgres_client::protocol::copy_data_packet(data.as_ref()).map(Buffer::from).map_err(native)
 }
 
 /// Builds the `CopyDone` message that ends a `COPY ... FROM STDIN` stream.
@@ -681,9 +656,7 @@ pub fn encode_copy_done() -> Buffer {
 /// Builds a `CopyFail` message carrying a human readable reason.
 #[napi]
 pub fn encode_copy_fail(reason: String) -> Result<Buffer> {
-    postgres_client::protocol::copy_fail_packet(&reason)
-        .map(Buffer::from)
-        .map_err(native)
+    postgres_client::protocol::copy_fail_packet(&reason).map(Buffer::from).map_err(native)
 }
 
 /// Decodes a `CopyInResponse`, `CopyOutResponse` or `CopyBothResponse` payload.
@@ -712,9 +685,7 @@ pub fn encode_bytea(bytes: Buffer) -> String {
 /// Parses the supported `psql` flags.
 #[napi]
 pub fn parse_psql_arguments(args: Vec<String>) -> Result<CommandOptions> {
-    parse_arguments(&args)
-        .map(CommandOptions::from)
-        .map_err(|message| Error::from_reason(message))
+    parse_arguments(&args).map(CommandOptions::from).map_err(|message| Error::from_reason(message))
 }
 
 /// Turns result sets into the lines `psql` prints.
@@ -735,9 +706,7 @@ impl Store {
     /// Opens or creates a store in `dataDir`.
     #[napi(constructor)]
     pub fn new(data_dir: String) -> Result<Self> {
-        postgres_client::Store::open(&data_dir)
-            .map(|inner| Self { inner })
-            .map_err(native)
+        postgres_client::Store::open(&data_dir).map(|inner| Self { inner }).map_err(native)
     }
 
     /// Writes one row.
@@ -888,8 +857,7 @@ fn describe_target(target: &str) -> Result<u8> {
 fn param_buffers(params: &[ParamInfo]) -> Result<Vec<(u16, Option<Vec<u8>>)>> {
     let mut owned = Vec::with_capacity(params.len());
     for param in params {
-        let format = u16::try_from(param.format)
-            .map_err(|_| Error::from_reason("parameter format does not fit 16 bits"))?;
+        let format = u16::try_from(param.format).map_err(|_| Error::from_reason("parameter format does not fit 16 bits"))?;
         if format > 1 {
             return Err(Error::from_reason("parameter format is 0 for text and 1 for binary"));
         }
@@ -901,8 +869,7 @@ fn param_buffers(params: &[ParamInfo]) -> Result<Vec<(u16, Option<Vec<u8>>)>> {
 fn result_formats_u16(formats: Vec<u32>) -> Result<Vec<u16>> {
     let mut codes = Vec::with_capacity(formats.len());
     for format in formats {
-        let code = u16::try_from(format)
-            .map_err(|_| Error::from_reason("result format does not fit 16 bits"))?;
+        let code = u16::try_from(format).map_err(|_| Error::from_reason("result format does not fit 16 bits"))?;
         if code > 1 {
             return Err(Error::from_reason("result format is 0 for text and 1 for binary"));
         }
@@ -961,9 +928,7 @@ impl ServerStore {
     /// Opens or creates the data directory and takes its lock.
     #[napi(constructor)]
     pub fn new(data_dir: String) -> Result<Self> {
-        postgres_client::ServerStore::open(&data_dir)
-            .map(|inner| Self { inner: Mutex::new(Some(inner)) })
-            .map_err(native)
+        postgres_client::ServerStore::open(&data_dir).map(|inner| Self { inner: Mutex::new(Some(inner)) }).map_err(native)
     }
 
     /// Ordered prefix scan inside one namespace.
@@ -977,14 +942,10 @@ impl ServerStore {
         limit: u32,
     ) -> Result<Vec<ServerStoreRow>> {
         with_server_store(&self.inner, |store| {
-            store
-                .scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize)
-                .map_err(native)
+            store.scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize).map_err(native)
         })
         .map(|rows| {
-            rows.into_iter()
-                .map(|row| ServerStoreRow { key: Buffer::from(row.key), value: Buffer::from(row.value) })
-                .collect()
+            rows.into_iter().map(|row| ServerStoreRow { key: Buffer::from(row.key), value: Buffer::from(row.value) }).collect()
         })
     }
 
@@ -997,14 +958,9 @@ impl ServerStore {
                 "put" => postgres_client::ServerChange::Put {
                     namespace: change.namespace,
                     key: change.key.to_vec(),
-                    value: change
-                        .value
-                        .ok_or_else(|| Error::from_reason("put change carries no value"))?
-                        .to_vec(),
+                    value: change.value.ok_or_else(|| Error::from_reason("put change carries no value"))?.to_vec(),
                 },
-                "delete" => {
-                    postgres_client::ServerChange::Delete { namespace: change.namespace, key: change.key.to_vec() }
-                }
+                "delete" => postgres_client::ServerChange::Delete { namespace: change.namespace, key: change.key.to_vec() },
                 other => return Err(Error::from_reason(format!("unknown server store change kind {other}"))),
             });
         }

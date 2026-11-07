@@ -15,21 +15,24 @@
 //! rejected explicitly; they are never sniffed or guessed. Writes go through a
 //! temp file and a rename, so a crash leaves the previous shard intact.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
-use database_formats::yy::yyds::{
-    decode_catalog_shard_id as shared_catalog_shard_id, encode_catalog, CATALOG_MAGIC,
+use database_formats::yy::{
+    yyds::{CATALOG_MAGIC, decode_catalog_shard_id as shared_catalog_shard_id, encode_catalog},
+    yykv::{
+        InlineValue, KV_LEGACY_MAGIC, KV_MAGIC, Key, Record as ShardRecord, Snapshot, StoredValue, decode_snapshot_strict,
+        encode_snapshot, kv_format::checksum as shard_checksum,
+    },
 };
-use database_formats::yy::yykv::kv_format::checksum as shard_checksum;
-use database_formats::yy::yykv::{
-    decode_snapshot_strict, encode_snapshot, InlineValue, Key, Record as ShardRecord, Snapshot, StoredValue, KV_LEGACY_MAGIC,
-    KV_MAGIC,
+use database_types::{
+    ReasonCode,
+    cluster::{Error as ClusterError, ShardId},
 };
-use database_types::cluster::{Error as ClusterError, ShardId};
-use database_types::ReasonCode;
 
 use crate::PostgresError;
 
@@ -105,11 +108,7 @@ struct Inner {
 
 impl Inner {
     fn empty() -> Self {
-        let mut inner = Self {
-            records: BTreeMap::new(),
-            next_revision: 1,
-            body: vec![0; SHARD_HEADER_LEN],
-        };
+        let mut inner = Self { records: BTreeMap::new(), next_revision: 1, body: vec![0; SHARD_HEADER_LEN] };
         inner.sync_header();
         inner
     }
@@ -202,12 +201,8 @@ impl Inner {
 /// dropping its fixed prefix, so the record layout stays in `database-formats`.
 fn encode_record(namespace: &str, key: &[u8], revision: u64, value: &[u8]) -> Result<Vec<u8>, PostgresError> {
     let key = Key::new(namespace, key.to_vec());
-    let record = ShardRecord {
-        key: key.clone(),
-        value: StoredValue::Inline(InlineValue(value.to_vec())),
-        revision,
-        expires_at: None,
-    };
+    let record =
+        ShardRecord { key: key.clone(), value: StoredValue::Inline(InlineValue(value.to_vec())), revision, expires_at: None };
     let snapshot = BTreeMap::from([(key, record)]);
     // `revision + 1` satisfies the shared guard that every record sits below
     // `next_revision`.
@@ -220,7 +215,6 @@ fn persist(path: &Path, inner: &Inner) -> Result<(), PostgresError> {
     write_atomic(path, &[KV_MAGIC, &checksum.to_le_bytes(), &inner.body])
 }
 
-
 fn decode_shard(bytes: &[u8]) -> Result<(BTreeMap<(String, Vec<u8>), Record>, u64), PostgresError> {
     // Header checks stay here so the shared decoder's generic EOF/legacy
     // classification keeps mapping onto the messages PostgreSQL has always
@@ -229,9 +223,7 @@ fn decode_shard(bytes: &[u8]) -> Result<(BTreeMap<(String, Vec<u8>), Record>, u6
         return Err(protocol("truncated .yykv header"));
     }
     if bytes.starts_with(KV_LEGACY_MAGIC) {
-        return Err(protocol(
-            "legacy .yykv v2 snapshot carries no checksum: delete the shard and let the node recreate it",
-        ));
+        return Err(protocol("legacy .yykv v2 snapshot carries no checksum: delete the shard and let the node recreate it"));
     }
     if !bytes.starts_with(KV_MAGIC) {
         return Err(protocol("unknown .yykv header"));
@@ -253,7 +245,8 @@ fn decode_shard(bytes: &[u8]) -> Result<(BTreeMap<(String, Vec<u8>), Record>, u6
         if record.expires_at.is_some() {
             return Err(protocol("expired shard records are unsupported"));
         }
-        let StoredValue::Inline(value) = record.value else {
+        let StoredValue::Inline(value) = record.value
+        else {
             return Err(protocol("unknown shard record tag"));
         };
         shard.insert((key.namespace.0, key.bytes), Record { revision: record.revision, value: value.0, start: 0 });
@@ -394,7 +387,8 @@ impl Store {
         let shard_id = if catalog.exists() {
             let bytes = fs::read(&catalog).map_err(io_error)?;
             decode_catalog_shard_id(&bytes)?
-        } else {
+        }
+        else {
             DEFAULT_SHARD_ID.to_owned()
         };
         let shard = dir.join(format!("{shard_id}.yykv"));
@@ -405,7 +399,8 @@ impl Store {
             let bytes = fs::read(&shard).map_err(io_error)?;
             let (records, next_revision) = decode_shard(&bytes)?;
             Inner::from_decoded(records, next_revision)?
-        } else {
+        }
+        else {
             Inner::empty()
         };
         if !shard.exists() {
@@ -660,10 +655,8 @@ mod tests {
     fn shared_codec_snapshot_opens_as_a_store() {
         let dir = temporary("interop-in");
         Store::open(&dir).unwrap();
-        let written_by_shared_codec = BTreeMap::from([
-            shared_record("public.seed", b"a", b"1", 1),
-            shared_record("public.seed", b"b", b"2", 2),
-        ]);
+        let written_by_shared_codec =
+            BTreeMap::from([shared_record("public.seed", b"a", b"1", 1), shared_record("public.seed", b"b", b"2", 2)]);
         let bytes = encode_snapshot(&written_by_shared_codec, 3).unwrap();
         fs::write(dir.join(format!("{DEFAULT_SHARD_ID}.yykv")), &bytes).unwrap();
 

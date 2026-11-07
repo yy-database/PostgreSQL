@@ -60,7 +60,8 @@ pub fn parse_arguments(args: &[String]) -> Result<PsqlOptions, String> {
             "-P" | "--pset" => {
                 index += 1;
                 let value = args.get(index).ok_or("only psql null output is configurable")?;
-                let Some(null_value) = value.strip_prefix("null=") else {
+                let Some(null_value) = value.strip_prefix("null=")
+                else {
                     return Err("only psql null output is configurable".into());
                 };
                 options.null_value = null_value.to_owned();
@@ -140,10 +141,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_options() {
-        assert_eq!(
-            parse_arguments(&["--nope".into()]).unwrap_err(),
-            "unsupported option '--nope'"
-        );
+        assert_eq!(parse_arguments(&["--nope".into()]).unwrap_err(), "unsupported option '--nope'");
     }
 
     #[test]
