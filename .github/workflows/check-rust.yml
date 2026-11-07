@@ -48,33 +48,9 @@ jobs:
       - name: Tests
         run: cargo test --release --manifest-path projects/postgres.rs/Cargo.toml -p postgres-napi -p postgres-pyo3 -- --test-threads=1
 
-  rust-test-live:
-    name: cargo test (live PostgreSQL)
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: rustc --version && cargo --version
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: projects/postgres.rs
-      - name: Tests
-        env:
-          POSTGRES_TEST_PORT: 5432
-        run: cargo test --release --manifest-path projects/postgres.rs/Cargo.toml -p postgres-napi -p postgres-pyo3 -- --test-threads=1
+  # Live PostgreSQL coverage belongs upstream: database.rs `postgres-live`.
+  # Do not add a live job here that only starts `postgres:16` and runs the
+  # binding crates, that executes zero tests and reports a false green.
 
   clippy:
     name: clippy
