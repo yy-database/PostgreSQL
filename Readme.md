@@ -347,6 +347,39 @@ one leaves the other usable, `DEALLOCATE <name>` removes the server-side
 statement (`26000` on reuse), and a failed bind (`22P02`) leaves both the
 statement and the connection usable.
 
+## Disk full and long-running sessions
+
+**A full disk.** The server was pointed at a 64 MB NTFS volume with 8 MB free
+and asked to commit rows carrying 1 MB of text. Four commits succeeded, the
+fifth returned SQLSTATE `58030` (`could not write to the data directory`) with
+the underlying I/O error in the message, and no `CommandComplete` was reported
+for it. The failed row never became visible: `SELECT count(*)` still returned
+four and the same session answered `SELECT 1`. The failed commit left no
+staging file behind, a restart against the still-nearly-full volume read the
+four committed rows, and after space was freed the restart read them with their
+full 1 MB payloads plus a parseable `sql-schema.v0.json`. Commits stage a
+temporary snapshot and rename it only after the bytes are durable, so an I/O
+failure before the rename keeps the previous snapshot and no repair step is
+needed. No injected error was used; the volume itself ran out of space. A
+graceful `SIGTERM` still leaves `postmaster.pid` behind, so the operator step
+above (confirm the process is gone, delete the file) applies unchanged and
+automatic stale-lock detection remains out of scope here.
+
+**Long-running sessions.** A 30-minute soak held two sessions open while
+running an insert, a delete and a count every two seconds and opening and
+closing a fresh connection every three seconds, 600 connections in total.
+Open connections were exactly the two long-lived sessions throughout and zero
+after they closed. The process handle count stayed at 245 in the sibling run
+that sampled it, so neither sessions nor file handles accumulate. Heap taken
+from the inspector, with a forced GC at the end, moved from 7.7 MB to 8.2 MB,
+while `arrayBuffers` fell from 0.9 MB to 0.1 MB in a shorter run with that
+breakdown, so the buffers a busy session allocates are garbage and are
+reclaimed. RSS rose from 67.1 MB to 71.1 MB over the half hour, but that is
+V8 heap slack and allocator high-water: live heap stayed flat. What did not
+fully return on GC is `external` memory outside `arrayBuffers`, which grew
+2.6 MB to 4.8 MB; it is small but unattributed, so boundedness over hours is
+not claimed yet and a longer soak with that breakdown is the next measurement.
+
 ## Testing
 
 ```shell
