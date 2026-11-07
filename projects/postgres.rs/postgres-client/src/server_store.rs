@@ -177,6 +177,23 @@ impl Drop for ServerStore {
 }
 
 fn take_lock(dir: &Path) -> Result<PathBuf, PostgresError> {
+    // The directory lock is deliberately product-side instead of the upstream
+    // `database-storage::local::lock::WriterLock`. The three observable
+    // contracts differ:
+    //
+    // 1. File content: this lock is `postmaster.pid` holding the live PID and a
+    //    newline, while `WriterLock` writes a `{db}-lock` sidecar with a `YYLK`
+    //    magic, a fence epoch and a CRC32.
+    // 2. Error wording: a second server must fail with `lock file "..." already
+    //    exists: another server owns this data directory`, which PostgreSQL
+    //    callers and tests match verbatim. `WriterLock` reports an OS-level lock
+    //    conflict instead.
+    // 3. Crash recovery: a hard kill leaves `postmaster.pid` behind on purpose,
+    //    so the operator removes it once the old process is gone. `WriterLock`
+    //    releases its OS lock automatically when the process dies.
+    //
+    // Aligning any one of these with `WriterLock` would change what a PostgreSQL
+    // user sees, so the lock stays owned by this crate.
     let lock = dir.join(LOCK_FILE);
     let mut file = match OpenOptions::new().write(true).create_new(true).open(&lock) {
         Ok(file) => file,
