@@ -162,12 +162,15 @@ jobs:
           test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
           test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
           echo "OIDC request URL present"
-          if npm config list -l | grep -E '(^|/)(_auth|_authToken)\s*='; then
+          # `npm config list -l` always prints `_auth = (protected)` for the key
+          # itself — that is not a set credential. Only the non-default listing
+          # (and on-disk npmrc) show real classic auth.
+          if npm config list | grep -E '(^|/)(_auth|_authToken)\s*='; then
             echo "classic npm auth still present after cleanup" >&2
-            npm config list -l | grep -E 'registry|auth|_auth|oidc|provenance' || true
+            npm config list | grep -E 'registry|auth|_auth|oidc|provenance' || true
             exit 1
           fi
-          npm config list -l | grep -E 'registry|auth|_auth|oidc|provenance' || true
+          npm config list | grep -E 'registry|auth|_auth|oidc|provenance' || true
       - name: Publish packages to npm
         shell: bash
         run: |
