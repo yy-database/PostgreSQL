@@ -107,7 +107,6 @@ jobs:
       - run: rustc --version && cargo --version
       - name: Upgrade npm for Trusted Publisher support
         run: |
-          # Trusted Publisher needs npm >= 11.5.1; pin latest so OIDC stays current.
           npm install --global npm@latest
           node -v
           npm -v
@@ -135,12 +134,17 @@ jobs:
             ls -la "$dest"
           done
       - run: pnpm run build:ts
-      - name: Strip token-style npmrc (OIDC only)
+      - name: Prepare OIDC-only npm
         shell: bash
         run: |
           set -euo pipefail
           unset NODE_AUTH_TOKEN NPM_TOKEN || true
-          # setup-node / leftover npmrc `_authToken` makes npm skip OIDC and fail with ENEEDAUTH.
+          # pnpm may inject npm_config_* that make npm skip Trusted Publisher OIDC.
+          while IFS='=' read -r key _; do
+            case "${key}" in
+              npm_config_*|NPM_CONFIG_*) unset "${key}" || true ;;
+            esac
+          done < <(env)
           for f in "${HOME}/.npmrc" "${GITHUB_WORKSPACE}/.npmrc" "${NPM_CONFIG_USERCONFIG:-}" "${RUNNER_TEMP:-}/.npmrc"; do
             [[ -n "${f}" && -f "${f}" ]] || continue
             if grep -qE '(^|/)(_auth|_authToken|_password|username)(=|:)' "${f}"; then
@@ -152,85 +156,19 @@ jobs:
           test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
           test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
           echo "OIDC request URL present"
-          echo "npmrc files:"
-          for f in "${HOME}/.npmrc" "${GITHUB_WORKSPACE}/.npmrc" "${NPM_CONFIG_USERCONFIG:-}" "${RUNNER_TEMP:-}/.npmrc"; do
-            [[ -n "${f}" && -f "${f}" ]] || continue
-            echo "--- ${f} ---"
-            # Redact values but keep keys so we can see leftover auth.
-            sed -E 's/(token|password|_auth|_authToken).*/\1=***/I' "${f}" || true
-          done
-          echo "npm_config_* in env:"
-          env | awk -F= '/^npm_config_|^NPM_CONFIG_/ {print $1}' | sort || true
       - name: Publish packages to npm
         shell: bash
         run: |
           set -euo pipefail
-          # Do not set NODE_AUTH_TOKEN — even empty — or npm skips Trusted Publisher OIDC.
           unset NODE_AUTH_TOKEN NPM_TOKEN || true
-          # pnpm/action-setup can leave npm_config_* in the job env; some of those make
-          # npm 11 treat auth as "already configured" and skip the OIDC exchange.
           while IFS='=' read -r key _; do
             case "${key}" in
               npm_config_*|NPM_CONFIG_*) unset "${key}" || true ;;
             esac
           done < <(env)
           VERSION="${RELEASE_TAG#v}"
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
-          # Prove GitHub will mint an OIDC JWT for this job before calling npm.
-          AUDIENCE='npm:registry.npmjs.org'
-          export OID_TOKEN
-          OID_TOKEN="$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).value')"
-          test -n "${OID_TOKEN}"
-          echo "GitHub OIDC JWT minted (length=${#OID_TOKEN})"
-          # Decode claims (header.payload) for trust matching without printing the signature.
-          node -e '
-            const t=process.env.OID_TOKEN.split(".");
-            const p=JSON.parse(Buffer.from(t[1],"base64url").toString());
-            console.log(JSON.stringify({
-              iss:p.iss, aud:p.aud, sub:p.sub,
-              repository:p.repository,
-              job_workflow_ref:p.job_workflow_ref,
-              workflow_ref:p.workflow_ref,
-              workflow:p.workflow,
-              environment:p.environment,
-              ref:p.ref, sha:p.sha
-            },null,2));
-          '
-          # Same path as yydb: plain `npm publish` per package directory.
-          DIRS=(
-            projects/postgres.ts/platforms/postgres-win32-x64
-            projects/postgres.ts/platforms/postgres-linux-x64
-            projects/postgres.ts/platforms/postgres-darwin-x64
-            projects/postgres.ts/platforms/postgres-darwin-arm64
-            projects/postgres.ts/packages/postgres
-          )
-          FIRST=1
-          for dir in "${DIRS[@]}"; do
-            name="$(node -p "require('./${dir}/package.json').name")"
-            ver="$(node -p "require('./${dir}/package.json').version")"
-            test "$ver" = "$VERSION"
-            if got="$(npm view "${name}@${VERSION}" version 2>/dev/null)" && [[ "$got" == "$VERSION" ]]; then
-              echo "skip ${name}@${VERSION} (already published)"
-              continue
-            fi
-            echo "publish ${name}@${VERSION}"
-            if [[ "$FIRST" -eq 1 ]]; then
-              FIRST=0
-              # First package: silly log so OIDC exchange lines are visible on failure.
-              if ! (cd "$dir" && npm publish --access public --tag latest --loglevel silly) >"$RUNNER_TEMP/npm-publish-silly.log" 2>&1; then
-                echo "npm publish failed; OIDC/auth-related silly log lines:" >&2
-                grep -Ei 'oidc|trusted|auth|audience|token exchange|ENEEDAUTH|401|403|provenance' "$RUNNER_TEMP/npm-publish-silly.log" >&2 || true
-                echo "----- last 80 lines -----" >&2
-                tail -n 80 "$RUNNER_TEMP/npm-publish-silly.log" >&2 || true
-                exit 1
-              fi
-              tail -n 40 "$RUNNER_TEMP/npm-publish-silly.log" || true
-            else
-              (cd "$dir" && npm publish --access public --tag latest)
-            fi
-          done
+          # Call local binary — `pnpm exec` re-injects npm_config_*.
+          ./node_modules/.bin/nifty publish --access public --tag latest --version="$VERSION"
           EXPECTED=(
             @yydb/postgres
             @yydb/postgres-darwin-arm64
