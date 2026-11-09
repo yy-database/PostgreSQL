@@ -134,25 +134,43 @@ jobs:
             ls -la "$dest"
           done
       - run: pnpm run build:ts
-      - name: Strip token-style npmrc (OIDC only)
+      - name: Prepare OIDC-only npm (no token, no pnpm npm_config leak)
         shell: bash
         run: |
           set -euo pipefail
           unset NODE_AUTH_TOKEN NPM_TOKEN || true
-          for f in "${HOME}/.npmrc" "${NPM_CONFIG_USERCONFIG:-}" "${RUNNER_TEMP:-}/.npmrc"; do
+          # pnpm injects npm_config_* (e.g. verify-deps-before-run) that make npm 11
+          # skip Trusted Publisher OIDC and fall back to ENEEDAUTH.
+          while IFS='=' read -r key _; do
+            case "${key}" in
+              npm_config_*|NPM_CONFIG_*) unset "${key}" || true ;;
+            esac
+          done < <(env)
+          for f in "${HOME}/.npmrc" "${GITHUB_WORKSPACE}/.npmrc" "${NPM_CONFIG_USERCONFIG:-}" "${RUNNER_TEMP:-}/.npmrc"; do
             [[ -n "${f}" && -f "${f}" ]] || continue
-            if grep -q '_authToken' "${f}"; then
-              grep -v '_authToken' "${f}" > "${f}.oidc" && mv "${f}.oidc" "${f}"
+            if grep -qE '_authToken|^[[:space:]]*//registry\.npmjs\.org/:_authToken' "${f}"; then
+              grep -vE '_authToken|^[[:space:]]*//registry\.npmjs\.org/:_authToken' "${f}" > "${f}.oidc"
+              mv "${f}.oidc" "${f}"
               echo "stripped _authToken from ${f}"
             fi
           done
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          echo "OIDC request URL present"
+          npm config list -l | grep -E 'registry|auth|_auth|oidc|provenance' || true
       - name: Publish packages to npm
         shell: bash
         run: |
           set -euo pipefail
           unset NODE_AUTH_TOKEN NPM_TOKEN || true
+          while IFS='=' read -r key _; do
+            case "${key}" in
+              npm_config_*|NPM_CONFIG_*) unset "${key}" || true ;;
+            esac
+          done < <(env)
           VERSION="${RELEASE_TAG#v}"
-          pnpm exec nifty publish --access public --tag latest --version="$VERSION" | tee "$RUNNER_TEMP/nifty-publish.log"
+          # Call the local binary directly — `pnpm exec` re-injects npm_config_*.
+          ./node_modules/.bin/nifty publish --access public --tag latest --version="$VERSION" | tee "$RUNNER_TEMP/nifty-publish.log"
           # nifty exits 0 when it skips packages that are "already live"; refuse a green
           # job unless every intended public package actually lands on the registry.
           EXPECTED=(
