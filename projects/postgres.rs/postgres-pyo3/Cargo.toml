@@ -15,8 +15,8 @@ name = "postgres_pyo3"
 
 [dependencies]
 pyo3 = { workspace = true }
-database-client = { git = "https://github.com/oovm/database.rs.git", rev = "13ae964bdd1026517d7d9c7cb37a7bc811299a2e" }
-database-protocol-pgsql = { git = "https://github.com/oovm/database.rs.git", rev = "13ae964bdd1026517d7d9c7cb37a7bc811299a2e" }
+database-client = { git = "https://github.com/oovm/database.rs.git", rev = "382a408623166924dbd0fcfbb7f438170ad3a0e9" }
+database-protocol-pgsql = { git = "https://github.com/oovm/database.rs.git", rev = "382a408623166924dbd0fcfbb7f438170ad3a0e9" }
 
 [build-dependencies]
 pyo3-build-config = "0.30.1"

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import { startServer } from './server.mjs';
@@ -161,13 +162,31 @@ function tail(output) {
     return lines.slice(-TAIL_LINES).join('\n');
 }
 
+// Stage floor verdicts run in `database.harness` through the napi primitive
+// `harnessSuiteVerdict`; the binding is loaded lazily because the native stage
+// builds it on fresh checkouts.
+let harnessBinding = null;
+function loadHarnessBinding() {
+    if (!harnessBinding) {
+        harnessBinding = createRequire(import.meta.url)(
+            path.join(repositoryRoot, 'projects', 'postgres.ts', 'platforms', `postgres-${process.platform}-${process.arch}`),
+        );
+    }
+    return harnessBinding;
+}
+
 function report(stage) {
     const { executed, skipped, failed } = stage.counts;
-    const ok = failed === 0 && skipped === 0 && executed >= stage.floor;
+    const gate = JSON.parse(loadHarnessBinding().harnessSuiteVerdict(
+        JSON.stringify({ cases: executed, assertions: 0, passed: Math.max(executed - failed - skipped, 0), failed, skipped }),
+        JSON.stringify([{ metric: 'cases', min: stage.floor }]),
+    ));
+    const ok = gate.ok;
+    const byKind = new Map(gate.problems.map((problem) => [problem.kind, problem]));
     const reason = [];
-    if (failed > 0) reason.push(`${failed} failed`);
-    if (skipped > 0) reason.push(`${skipped} skipped`);
-    if (executed < stage.floor) reason.push(`${executed} executed below floor ${stage.floor}`);
+    if (byKind.has('failed')) reason.push(`${byKind.get('failed').count} failed`);
+    if (byKind.has('skipped')) reason.push(`${byKind.get('skipped').count} skipped`);
+    if (byKind.has('floor-unmet')) reason.push(`${byKind.get('floor-unmet').actual} executed below floor ${byKind.get('floor-unmet').min}`);
     console.log(`${ok ? 'PASS' : 'FAIL'} ${stage.name}: executed=${executed} skipped=${skipped} failed=${failed} floor=${stage.floor}`);
     if (!ok) console.log(tail(stage.output));
     return { ok, name: stage.name, executed, skipped, failed, floor: stage.floor, reason: reason.join(', ') };

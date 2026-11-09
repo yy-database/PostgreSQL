@@ -28,7 +28,6 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { fork, execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -1331,219 +1330,9 @@ if (options.help) {
 
 // -------------------------------------------------------------------------------
 // Corpus identity. The seed and the statement generator fully determine the
-// corpus, so the digest is computed before any process starts.
-// -------------------------------------------------------------------------------
-const corpus = generateCorpus(options.seed);
-const digest = crypto.createHash('sha256').update(JSON.stringify(corpus)).digest('hex');
-const selected = options.only ? corpus.filter((item) => item.name === options.only) : corpus;
-if (options.only && selected.length === 0) throw new Error(`no case named '${options.only}'`);
-
-if (corpus.length !== options.count) {
-    process.stderr.write(
-        [
-            `corpus gate failed: the generator produced ${corpus.length} cases but --count declared ${options.count}`,
-            `  seed ${options.seed}`,
-            `  digest ${digest}`,
-            '',
-            'The corpus is generated from the seed, so --count must equal the generated length.',
-            '',
-        ].join('\n'),
-    );
-    process.exit(1);
-}
-
-// -------------------------------------------------------------------------------
-// Harness shadow comparison. `HARNESS_SHADOW=1` compares the existing path with
-// `database.harness` through the native addon and exits before any engine
-// starts. The repository keeps its existing path until the comparison is clean.
-// -------------------------------------------------------------------------------
-if (process.env.HARNESS_SHADOW === '1') {
-    const { createRequire } = await import('node:module');
-    const require = createRequire(import.meta.url);
-    const platformDirectory = path.join(
-        repositoryRoot,
-        'projects',
-        'postgres.ts',
-        'platforms',
-        `postgres-${process.platform}-${process.arch}`,
-    );
-    const addon = require(process.env.POSTGRES_NATIVE || platformDirectory);
-
-    const failures = [];
-    const compare = (label, legacy, candidate) => {
-        if (legacy !== candidate) failures.push({ label, legacy, candidate });
-    };
-
-    const stored = loadBaseline();
-    const identity = {
-        spec: { version: stored.version, seed: stored.seed, count: stored.count },
-        digest: stored.digest,
-    };
-    const entries = stored.entries.map((entry) => ({
-        key: entryKey(entry),
-        signal: entry.signal,
-        reason: entry.reason,
-    }));
-    const harnessBaseline = { identity, entries };
-
-    const legacyIdentityKind = (message) => {
-        if (message.startsWith('seed:')) return 'seed-drift';
-        if (message.startsWith('count:')) return 'count-drift';
-        if (message.startsWith('corpus digest:')) return 'digest-drift';
-        throw new Error(`unknown identity problem: ${message}`);
-    };
-    const legacyLedgerKind = (message) => {
-        if (message.startsWith('unexpected difference that the known-difference baseline does not explain')) return 'unlisted';
-        if (message.startsWith('known difference changed shape:')) return 'signal-changed';
-        if (message.startsWith('baseline entry no longer differs:')) return 'stale';
-        throw new Error(`unknown ledger problem: ${message}`);
-    };
-
-    const scenario = (label, currentIdentity, observedEntries) => {
-        const legacyIdentityProblems = identityProblems(stored, {
-            seed: currentIdentity.spec.seed,
-            count: currentIdentity.spec.count,
-            digest: currentIdentity.digest,
-        });
-        const legacyVerdict = checkBaseline(
-            stored.entries,
-            observedEntries.map((entry) => ({ entry, boundary: { statement: 'shadow probe' } })),
-        );
-        const verdict = JSON.parse(
-            addon.harnessCheckBaseline(
-                JSON.stringify(harnessBaseline),
-                JSON.stringify(currentIdentity),
-                JSON.stringify(observedEntries.map((entry) => ({
-                    key: entryKey(entry),
-                    signal: entry.signal,
-                    reason: entry.reason,
-                }))),
-            ),
-        );
-        const normalizedLegacy = JSON.stringify({
-            matched: legacyVerdict.matched,
-            problems: [
-                ...legacyIdentityProblems.map(legacyIdentityKind),
-                ...legacyVerdict.problems.map(legacyLedgerKind),
-            ],
-        });
-        const normalizedCandidate = JSON.stringify({
-            matched: verdict.matched,
-            problems: verdict.problems.map((problem) => problem.kind),
-        });
-        compare(`ledger/${label}`, normalizedLegacy, normalizedCandidate);
-        return { legacyVerdict, verdict, normalizedCandidate };
-    };
-
-    const cleanRun = scenario('clean', identity, stored.entries);
-
-    const unlistedEntry = {
-        kind: 'shadow',
-        id: 'shadow/unlisted',
-        name: 'shadow-unlisted',
-        statement: 'SELECT 1',
-        cluster: 'shadow',
-        reason: 'unlisted',
-        signal: ['shadow probe'],
-    };
-    const unlistedRun = scenario('unlisted', identity, [...stored.entries, unlistedEntry]);
-
-    const changed = { ...stored.entries[0], signal: [...stored.entries[0].signal, 'shadow-extra'] };
-    const changedRun = scenario('signal-changed', identity, [changed, ...stored.entries.slice(1)]);
-
-    const staleRun = scenario('stale', identity, stored.entries.slice(0, -1));
-
-    const driftRun = scenario('identity-drift', {
-        spec: { ...identity.spec, seed: identity.spec.seed + 1 },
-        digest: identity.digest,
-    }, stored.entries);
-
-    const nodeDigest = digest;
-    const harnessDigest = addon.harnessDigest(Buffer.from(JSON.stringify(corpus)));
-    compare('digest/node', nodeDigest, harnessDigest);
-    compare('digest/baseline', stored.digest, harnessDigest);
-
-    const legacyReport = {
-        version: 1,
-        command: 'corpus',
-        corpus: {
-            spec: identity.spec,
-            digest: harnessDigest,
-            matched: cleanRun.legacyVerdict.matched,
-            problems: [],
-            clean: true,
-        },
-    };
-    const legacyText = `${JSON.stringify(legacyReport, null, 2)}\n`;
-    const candidateText = addon.harnessRenderReport(JSON.stringify(legacyReport));
-    compare('report/corpus', legacyText, candidateText);
-
-    console.log(JSON.stringify({
-        digest: nodeDigest,
-        scenarios: {
-            clean: cleanRun.normalizedCandidate,
-            unlisted: unlistedRun.normalizedCandidate,
-            'signal-changed': changedRun.normalizedCandidate,
-            stale: staleRun.normalizedCandidate,
-            'identity-drift': driftRun.normalizedCandidate,
-        },
-        failures,
-    }, null, 2));
-    if (failures.length > 0) {
-        process.stderr.write(`harness shadow mismatch: ${failures.length} difference(s)\n`);
-        process.exit(1);
-    }
-    process.exit(0);
-}
-
-// -------------------------------------------------------------------------------
-// Known differences. The baseline is the only allowed set of differences. Each
-// entry names one case, why it is expected to differ and the exact signal seen
-// when the baseline was generated. `--check` runs this before any engine starts.
-// -------------------------------------------------------------------------------
-function loadBaseline() {
-    let parsed;
-    try {
-        parsed = JSON.parse(fs.readFileSync(baselineFile, 'utf8'));
-    } catch (error) {
-        throw new Error(`cannot read the differential baseline at ${baselineFile}: ${error.message}`);
-    }
-    if (parsed.version !== BASELINE_VERSION) {
-        throw new Error(`baseline version ${parsed.version} is not supported, expected ${BASELINE_VERSION}`);
-    }
-    return parsed;
-}
-
-function identityProblems(baseline, expected) {
-    const problems = [];
-    if (baseline.seed !== expected.seed) problems.push(`seed: baseline ${baseline.seed}, current ${expected.seed}`);
-    if (baseline.count !== expected.count) problems.push(`count: baseline ${baseline.count}, current ${expected.count}`);
-    if (baseline.digest !== expected.digest) {
-        problems.push(`corpus digest: baseline ${baseline.digest}, current ${expected.digest}`);
-    }
-    return problems;
-}
-
-const baseline = options.check ? loadBaseline() : null;
-if (baseline) {
-    const problems = identityProblems(baseline, { seed: options.seed, count: options.count, digest });
-    if (problems.length > 0) {
-        process.stderr.write(
-            [
-                'corpus gate failed: the generated corpus no longer matches the baseline',
-                ...problems.map((problem) => `  ${problem}`),
-                '',
-                'The corpus changed without regenerating the baseline. Review the change and run:',
-                `  pnpm corpus -- --seed ${options.seed} --count ${options.count} --update-baseline`,
-                '',
-            ].join('\n'),
-        );
-        process.exit(1);
-    }
-}
-
-// -------------------------------------------------------------------------------
-// Repository client. Build the two artifacts on demand so one command is enough.
+// corpus, so the digest is computed before any process starts. The digest runs
+// in `database.harness` through the napi primitive `harnessDigest`; the binding
+// is built on demand first, so one command is enough on a fresh checkout.
 // -------------------------------------------------------------------------------
 const platformKey = `${process.platform}-${process.arch}`;
 const bindings = {
@@ -1566,6 +1355,98 @@ function ensureBuilt() {
 ensureBuilt();
 const { loadNative } = await import(pathToFileURL(path.join(packageDir, 'dist', 'native.js')).href);
 const nativeModule = loadNative();
+
+const corpus = generateCorpus(options.seed);
+const digest = nativeModule.harnessDigest(Buffer.from(JSON.stringify(corpus)));
+const selected = options.only ? corpus.filter((item) => item.name === options.only) : corpus;
+if (options.only && selected.length === 0) throw new Error(`no case named '${options.only}'`);
+
+if (corpus.length !== options.count) {
+    process.stderr.write(
+        [
+            `corpus gate failed: the generator produced ${corpus.length} cases but --count declared ${options.count}`,
+            `  seed ${options.seed}`,
+            `  digest ${digest}`,
+            '',
+            'The corpus is generated from the seed, so --count must equal the generated length.',
+            '',
+        ].join('\n'),
+    );
+    process.exit(1);
+}
+
+// -------------------------------------------------------------------------------
+// Known differences. The baseline is the only allowed set of differences. Each
+// entry names one case, why it is expected to differ and the exact signal seen
+// when the baseline was generated. `--check` runs this before any engine starts.
+// -------------------------------------------------------------------------------
+function loadBaseline() {
+    let parsed;
+    try {
+        parsed = JSON.parse(fs.readFileSync(baselineFile, 'utf8'));
+    } catch (error) {
+        throw new Error(`cannot read the differential baseline at ${baselineFile}: ${error.message}`);
+    }
+    if (parsed.version !== BASELINE_VERSION) {
+        throw new Error(`baseline version ${parsed.version} is not supported, expected ${BASELINE_VERSION}`);
+    }
+    return parsed;
+}
+
+// Ledger and identity decisions run in `database.harness` through the napi
+// primitive `harnessCheckBaseline`; this file only maps verdicts onto the
+// human-readable CLI wording.
+function harnessBaselineJson(stored) {
+    return JSON.stringify({
+        identity: { spec: { version: stored.version, seed: stored.seed, count: stored.count }, digest: stored.digest },
+        entries: stored.entries.map((entry) => ({ key: entryKey(entry), signal: [...entry.signal], reason: entry.reason })),
+    });
+}
+
+function harnessCurrentJson(stored, seed, count, digestValue) {
+    return JSON.stringify({ spec: { version: stored.version, seed, count }, digest: digestValue });
+}
+
+const PROBLEM_TEXT = {
+    'seed-drift': (problem) => `seed: baseline ${problem.baseline}, current ${problem.current}`,
+    'count-drift': (problem) => `count: baseline ${problem.baseline}, current ${problem.current}`,
+    'digest-drift': (problem) => `corpus digest: baseline ${problem.baseline}, current ${problem.current}`,
+};
+
+const baseline = options.check ? loadBaseline() : null;
+if (baseline) {
+    // Identity-only check: an empty entry set keeps the verdict to drift problems,
+    // the ledger itself is judged after the run in `checkBaseline`.
+    const verdict = JSON.parse(
+        nativeModule.harnessCheckBaseline(
+            JSON.stringify({
+                identity: { spec: { version: baseline.version, seed: baseline.seed, count: baseline.count }, digest: baseline.digest },
+                entries: [],
+            }),
+            harnessCurrentJson(baseline, options.seed, options.count, digest),
+            JSON.stringify([]),
+        ),
+    );
+    const problems = verdict.problems.map((problem) => PROBLEM_TEXT[problem.kind](problem));
+    if (problems.length > 0) {
+        process.stderr.write(
+            [
+                'corpus gate failed: the generated corpus no longer matches the baseline',
+                ...problems.map((problem) => `  ${problem}`),
+                '',
+                'The corpus changed without regenerating the baseline. Review the change and run:',
+                `  pnpm corpus -- --seed ${options.seed} --count ${options.count} --update-baseline`,
+                '',
+            ].join('\n'),
+        );
+        process.exit(1);
+    }
+}
+
+// -------------------------------------------------------------------------------
+// Repository client. The binding was built and loaded above for the corpus
+// digest; `nativeModule` is the installed public client used by every run.
+// -------------------------------------------------------------------------------
 
 // -------------------------------------------------------------------------------
 // Oracle process.
@@ -1956,7 +1837,7 @@ runtime.kill();
 // Gate.
 // -------------------------------------------------------------------------------
 function sha256(value) {
-    return crypto.createHash('sha256').update(value).digest('hex');
+    return nativeModule.harnessDigest(Buffer.from(value));
 }
 
 function repoText(side) {
@@ -2070,27 +1951,27 @@ function describeStale(entry) {
     ].join('\n');
 }
 
-function checkBaseline(entries, observed) {
-    const listed = new Map(entries.map((entry) => [entryKey(entry), entry]));
-    const seen = new Set();
-    const problems = [];
-    let matched = 0;
-    for (const item of observed) {
-        const key = entryKey(item.entry);
-        seen.add(key);
-        const expected = listed.get(key);
-        if (!expected) {
-            problems.push(describeUnexpected(item));
-        } else if (JSON.stringify(expected.signal) !== JSON.stringify(item.entry.signal)) {
-            problems.push(describeChanged(expected, item));
-        } else {
-            matched += 1;
-        }
-    }
-    for (const entry of entries) {
-        if (!seen.has(entryKey(entry))) problems.push(describeStale(entry));
-    }
-    return { problems, matched };
+function checkBaseline(observed) {
+    const observedByKey = new Map(observed.map((item) => [entryKey(item.entry), item]));
+    const entriesByKey = new Map(baseline.entries.map((entry) => [entryKey(entry), entry]));
+    const verdict = JSON.parse(
+        nativeModule.harnessCheckBaseline(
+            harnessBaselineJson(baseline),
+            harnessCurrentJson(baseline, options.seed, options.count, digest),
+            JSON.stringify(observed.map((item) => ({
+                key: entryKey(item.entry),
+                signal: [...item.entry.signal],
+                reason: item.entry.reason,
+            }))),
+        ),
+    );
+    const problems = verdict.problems.map((problem) => {
+        if (problem.kind === 'unlisted') return describeUnexpected(observedByKey.get(problem.key));
+        if (problem.kind === 'signal-changed') return describeChanged(entriesByKey.get(problem.key), observedByKey.get(problem.key));
+        if (problem.kind === 'stale') return describeStale(entriesByKey.get(problem.key));
+        return PROBLEM_TEXT[problem.kind](problem);
+    });
+    return { problems, matched: verdict.matched };
 }
 
 function isolationProblems() {
@@ -2150,7 +2031,7 @@ if (options.updateBaseline) {
 }
 
 if (options.check) {
-    const result = checkBaseline(baseline.entries, observed);
+    const result = checkBaseline(observed);
     const problems = [...isolationState.problems, ...result.problems];
     const ok = problems.length === 0;
     const summary = ok
