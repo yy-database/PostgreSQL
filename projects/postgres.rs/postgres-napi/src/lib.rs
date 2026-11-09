@@ -12,7 +12,8 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use database::harness::{
-    Baseline, BaselineIdentity, DifferenceObservation, Digest, Floor, ReportEnvelope, SuiteSummary, check_baseline, render_json, verdict,
+    Baseline, BaselineIdentity, DifferenceObservation, Digest, Floor, ReportEnvelope, SuiteSummary, check_baseline,
+    render_json, verdict,
 };
 use database_client::pgsql::{
     ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
