@@ -146,17 +146,27 @@ jobs:
               npm_config_*|NPM_CONFIG_*) unset "${key}" || true ;;
             esac
           done < <(env)
+          # Any leftover classic auth (_auth / _authToken) blocks OIDC. The previous
+          # failure still showed `_auth = (protected)` after only stripping _authToken.
           for f in "${HOME}/.npmrc" "${GITHUB_WORKSPACE}/.npmrc" "${NPM_CONFIG_USERCONFIG:-}" "${RUNNER_TEMP:-}/.npmrc"; do
             [[ -n "${f}" && -f "${f}" ]] || continue
-            if grep -qE '_authToken|^[[:space:]]*//registry\.npmjs\.org/:_authToken' "${f}"; then
-              grep -vE '_authToken|^[[:space:]]*//registry\.npmjs\.org/:_authToken' "${f}" > "${f}.oidc"
+            if grep -qE '(^|/)(_auth|_authToken|_password|username)(=|:)' "${f}"; then
+              grep -vE '(^|/)(_auth|_authToken|_password|username)(=|:)' "${f}" > "${f}.oidc" || true
               mv "${f}.oidc" "${f}"
-              echo "stripped _authToken from ${f}"
+              echo "stripped classic auth lines from ${f}"
             fi
+          done
+          for key in _auth _authToken //registry.npmjs.org/:_auth //registry.npmjs.org/:_authToken; do
+            npm config delete "${key}" >/dev/null 2>&1 || true
           done
           test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
           test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
           echo "OIDC request URL present"
+          if npm config list -l | grep -E '(^|/)(_auth|_authToken)\s*='; then
+            echo "classic npm auth still present after cleanup" >&2
+            npm config list -l | grep -E 'registry|auth|_auth|oidc|provenance' || true
+            exit 1
+          fi
           npm config list -l | grep -E 'registry|auth|_auth|oidc|provenance' || true
       - name: Publish packages to npm
         shell: bash
@@ -168,6 +178,9 @@ jobs:
               npm_config_*|NPM_CONFIG_*) unset "${key}" || true ;;
             esac
           done < <(env)
+          for key in _auth _authToken //registry.npmjs.org/:_auth //registry.npmjs.org/:_authToken; do
+            npm config delete "${key}" >/dev/null 2>&1 || true
+          done
           VERSION="${RELEASE_TAG#v}"
           # Call the local binary directly — `pnpm exec` re-injects npm_config_*.
           ./node_modules/.bin/nifty publish --access public --tag latest --version="$VERSION" | tee "$RUNNER_TEMP/nifty-publish.log"
