@@ -65,7 +65,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: projects/postgres.rs
-      - name: Clippy
+      - name: clippy
         run: cargo clippy --release --manifest-path projects/postgres.rs/Cargo.toml --workspace --all-targets -- -D warnings
   toolchain-health:
     name: toolchain health

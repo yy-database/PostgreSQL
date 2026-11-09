@@ -57,6 +57,8 @@ jobs:
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
       - uses: dtolnay/rust-toolchain@nightly
       - run: rustc --version && cargo --version
       - uses: pnpm/action-setup@v6
@@ -65,6 +67,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+          # Do not set registry-url: it writes _authToken into npmrc and blocks OIDC.
       - run: pnpm install --no-frozen-lockfile
       - name: Build N-API
         env:
@@ -82,11 +85,16 @@ jobs:
     needs: [check-rust, check-typescript, check-python, build-native]
     runs-on: ubuntu-latest
     environment: NPM_PUBLISH
+    permissions:
+      contents: read
+      id-token: write
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
       - uses: pnpm/action-setup@v6
         with:
           version: 10.18.3
@@ -94,10 +102,14 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
+          # Do not set registry-url: it writes _authToken into npmrc and blocks OIDC.
       - uses: dtolnay/rust-toolchain@nightly
       - run: rustc --version && cargo --version
       - name: Upgrade npm for Trusted Publisher support
-        run: npm install --global npm@11
+        run: |
+          npm install --global npm@11
+          node -v
+          npm -v
       - run: pnpm install --no-frozen-lockfile
       - name: Download native artifacts
         uses: actions/download-artifact@v8
@@ -122,5 +134,42 @@ jobs:
             ls -la "$dest"
           done
       - run: pnpm run build:ts
+      - name: Strip token-style npmrc (OIDC only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset NODE_AUTH_TOKEN NPM_TOKEN || true
+          for f in "${HOME}/.npmrc" "${NPM_CONFIG_USERCONFIG:-}" "${RUNNER_TEMP:-}/.npmrc"; do
+            [[ -n "${f}" && -f "${f}" ]] || continue
+            if grep -q '_authToken' "${f}"; then
+              grep -v '_authToken' "${f}" > "${f}.oidc" && mv "${f}.oidc" "${f}"
+              echo "stripped _authToken from ${f}"
+            fi
+          done
       - name: Publish packages to npm
-        run: pnpm exec nifty publish --access public --tag latest --version="${RELEASE_TAG#v}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset NODE_AUTH_TOKEN NPM_TOKEN || true
+          VERSION="${RELEASE_TAG#v}"
+          pnpm exec nifty publish --access public --tag latest --version="$VERSION" | tee "$RUNNER_TEMP/nifty-publish.log"
+          # nifty exits 0 when it skips packages that are "already live"; refuse a green
+          # job unless every intended public package actually lands on the registry.
+          EXPECTED=(
+            @yydb/postgres
+            @yydb/postgres-darwin-arm64
+            @yydb/postgres-darwin-x64
+            @yydb/postgres-linux-x64
+            @yydb/postgres-win32-x64
+          )
+          for pkg in "${EXPECTED[@]}"; do
+            ok=0
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              if got="$(npm view "$pkg@$VERSION" version 2>/dev/null)" && [[ "$got" == "$VERSION" ]]; then
+                ok=1
+                break
+              fi
+              sleep 15
+            done
+            test "$ok" -eq 1
+          done
