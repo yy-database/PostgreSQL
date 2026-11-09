@@ -107,7 +107,8 @@ jobs:
       - run: rustc --version && cargo --version
       - name: Upgrade npm for Trusted Publisher support
         run: |
-          npm install --global npm@11
+          # Trusted Publisher needs npm >= 11.5.1; pin latest so OIDC stays current.
+          npm install --global npm@latest
           node -v
           npm -v
       - run: pnpm install --no-frozen-lockfile
@@ -134,20 +135,12 @@ jobs:
             ls -la "$dest"
           done
       - run: pnpm run build:ts
-      - name: Prepare OIDC-only npm (no token, no pnpm npm_config leak)
+      - name: Strip token-style npmrc (OIDC only)
         shell: bash
         run: |
           set -euo pipefail
           unset NODE_AUTH_TOKEN NPM_TOKEN || true
-          # pnpm injects npm_config_* (e.g. verify-deps-before-run) that make npm 11
-          # skip Trusted Publisher OIDC and fall back to ENEEDAUTH.
-          while IFS='=' read -r key _; do
-            case "${key}" in
-              npm_config_*|NPM_CONFIG_*) unset "${key}" || true ;;
-            esac
-          done < <(env)
-          # Any leftover classic auth (_auth / _authToken) blocks OIDC. The previous
-          # failure still showed `_auth = (protected)` after only stripping _authToken.
+          # setup-node / leftover npmrc `_authToken` makes npm skip OIDC and fail with ENEEDAUTH.
           for f in "${HOME}/.npmrc" "${GITHUB_WORKSPACE}/.npmrc" "${NPM_CONFIG_USERCONFIG:-}" "${RUNNER_TEMP:-}/.npmrc"; do
             [[ -n "${f}" && -f "${f}" ]] || continue
             if grep -qE '(^|/)(_auth|_authToken|_password|username)(=|:)' "${f}"; then
@@ -156,39 +149,38 @@ jobs:
               echo "stripped classic auth lines from ${f}"
             fi
           done
-          for key in _auth _authToken //registry.npmjs.org/:_auth //registry.npmjs.org/:_authToken; do
-            npm config delete "${key}" >/dev/null 2>&1 || true
-          done
           test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
           test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
           echo "OIDC request URL present"
-          # `npm config list -l` always prints `_auth = (protected)` for the key
-          # itself — that is not a set credential. Only the non-default listing
-          # (and on-disk npmrc) show real classic auth.
-          if npm config list | grep -E '(^|/)(_auth|_authToken)\s*='; then
-            echo "classic npm auth still present after cleanup" >&2
-            npm config list | grep -E 'registry|auth|_auth|oidc|provenance' || true
-            exit 1
-          fi
-          npm config list | grep -E 'registry|auth|_auth|oidc|provenance' || true
       - name: Publish packages to npm
         shell: bash
         run: |
           set -euo pipefail
+          # Do not set NODE_AUTH_TOKEN — even empty — or npm skips Trusted Publisher OIDC.
           unset NODE_AUTH_TOKEN NPM_TOKEN || true
-          while IFS='=' read -r key _; do
-            case "${key}" in
-              npm_config_*|NPM_CONFIG_*) unset "${key}" || true ;;
-            esac
-          done < <(env)
-          for key in _auth _authToken //registry.npmjs.org/:_auth //registry.npmjs.org/:_authToken; do
-            npm config delete "${key}" >/dev/null 2>&1 || true
-          done
           VERSION="${RELEASE_TAG#v}"
-          # Call the local binary directly — `pnpm exec` re-injects npm_config_*.
-          ./node_modules/.bin/nifty publish --access public --tag latest --version="$VERSION" | tee "$RUNNER_TEMP/nifty-publish.log"
-          # nifty exits 0 when it skips packages that are "already live"; refuse a green
-          # job unless every intended public package actually lands on the registry.
+          # Same path as yydb `scripts/publish-npm-packages.mjs`: plain `npm publish` per
+          # package dir. nifty 0.1.10 hardcodes a misleading trust-repo hint and has been
+          # failing OIDC here even when Trusted Publisher claims match.
+          DIRS=(
+            projects/postgres.ts/platforms/postgres-win32-x64
+            projects/postgres.ts/platforms/postgres-linux-x64
+            projects/postgres.ts/platforms/postgres-darwin-x64
+            projects/postgres.ts/platforms/postgres-darwin-arm64
+            projects/postgres.ts/packages/postgres
+          )
+          for dir in "${DIRS[@]}"; do
+            name="$(node -p "require('./${dir}/package.json').name")"
+            ver="$(node -p "require('./${dir}/package.json').version")"
+            test "$ver" = "$VERSION"
+            if got="$(npm view "${name}@${VERSION}" version 2>/dev/null)" && [[ "$got" == "$VERSION" ]]; then
+              echo "skip ${name}@${VERSION} (already published)"
+              continue
+            fi
+            echo "publish ${name}@${VERSION}"
+            # Publish from the package directory — this is a pnpm workspace, not npm workspaces.
+            (cd "$dir" && npm publish --access public --tag latest)
+          done
           EXPECTED=(
             @yydb/postgres
             @yydb/postgres-darwin-arm64
