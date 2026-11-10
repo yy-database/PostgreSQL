@@ -8,7 +8,7 @@
 // Run: `pnpm --dir projects/postgres.ts/examples/vs-js-libraries benchmark`
 // Env: BENCH_ROWS (200), BENCH_POINT (500), BENCH_SCAN (1000), BENCH_PREPARED (500),
 //      BENCH_ROUNDS (3), BENCH2_ROWS (200), BENCH_ORDER (50), BENCH_GROUP (50),
-//      BENCH_JOIN (50), BENCH_BATCH (100)
+//      BENCH_JOIN (50), BENCH_BATCH (100), BENCH_RANGE (100), BENCH_MUTATE (200), BENCH_UPSERT (200)
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -19,6 +19,7 @@ import { loadNative } from "../../../packages/postgres/dist/index.js";
 import { openNativeClient } from "../src/native-client.mjs";
 import { openPgClient } from "../src/pg-client.mjs";
 import { startPgServer } from "../src/pg-server.mjs";
+import { bench2RowTuple } from "../src/sql.mjs";
 import { elapsedMs, throughput } from "../src/timing.mjs";
 
 const exampleRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -47,6 +48,9 @@ const ORDER_OPS = readInt("BENCH_ORDER", 50, 1);
 const GROUP_OPS = readInt("BENCH_GROUP", 50, 1);
 const JOIN_OPS = readInt("BENCH_JOIN", 50, 1);
 const BATCH = readInt("BENCH_BATCH", 100, 1);
+const RANGE_OPS = readInt("BENCH_RANGE", 100, 1);
+const MUTATE_OPS = readInt("BENCH_MUTATE", 200, 1);
+const UPSERT_OPS = readInt("BENCH_UPSERT", 200, 1);
 
 const GROUP_SIZE = 10;
 const GROUP_COUNT = Math.ceil(BENCH2_ROWS / GROUP_SIZE);
@@ -61,7 +65,42 @@ const WORKLOADS = [
   "group-by",
   "join",
   "batch-insert",
+  "distinct",
+  "aggregate",
+  "subquery",
+  "index-range",
+  "upsert",
+  "update",
+  "delete",
+  "rollback",
 ];
+const BENCH_SEEDED = new Set([
+  "point-uk",
+  "order-limit",
+  "group-by",
+  "join",
+  "distinct",
+  "aggregate",
+  "subquery",
+  "index-range",
+  "upsert",
+  "update",
+  "delete",
+  "rollback",
+]);
+
+/** `bench` 的 `val` 由 `bench2RowTuple` 的 `(id * 137) % 997` 决定。 */
+function expectedSubqueryRows() {
+  let count = 0;
+  for (let id = 1; id <= BENCH2_ROWS; id += 1) if ((id * 137) % 997 > 500) count += 1;
+  return count;
+}
+
+function expectedIndexRangeRows() {
+  let count = 0;
+  for (let id = 1; id <= BENCH2_ROWS; id += 1) if (id >= 100 && id <= 199) count += 1;
+  return count;
+}
 const CLIENTS = [
   { key: "pg", open: openPgClient },
   { key: "@yydb/postgres", open: openNativeClient },
@@ -84,7 +123,7 @@ async function runRound(clientSpec, workload) {
       if (workload === "batch-insert") {
         // 批量写入从空 `bench` 开始，计时区内灌满 `BENCH_ROWS` 行。
         await client.createBench(0, BATCH);
-      } else if (workload === "point-uk" || workload === "order-limit" || workload === "group-by" || workload === "join") {
+      } else if (BENCH_SEEDED.has(workload)) {
         await client.createBench(BENCH2_ROWS, BATCH);
       }
 
@@ -139,6 +178,58 @@ async function runRound(clientSpec, workload) {
           inserted += touched;
         }
         ops = inserted;
+      } else if (workload === "distinct") {
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const rows = await client.query("SELECT DISTINCT grp FROM bench");
+          if (rows !== GROUP_COUNT) throw new Error(`distinct groups=${rows} expected=${GROUP_COUNT}`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "aggregate") {
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const rows = await client.query("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM bench");
+          if (rows !== 1) throw new Error(`aggregate rows=${rows} expected=1`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "subquery") {
+        const expected = expectedSubqueryRows();
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const rows = await client.query("SELECT COUNT(*) FROM bench WHERE id IN (SELECT id FROM bench WHERE val > 500)");
+          if (rows !== 1) throw new Error(`subquery rows=${rows} expected=1 (${expected} matches)`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "index-range") {
+        const expected = expectedIndexRangeRows();
+        for (let index = 0; index < RANGE_OPS; index += 1) {
+          const rows = await client.query("SELECT id FROM bench WHERE uk BETWEEN 100 AND 199");
+          if (rows !== expected) throw new Error(`index-range rows=${rows} expected=${expected}`);
+        }
+        ops = RANGE_OPS;
+      } else if (workload === "upsert") {
+        for (let index = 0; index < UPSERT_OPS; index += 1) {
+          const id = (index % BENCH2_ROWS) + 1;
+          await client.query(`INSERT INTO bench VALUES ${bench2RowTuple(id)} ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val`);
+        }
+        ops = UPSERT_OPS;
+      } else if (workload === "update") {
+        for (let index = 0; index < MUTATE_OPS; index += 1) {
+          const id = (index % BENCH2_ROWS) + 1;
+          await client.query(`UPDATE bench SET val = val + 1 WHERE id = ${id}`);
+        }
+        ops = MUTATE_OPS;
+      } else if (workload === "delete") {
+        for (let index = 0; index < MUTATE_OPS; index += 1) {
+          const id = (index % BENCH2_ROWS) + 1;
+          await client.query(`DELETE FROM bench WHERE id = ${id}`);
+        }
+        ops = MUTATE_OPS;
+      } else if (workload === "rollback") {
+        await client.query("BEGIN");
+        for (let index = 0; index < MUTATE_OPS; index += 1) {
+          const id = 1_000_000 + index;
+          await client.query(`INSERT INTO bench VALUES (${id}, ${id}, 0, 0, 'rollback-${index}')`);
+        }
+        await client.query("ROLLBACK");
+        ops = MUTATE_OPS;
       } else {
         throw new Error(`unknown workload ${workload}`);
       }
@@ -270,7 +361,7 @@ function markdownReport(results, source) {
   return `# Benchmark report
 
 Command: \`pnpm --dir projects/postgres.ts/examples/vs-js-libraries benchmark\`
-Defaults: \`BENCH_ROWS=${ROWS}\`, \`BENCH_POINT=${POINT_OPS}\`, \`BENCH_SCAN=${SCAN_ROWS}\`, \`BENCH_PREPARED=${PREPARED_OPS}\`, \`BENCH_ROUNDS=${ROUNDS}\`, \`BENCH2_ROWS=${BENCH2_ROWS}\`, \`BENCH_ORDER=${ORDER_OPS}\`, \`BENCH_GROUP=${GROUP_OPS}\`, \`BENCH_JOIN=${JOIN_OPS}\`, \`BENCH_BATCH=${BATCH}\`
+Defaults: \`BENCH_ROWS=${ROWS}\`, \`BENCH_POINT=${POINT_OPS}\`, \`BENCH_SCAN=${SCAN_ROWS}\`, \`BENCH_PREPARED=${PREPARED_OPS}\`, \`BENCH_ROUNDS=${ROUNDS}\`, \`BENCH2_ROWS=${BENCH2_ROWS}\`, \`BENCH_ORDER=${ORDER_OPS}\`, \`BENCH_GROUP=${GROUP_OPS}\`, \`BENCH_JOIN=${JOIN_OPS}\`, \`BENCH_BATCH=${BATCH}\`, \`BENCH_RANGE=${RANGE_OPS}\`, \`BENCH_MUTATE=${MUTATE_OPS}\`, \`BENCH_UPSERT=${UPSERT_OPS}\`
 Baseline: \`pg\` (one \`pg.Client\` connection) = \`1.00x\`
 Ratio: subject_time / baseline_time (smaller is faster). Fastest cell in each row is bold.
 统计口径：median/p95 由 \`database.harness\` 的 nearest-rank 判定计算（经本仓 napi 直通 \`harnessBenchSummary\`），JS 侧不另写一份。
@@ -293,7 +384,7 @@ ${relativeLines}
 
 ${absoluteLines}
 
-An op is one inserted row, one point query, one scanned row, one prepared execution, one ordered-limit statement, one grouping statement, one join statement, or one batched row.
+An op is one inserted row, one point query, one scanned row, one prepared execution, one ordered-limit statement, one grouping statement, one join statement, one distinct projection, one aggregate projection, one subquery, one indexed range statement, one upsert, one update, one delete, one rolled-back insert, or one batched row.
 One warmup round runs before the measured rounds. The table reports median and p95 of ${ROUNDS} measured rounds.
 
 ## Intentional deltas
@@ -304,6 +395,7 @@ One warmup round runs before the measured rounds. The table reports median and p
 - Every measured round starts a fresh child server and a fresh \`mkdtemp\` data directory. Table creation and seeding happen before timing, and the client is closed and the server killed after the timed region.
 - The native prepared path is \`prepare\` plus \`executePrepared\`. The pg prepared path is a named query that prepares on first use, and that preparation call is outside the timed region.
 - \`point-uk\`, \`order-limit\`, \`group-by\`, \`join\` and \`batch-insert\` run against the shared \`bench\`/\`bench_join\` shape of \`benchmark-vs-postgres16.mjs\`: \`uk\` carries the unique index, \`(val DESC, id)\` carries the ordered index, \`grp\` has no index.
+- The SQL-feature rows (\`distinct\`, \`aggregate\`, \`subquery\`, \`index-range\`, \`upsert\`, \`update\`, \`delete\`, \`rollback\`) also run on the shared \`bench\` shape. Both clients send the same literal SQL; their \`query\` wrapper only exposes the returned row count, so aggregate and subquery values are asserted in the SQLite side's benchmark, while this side pins the row-count shape and the client/server ratio.
 
 Regenerate: \`pnpm --dir projects/postgres.ts/examples/vs-js-libraries benchmark\`
 `;
