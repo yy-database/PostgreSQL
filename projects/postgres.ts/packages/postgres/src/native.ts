@@ -209,6 +209,12 @@ export interface ServerStoreChange {
 /** One durable server data directory: `.yyds` catalog, `.yykv` shard and lock. */
 export interface ServerStore {
     scan(namespace: string, prefix: Buffer, after: Buffer | null, before: Buffer | null, limit: number): StoreRow[];
+    /**
+     * Flat transfer form of `scan`: `u32le` row count, then per row `u32le`
+     * key length, `u32le` value length, key bytes, value bytes. Same rows, same
+     * order, one boundary crossing instead of per-row objects.
+     */
+    scanFlat(namespace: string, prefix: Buffer, after: Buffer | null, before: Buffer | null, limit: number): Buffer;
     commitChanges(changes: ServerStoreChange[]): void;
     close(): void;
     durableAtomicCommit(): boolean;
@@ -224,6 +230,15 @@ export interface CommandOptions extends ClientOptions {
     headers: boolean;
     separator: string;
     nullValue: string;
+}
+
+/** Median/p95/extremes of one millisecond sample set, computed by `database.harness`. */
+export interface BenchStats {
+    medianMs: number;
+    p95Ms: number;
+    minMs: number;
+    maxMs: number;
+    rounds: number;
 }
 
 /** The primitive surface exported by the native binding. */
@@ -273,6 +288,10 @@ export interface PostgresNative {
     encodeBytea(bytes: Buffer): string;
     parsePsqlArguments(args: string[]): CommandOptions;
     formatPsqlResults(results: StatementResult[], options: CommandOptions): string[];
+    /** median/p95/极值，nearest-rank 判定在上游 `database.harness` 统一维护。 */
+    harnessBenchSummary(samplesMs: number[]): BenchStats;
+    /** 单次操作的归一毫秒（median / ops）；`ops` 为 0 时返回 NaN。 */
+    harnessBenchPerOp(stats: BenchStats, ops: number): number;
     Store: new (dataDir: string) => Store;
     ServerStore: new (dataDir: string) => ServerStore;
 }

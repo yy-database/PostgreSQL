@@ -12,8 +12,8 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use database::harness::{
-    Baseline, BaselineIdentity, DifferenceObservation, Digest, GatePolicy, ReportEnvelope, SuiteReport, check_baseline,
-    evaluate, render_json,
+    Baseline, BaselineIdentity, DifferenceObservation, Digest, GatePolicy, ReportEnvelope, Stats, SuiteReport, check_baseline,
+    evaluate, per_op_ms, render_json, summarize,
 };
 use database_client::pgsql::{
     ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
@@ -952,6 +952,37 @@ impl ServerStore {
         })
     }
 
+    /// Flat transfer form of [`Self::scan`]: one `Buffer` for the whole result.
+    ///
+    /// Layout is `u32le` row count, then per row `u32le` key length, `u32le`
+    /// value length, key bytes, value bytes. One boundary crossing replaces the
+    /// per-row object and the two per-row `Buffer` copies, which is what a
+    /// thousand-row relation load pays for; the caller reads rows as zero-copy
+    /// views. The bytes are the same rows `scan` returns, in the same order.
+    #[napi]
+    pub fn scan_flat(
+        &self,
+        namespace: String,
+        prefix: Buffer,
+        after: Option<Buffer>,
+        before: Option<Buffer>,
+        limit: u32,
+    ) -> Result<Buffer> {
+        let rows = with_server_store(&self.inner, |store| {
+            store.scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize).map_err(native)
+        })?;
+        let mut bytes: Vec<u8> =
+            Vec::with_capacity(4 + rows.iter().map(|row| 8 + row.key.len() + row.value.len()).sum::<usize>());
+        bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for row in &rows {
+            bytes.extend_from_slice(&(row.key.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(row.value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&row.key);
+            bytes.extend_from_slice(&row.value);
+        }
+        Ok(Buffer::from(bytes))
+    }
+
     /// Applies one batch as a single durable atomic commit.
     #[napi]
     pub fn commit_changes(&self, changes: Vec<ServerStoreChange>) -> Result<()> {
@@ -1056,4 +1087,48 @@ pub fn harness_evaluate_gate(input_json: String) -> Result<String> {
     let input: GateInput = serde_json::from_str(&input_json).map_err(harness_error)?;
     let gate = evaluate(&input.suites, &input.policy);
     serde_json::to_string(&gate).map_err(harness_error)
+}
+
+/// 基准统计的 JS 形态。字段名由本 DTO 负责 camelCase，核心 `Stats` 说 Rust。
+#[napi(object)]
+pub struct BenchStatsJson {
+    pub median_ms: f64,
+    pub p95_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub rounds: u32,
+}
+
+impl From<Stats> for BenchStatsJson {
+    fn from(stats: Stats) -> Self {
+        Self {
+            median_ms: stats.median_ms,
+            p95_ms: stats.p95_ms,
+            min_ms: stats.min_ms,
+            max_ms: stats.max_ms,
+            rounds: stats.rounds,
+        }
+    }
+}
+
+/// 对一组毫秒样本求 median/p95/极值（nearest-rank，判定公式在上游 `database.harness`
+/// 的 golden vector 钉死），基准脚本的统计口径统一走这里，不在 JS 侧另写一份。
+#[napi]
+pub fn harness_bench_summary(samples_ms: Vec<f64>) -> BenchStatsJson {
+    summarize(&samples_ms).into()
+}
+
+/// 单次操作的归一毫秒（median / ops）。`ops` 为 0 时返回 NaN。
+#[napi]
+pub fn harness_bench_per_op(stats: BenchStatsJson, ops: u32) -> f64 {
+    per_op_ms(
+        &Stats {
+            median_ms: stats.median_ms,
+            p95_ms: stats.p95_ms,
+            min_ms: stats.min_ms,
+            max_ms: stats.max_ms,
+            rounds: stats.rounds,
+        },
+        u64::from(ops),
+    )
 }
