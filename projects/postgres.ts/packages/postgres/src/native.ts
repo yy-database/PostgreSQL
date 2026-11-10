@@ -309,13 +309,16 @@ export function platformKey(platform = process.platform, arch = process.arch): P
 export function loadNative(): PostgresNative {
     const key = platformKey();
     if (!key) throw new Error(`PostgreSQL native binding is unavailable for ${process.platform}-${process.arch}`);
+    // A checkout builds the addon into the sibling platform package, so prefer it
+    // over the optional dependency: the registry copy can lag behind the sources
+    // the tests are exercising.
+    const repo = resolve(packageRoot, '..', '..', '..', '..');
+    const local = join(repo, 'projects', 'postgres.ts', 'platforms', `postgres-${key}`);
+    if (existsSync(join(local, 'package.json'))) return require(local) as PostgresNative;
     const platformPackage = `@yydb/postgres-${key}`;
     try {
         return require(platformPackage) as PostgresNative;
     } catch (error) {
-        const repo = resolve(packageRoot, '..', '..', '..', '..');
-        const local = join(repo, 'projects', 'postgres.ts', 'platforms', `postgres-${key}`);
-        if (existsSync(join(local, 'package.json'))) return require(local) as PostgresNative;
         throw new Error(
             `cannot resolve ${platformPackage}: install the matching platform package (${(error as Error).message})`,
         );
