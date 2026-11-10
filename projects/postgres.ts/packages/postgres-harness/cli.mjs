@@ -163,7 +163,7 @@ function tail(output) {
 }
 
 // Stage floor verdicts run in `database.harness` through the napi primitive
-// `harnessSuiteVerdict`; the binding is loaded lazily because the native stage
+// `harnessEvaluateGate`; the binding is loaded lazily because the native stage
 // builds it on fresh checkouts.
 let harnessBinding = null;
 function loadHarnessBinding() {
@@ -177,10 +177,32 @@ function loadHarnessBinding() {
 
 function report(stage) {
     const { executed, skipped, failed } = stage.counts;
-    const gate = JSON.parse(loadHarnessBinding().harnessSuiteVerdict(
-        JSON.stringify({ cases: executed, assertions: 0, passed: Math.max(executed - failed - skipped, 0), failed, skipped }),
-        JSON.stringify([{ metric: 'cases', min: stage.floor }]),
-    ));
+    const passed = Math.max(executed - failed - skipped, 0);
+    const gate = JSON.parse(loadHarnessBinding().harnessEvaluateGate(JSON.stringify({
+        suites: [
+            {
+                name: stage.name,
+                tally: {
+                    cases: executed,
+                    assertions: 0,
+                    attempts: executed,
+                    passed,
+                    failed,
+                    skipped,
+                    unverified: 0,
+                    unavailable: 0,
+                    timed_out: 0,
+                    cancelled: 0,
+                    crashed: 0,
+                    not_run: 0,
+                },
+                floors: [{ metric: 'cases', min: stage.floor }],
+                oracle: { required: false, available: false, provenance: null },
+                baseline: 'none',
+            },
+        ],
+        policy: { allow_partial: false, allow_skipped: false, required_suites: [] },
+    })));
     const ok = gate.ok;
     const byKind = new Map(gate.problems.map((problem) => [problem.kind, problem]));
     const reason = [];

@@ -16,9 +16,10 @@ name = "postgres_napi"
 [dependencies]
 napi = { workspace = true }
 napi-derive = { workspace = true }
-database-client = { git = "https://github.com/oovm/database.rs.git", rev = "382a408623166924dbd0fcfbb7f438170ad3a0e9" }
-database-protocol-pgsql = { git = "https://github.com/oovm/database.rs.git", rev = "382a408623166924dbd0fcfbb7f438170ad3a0e9" }
-database = { git = "https://github.com/oovm/database.rs.git", rev = "382a408623166924dbd0fcfbb7f438170ad3a0e9", default-features = false, features = ["harness"] }
+database-client = { git = "https://github.com/oovm/database.rs.git", rev = "0d688fe8526171b4a7a5398489cfb73f74fae5b2" }
+database-protocol-pgsql = { git = "https://github.com/oovm/database.rs.git", rev = "0d688fe8526171b4a7a5398489cfb73f74fae5b2" }
+database = { git = "https://github.com/oovm/database.rs.git", rev = "0d688fe8526171b4a7a5398489cfb73f74fae5b2", default-features = false, features = ["harness"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]

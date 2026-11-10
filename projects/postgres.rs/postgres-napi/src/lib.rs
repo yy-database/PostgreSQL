@@ -12,8 +12,8 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use database::harness::{
-    Baseline, BaselineIdentity, DifferenceObservation, Digest, Floor, ReportEnvelope, SuiteSummary, check_baseline,
-    render_json, verdict,
+    Baseline, BaselineIdentity, DifferenceObservation, Digest, GatePolicy, ReportEnvelope, SuiteReport, check_baseline,
+    evaluate, render_json,
 };
 use database_client::pgsql::{
     ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
@@ -1038,16 +1038,22 @@ pub fn harness_render_report(report_json: String) -> Result<String> {
     render_json(&report).map_err(harness_error)
 }
 
-/// 按 floor 门禁判定套件计数。
+/// 门禁判定：消费执行状态、oracle 资格、证据与 floors，失败关闭，不用单个
+/// `ok` 掩盖未验证项。
 ///
-/// `summary_json` 是 `SuiteSummary` 的 serde 形态（`cases` / `assertions` /
-/// `passed` / `failed` / `skipped`）；`floors_json` 是 `Vec<Floor>` 形态
-/// （如 `[{"metric":"cases","min":80}]`）。测试输出解析与 floor 数值由调用方
-/// 持有，本函数只做判定：skipped 即红、failed 记问题、逐条 floor 比较。
+/// `input_json` 是 `{ "suites": [SuiteReport..], "policy": GatePolicy }` 的
+/// serde 形态（核心类型 snake_case 字段），返回 `GateVerdict` 的 JSON。测试
+/// 输出解析与 floor 数值由调用方持有，判定算法在上游 `database.harness` 统一
+/// 维护：skipped 即红、failed 记问题、逐条 floor 比较，任一问题即 `ok = false`。
 #[napi]
-pub fn harness_suite_verdict(summary_json: String, floors_json: String) -> Result<String> {
-    let summary: SuiteSummary = serde_json::from_str(&summary_json).map_err(harness_error)?;
-    let floors: Vec<Floor> = serde_json::from_str(&floors_json).map_err(harness_error)?;
-    let gate = verdict(&summary, &floors);
+pub fn harness_evaluate_gate(input_json: String) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct GateInput {
+        suites: Vec<SuiteReport>,
+        #[serde(default)]
+        policy: GatePolicy,
+    }
+    let input: GateInput = serde_json::from_str(&input_json).map_err(harness_error)?;
+    let gate = evaluate(&input.suites, &input.policy);
     serde_json::to_string(&gate).map_err(harness_error)
 }
