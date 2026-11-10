@@ -445,7 +445,8 @@ class Session {
 
     start(): void {
         this.socket.on('data', (chunk: Buffer) => {
-            this.buffer = Buffer.concat([this.buffer, chunk]);
+            // 当没有残留字节时直接复用入站 chunk，省掉一次 `Buffer.concat` 的拷贝。
+            this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
             this.pump();
         });
         this.socket.on('error', () => this.destroy());
@@ -520,6 +521,19 @@ class Session {
     }
 
     private pump(): void {
+        // 一轮处理里产生的所有回包合并成一次 flush：扩展协议的 ParseComplete、
+        // BindComplete、RowDescription、DataRow、CommandComplete 与 ReadyForQuery
+        // 各是一次 `socket.write`，cork 把它们压进同一次系统调用。
+        // `finally` 保证提前返回（等更多字节、锁挂起）时已写的回包照常发出。
+        this.socket.cork();
+        try {
+            this.pumpMessages();
+        } finally {
+            this.socket.uncork();
+        }
+    }
+
+    private pumpMessages(): void {
         while (!this.closing && !this.suspended) {
             if (this.startupPhase) {
                 if (this.buffer.length < 4) return;

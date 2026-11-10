@@ -15,6 +15,21 @@ import {
 const EMPTY = Buffer.alloc(0);
 const decoder = new TextDecoder();
 
+/** One stored row read as a zero-copy view over the flat `scanFlat` payload. */
+function readFlatRows(payload: Buffer): StoredRow[] {
+    const count = payload.readUInt32LE(0);
+    const rows: StoredRow[] = [];
+    let offset = 4;
+    for (let index = 0; index < count; index += 1) {
+        const keyLength = payload.readUInt32LE(offset);
+        const valueLength = payload.readUInt32LE(offset + 4);
+        offset += 8;
+        rows.push({ key: payload.subarray(offset, offset + keyLength), value: payload.subarray(offset + keyLength, offset + keyLength + valueLength) });
+        offset += keyLength + valueLength;
+    }
+    return rows;
+}
+
 /** One `ServerStore` handle exposed as the engine's narrow storage interface. */
 export function storageFor(store: ServerStore): Storage {
     return {
@@ -25,12 +40,16 @@ export function storageFor(store: ServerStore): Storage {
             before?: Uint8Array | null,
             limit?: number,
         ): StoredRow[] {
-            return store.scan(
-                namespace,
-                prefix === undefined ? EMPTY : Buffer.from(prefix),
-                after === undefined || after === null ? null : Buffer.from(after),
-                before === undefined || before === null ? null : Buffer.from(before),
-                limit ?? 0,
+            // 扁平传输：整段结果一次跨边界，行是零拷贝视图。千行级关系加载
+            // 付的是每行对象加两次 `Buffer` 拷贝的成本，这里一次压掉。
+            return readFlatRows(
+                store.scanFlat(
+                    namespace,
+                    prefix === undefined ? EMPTY : Buffer.from(prefix),
+                    after === undefined || after === null ? null : Buffer.from(after),
+                    before === undefined || before === null ? null : Buffer.from(before),
+                    limit ?? 0,
+                ),
             );
         },
         commitChanges(changes: StoredChange[]): void {
