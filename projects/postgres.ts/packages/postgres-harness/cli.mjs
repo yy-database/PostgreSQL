@@ -201,7 +201,10 @@ function report(stage) {
                 baseline: 'none',
             },
         ],
-        policy: { allow_partial: false, allow_skipped: false, required_suites: [] },
+        // The Rust stage only compiles the two binding crates, so it contributes
+        // no cases by design (`stages/rust.mjs` documents the floor of 0). Every
+        // other stage must still prove a non-empty suite.
+        policy: { allow_partial: false, allow_skipped: false, allow_empty_suites: stage.name === 'rust', required_suites: [] },
     })));
     const ok = gate.ok;
     const byKind = new Map(gate.problems.map((problem) => [problem.kind, problem]));
