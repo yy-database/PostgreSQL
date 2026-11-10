@@ -41,7 +41,7 @@ function waitForPort(child) {
  */
 export async function startPgServer(options = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "postgres-example-"));
-  const child = spawn(process.execPath, [serverScript], {
+  const child = spawn(process.execPath, [...(options.execArgv ?? []), serverScript], {
     cwd: path.dirname(fileURLToPath(import.meta.url)),
     env: {
       ...process.env,

@@ -4,76 +4,49 @@
 方法：服务端子进程加 `--cpu-prof --cpu-prof-interval=100`，按 self time 归并到阶段，除以语句数得到 µs/语句；客户端在同一台机器上，`idle` 是等回包的往返时间。
 本报告只记录服务端 CPU 采样，不含客户端驱动自身开销；绝对值与基准脚本的 ms/语句不可直接相加。
 
-## 结论
+## Provenance
 
-固定开销的大头不是解析、计划或行编码，而是每语句重复做的三件事：载入并深拷贝 catalog（原生 scan + `JSON.parse` + `structuredClone`）、原生扫描（catalog 与索引）、以及协议消息多次 `socket.write`。
-三条改动的依据都来自这张表：无序列时跳过序列命名空间扫描、只读隐式语句不再克隆快照、一条语句的协议消息合并成一次写。
+- node `v24.18.0`，rustc `rustc 1.101.0-nightly (1c3a65069 2026-11-02)`，本仓 rev `3b9d08d`，database.rs 钉住 rev `0d688fe`
+- 采样 4713 帧，采样总时长 2018.7 ms，实测 0.134 ms/语句
 
-| 阶段 | 改动前 µs/语句 | 改动后 µs/语句 | 变化 |
-|-----:|---------------:|---------------:|-----:|
-| 原生扫描（catalog、索引、行数据） | 232.9 | 163.7 | −69.2 |
-| socket 写入（`writeBuffer`、写封装） | 67.8 | 37.7 | −30.1 |
-| 网络往返等待（`idle`） | 86.6 | 79.1 | −7.5 |
-| catalog 克隆（`clone`） | 48.4 | 0.0 | −48.4 |
-| catalog 深拷贝（`structuredClone`） | 49.6 | 14.4 | −35.2 |
-| 打开数据库（`open`） | 24.5 | 18.1 | −6.4 |
-| 语句切分（`scanStatements`） | 12.1 | 7.7 | −4.4 |
-| catalog 载入（`loadCatalog`） | 10.8 | 10.7 | −0.1 |
-| 解析（切词、`parsePrimary`、注释跳过） | 11.7 | 9.2 | −2.5 |
-| 计划与执行（索引选择、解码、过滤、聚合） | 40.3 | 32.2 | −8.1 |
-| 行文本编码与字段描述 | 6.1 | 5.0 | −1.1 |
-| GC | 10.5 | 8.4 | −2.1 |
-| 事件循环与其余杂项 | 160.0 | 118.2 | −41.8 |
-| **合计（采样）** | **761.3** | **504.4** | **−33.7%** |
+## 阶段拆分
 
-同一脚本的实测：0.722 ms/语句 → 0.473 ms/语句；基准脚本的 `point-pk` 0.900 ms/语句 → 0.527 ms/语句。
+| 阶段 | µs/语句 | 占比 |
+|-----:|--------:|-----:|
+| 原生扫描（catalog、索引、行数据） | 16.9 | 12.6% |
+| socket 写入（`writeBuffer`、写封装） | 17.7 | 13.2% |
+| 网络往返等待（`idle`） | 21.0 | 15.6% |
+| catalog 克隆（`clone`） | 0.0 | 0.0% |
+| catalog 深拷贝（`structuredClone`） | 0.0 | 0.0% |
+| 打开数据库（`open`） | 15.6 | 11.6% |
+| 语句切分（`scanStatements`） | 2.3 | 1.7% |
+| catalog 载入（`loadCatalog`） | 6.8 | 5.1% |
+| 解析（切词、`parsePrimary`、注释跳过） | 7.4 | 5.5% |
+| 计划与执行（索引选择、解码、过滤、聚合） | 12.3 | 9.1% |
+| 行文本编码与字段描述 | 2.9 | 2.2% |
+| GC | 2.9 | 2.1% |
+| 事件循环与其余杂项 | 28.7 | 21.3% |
+| **合计（采样）** | **134.6** | 100.0% |
 
-## 第二轮：扫描上限与角色写时复制
+## 事件循环与杂项的 top 帧
 
-第一轮把固定开销压到 504.4 µs/语句后，剩下的四块是原生扫描、事件循环与杂项、网络往返、catalog 深拷贝。这一轮只动能改在正确位置的两块：原生扫描的调用形态，和角色表的深拷贝。网络往返是一问一答的固有成本，事件循环杂项里没有可删的让步点，catalog 不做跨语句缓存。
+| 帧 | µs/语句 |
+|----|--------:|
+| `(program)` @ node 内部 | 6.4 |
+| `nextTick` @ node:internal/process/task_queues | 1.3 |
+| `integerText` @ postgres/dist/server/sql/types.js | 0.8 |
+| `runSimpleBatch` @ postgres/dist/server/server.js | 0.8 |
+| `(anonymous)` @ postgres/dist/server/sql/database.js | 0.5 |
+| `handleSimpleQuery` @ postgres/dist/server/server.js | 0.5 |
+| `(anonymous)` @ postgres/dist/server/sql/database.js | 0.4 |
+| `(anonymous)` @ node 内部 | 0.3 |
+| `(anonymous)` @ postgres/dist/server/server.js | 0.3 |
+| `openImplicit` @ postgres/dist/server/server.js | 0.3 |
+| `nextTick` @ node:internal/process/task_queues | 0.3 |
+| `concat` @ node:buffer | 0.3 |
 
-| 项 | 上一轮 µs/语句 | 本轮 µs/语句 | 依据 |
-|----|---------------:|-------------:|------|
-| 原生扫描 | 163.7 | 107.0 | catalog 扫描给上限 1，唯一索引全键等值扫描给上限 1 |
-| 角色表深拷贝（`structuredClone`） | 14.4 | 0.0 | 角色表默认共享集群目录，首次写入才复制 |
-| 语句总采样 | 504.4 | 504.0 | 采样期间机器被其他任务占满，JS 侧帧整体抬高，抵消了原生扫描的下降 |
-| 同一脚本实测 | 0.473 | 0.459 ms/语句 | 15000 条点查 |
+## 归并规则
 
-同一进程内对真实 store 的原生调用微基准（同一次运行、5 轮中位数，不受跨运行噪声影响）：
+V8 CPU profile 里 napi 调用没有独立 JS 帧，原生耗时记在直接调用它的 JS 帧上：`store.js` 的 scan/commitChanges 包装与 `database.js` 的 `table`/`scanIndex`（含行数据解码）归入原生扫描；`node:net`/`node:internal` 的写帧归入 socket 写入；其余未识别帧归入事件循环与杂项。
 
-| 原生调用 | `limit=0` | `limit=1` |
-|----------|----------:|----------:|
-| `pg_catalog` 扫描（1 行） | 57.4 µs | 11.7 µs |
-| 唯一索引等值（9 字节前缀） | 71.7 µs | 24.3 µs |
-| 有序索引扫描（20 行） | — | 238.8 µs |
-
-`limit=0` 在原生层表示「走完整段」，即使只要第一行也要把命名空间扫完；传 `limit=1` 后原生在命中后即停止。catalog 命名空间只存 `CATALOG_KEY` 一行，唯一索引的全键等值查找最多命中一行，两处给上限都不改变结果集。
-
-角色写时复制覆盖了 `Database` 的构造、`clone`、`restore`、`refreshCommitted`、`commit` 与 `engine.ts` 的三处写入点：`CREATE ROLE` 追加、`ALTER ROLE` 原地改字段、`DROP ROLE` 过滤。共享期间任何写入都先经 `mutableRoles()` 复制，因此未提交的角色变更不会漏给同进程的其他会话，`ROLLBACK` 与 `ROLLBACK TO SAVEPOINT` 各自回到正确的数组。新增门禁用例 `roles/cow` 守住这条不变量。
-
-`scanIndex` 在无未提交写入时不再建 `Map` 再全量排序：原生扫描本身按键字节升序返回，且已按 `limit` 截断。对 20 行的 `order-limit` 影响很小，但 `LIMIT`/`OFFSET` 放大时省掉的是 O(n log n) 的重排。
-
-## `order-limit` 的构成
-
-`SELECT id, val FROM bench ORDER BY val DESC, id LIMIT 20` 在同一轮剖析里拆成三部分：
-
-| 组成 | 数值（本机当时负载下） |
-|------|-----------------------:|
-| 全语句 | 1.017 ms/语句 |
-| 其中原生扫描（catalog + 20 行有序索引） | 333 µs，33% |
-| 点查基线（每语句固定开销） | 0.259 ms/语句 |
-| 每多取一行 | 约 15 µs（原生约 6 µs + 解码投影编码约 9 µs） |
-
-每行成本由 `LIMIT 1 / 20 / 100 / 200` 的斜率得出，原生侧单行约 6 µs、全链路约 15 µs。结论：`order-limit` 剩下的不是键序扫描的排序常数（排序已在上一轮去掉，`LIMIT` 也真实提前停止），而是原生按键顺序逐行取值的固定启动成本加每行成本，再叠加每语句固定开销。原生逐行取值的常数由 `.yykv` 布局与绑定层决定，这一轮不越界改 Rust。
-
-## 依据与取舍
-
-- **catalog 克隆归零**：隐式批次里的只读 `SELECT`/`EXPLAIN` 不修改数据库，跳过 `database.clone()`；写入语句和显式事务仍然克隆，语句级回滚与 `LockWait` 重放不受影响。
-- **原生扫描减少**：catalog 有序列时才扫描序列命名空间，没有序列时这次扫描必然为空。
-- **socket 写合并**：`RowDescription`、每一行 `DataRow`、`CommandComplete` 合并成一次 `socket.write`，小结果集从多次系统调用降到一次。
-- **仍然保留的成本**：`idle` 是真实往返，无法在服务端消除；`loadCatalog` 的 `JSON.parse` 与索引扫描的解码由 `.yykv` 布局与原生接口决定，这一轮不动。
-
-## 口径
-
-- `connect` 比值（0.04x）不可比：真实库每次都做认证与初始化握手，本仓连接极简，该数字不能用来说明服务端性能。
-- 本轮只做服务端 CPU 剖析，不改变 `BENCH_*` 参数；基准数字见 [benchmark-vs-postgres16.md](./benchmark-vs-postgres16.md)。
+Regenerate: `pnpm --dir projects/postgres.ts/examples/vs-js-libraries profile:point`

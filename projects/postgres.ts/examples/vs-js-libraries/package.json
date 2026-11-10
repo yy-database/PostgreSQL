@@ -8,6 +8,7 @@
   "scripts": {
     "test": "node ./tests/conformance.mjs",
     "benchmark": "node ./tests/benchmark.mjs",
-    "benchmark:postgres16": "node ./tests/benchmark-vs-postgres16.mjs"
+    "benchmark:postgres16": "node ./tests/benchmark-vs-postgres16.mjs",
+    "profile:point": "node ./tests/profile-point.mjs"
   }
 }

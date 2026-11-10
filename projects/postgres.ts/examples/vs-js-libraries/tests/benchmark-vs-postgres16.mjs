@@ -12,28 +12,41 @@
 //   BENCH_REAL_HOST（默认 127.0.0.1）
 //   BENCH_REAL_PORT（默认 35432）
 //   BENCH_REAL_USER（默认 postgres）
+//   BENCH_REAL_PASSWORD（缺省交给 libpq 口径的 `PGPASSWORD`）
 //   BENCH_REAL_DATABASE（默认 postgres）
 // 真实库不可达时直接失败，不降级为本仓自比。
 //
+// 统计口径：median/p95 一律走 `database.harness` 的 `harnessBenchSummary`
+// （经本仓 napi 直通），JS 侧不另写一份 nearest-rank。
+//
 // 运行：`pnpm --dir projects/postgres.ts/examples/vs-js-libraries benchmark:postgres16`
 
+import { execFileSync } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
+import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { writeFileSync } from "node:fs";
 
 import pg from "pg";
 
+import { loadNative } from "../../../packages/postgres/dist/index.js";
 import { startPgServer } from "../src/pg-server.mjs";
 
 const exampleRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = join(exampleRoot, "..", "..", "..", "..");
 const { Client } = pg;
+
+const native = loadNative();
+if (typeof native.harnessBenchSummary !== "function") {
+  throw new Error("the native binding must expose `harnessBenchSummary`; rebuild it with `pnpm build:napi`");
+}
 
 const REAL = {
   host: process.env.BENCH_REAL_HOST ?? "127.0.0.1",
   port: Number(process.env.BENCH_REAL_PORT ?? 35_432),
   user: process.env.BENCH_REAL_USER ?? "postgres",
+  password: process.env.BENCH_REAL_PASSWORD,
   database: process.env.BENCH_REAL_DATABASE ?? "postgres",
 };
 
@@ -48,6 +61,7 @@ const UPDATE_STATEMENTS = Number(process.env.BENCH_UPDATE ?? 20);
 const DELETE_STATEMENTS = Number(process.env.BENCH_DELETE ?? 10);
 const ORDER_OPS = Number(process.env.BENCH_ORDER ?? 50);
 const GROUP_OPS = Number(process.env.BENCH_GROUP ?? 50);
+const JOIN_OPS = Number(process.env.BENCH_JOIN ?? 50);
 const TX_COUNT = Number(process.env.BENCH_TX ?? 30);
 const TX_ROWS = Number(process.env.BENCH_TX_ROWS ?? 10);
 const CONNECT_OPS = Number(process.env.BENCH_CONNECT ?? 20);
@@ -63,15 +77,14 @@ function elapsedMs(start) {
   return Number(process.hrtime.bigint() - start) / 1_000_000;
 }
 
+// median/p95 走上游 `database.harness` 的 nearest-rank 判定（经 napi 直通），
+// 与 SQLite 线 `sqlite-harness` 的 `bench` 同一口径。
 function median(samples) {
-  const sorted = [...samples].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  return native.harnessBenchSummary(samples).medianMs;
 }
 
 function p95(samples) {
-  const sorted = [...samples].sort((a, b) => a - b);
-  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)];
+  return native.harnessBenchSummary(samples).p95Ms;
 }
 
 function rowTuple(id) {
@@ -254,6 +267,31 @@ const WORKLOADS = [
     },
   },
   {
+    name: "join",
+    unit: "statements",
+    ops: JOIN_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+      await connection.query("DROP TABLE IF EXISTS bench_join");
+      await connection.query("CREATE TABLE bench_join (id INT NOT NULL PRIMARY KEY, note VARCHAR(40))");
+      const rows = [];
+      for (let id = ID_BASE; id < ID_BASE + DATASET; id += 1) rows.push(`(${id}, 'note-${id}')`);
+      for (let start = 0; start < rows.length; start += MULTI_BATCH) {
+        await connection.query(`INSERT INTO bench_join VALUES ${rows.slice(start, start + MULTI_BATCH).join(", ")}`);
+      }
+    },
+    async run(connection) {
+      for (let index = 0; index < JOIN_OPS; index += 1) {
+        const grp = index % 10;
+        const result = await connection.query(
+          `SELECT b.id, o.note FROM bench b INNER JOIN bench_join o ON o.id = b.id WHERE b.grp = ${grp}`,
+        );
+        if (result.rowCount !== GROUP_SIZE) throw new Error(`join rows=${result.rowCount} grp=${grp}`);
+      }
+      return JOIN_OPS;
+    },
+  },
+  {
     name: "tx-commit",
     unit: "rows",
     ops: TX_COUNT * TX_ROWS,
@@ -307,6 +345,7 @@ async function openReal() {
     host: REAL.host,
     port: REAL.port,
     user: REAL.user,
+    password: REAL.password,
     database: REAL.database,
   });
   await client.connect();
@@ -396,12 +435,44 @@ async function probeSemantics() {
   return { real: realResult, ours: oursResult };
 }
 
+function provenance() {
+  const run = (command, args) => {
+    try {
+      return execFileSync(command, args, { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch {
+      return "n/a";
+    }
+  };
+  const cargoToml = readFileSync(join(repoRoot, "projects", "postgres.rs", "postgres-napi", "Cargo.toml"), "utf8");
+  const pin = /rev = "([0-9a-f]{40})"/.exec(cargoToml)?.[1] ?? "n/a";
+  return {
+    node: process.version,
+    rustc: run("rustc", ["--version"]),
+    rev: run("git", ["rev-parse", "--short", "HEAD"]),
+    databaseRsPin: pin.slice(0, 7),
+    dataset: `数据集 ${DATASET} 行（uk 唯一、grp 每组 ${GROUP_SIZE} 行、(val DESC, id) 索引），固定 seed。`,
+  };
+}
+
 function markdownReport(samples, version, semantics) {
   const lines = [];
   lines.push("# 服务端对服务端：`@yydb/postgres` 与真实 PostgreSQL 16");
   lines.push("");
   lines.push(`真实库：\`${version}\`（\`${REAL.host}:${REAL.port}\`，库 \`${REAL.database}\`）`);
   lines.push("本仓：`@yydb/postgres`（每轮新起子进程服务与临时数据目录）");
+  const source = provenance();
+  lines.push("统计口径：median/p95 由 `database.harness` 的 nearest-rank 判定计算（经本仓 napi 直通 `harnessBenchSummary`），JS 侧不另写一份。");
+  lines.push("");
+  lines.push("## Provenance");
+  lines.push("");
+  lines.push("| 项 | 值 |");
+  lines.push("|----|----|");
+  lines.push(`| node | \`${source.node}\` |`);
+  lines.push(`| rustc | \`${source.rustc}\` |`);
+  lines.push(`| 本仓 rev | \`${source.rev}\` |`);
+  lines.push(`| database.rs 钉住 rev | \`${source.databaseRsPin}\` |`);
+  lines.push(`| 数据规模 | ${source.dataset} |`);
+  lines.push("");
   lines.push(
     "说明：truth corpus 的 SQL 差分基线来自 pglite 0.5.15；本机装有 PostgreSQL 16.15，这次直接用真实服务端。CI 有 `postgres:16` 时用 `BENCH_REAL_*` 指向该实例重跑。",
   );
@@ -453,6 +524,7 @@ function markdownReport(samples, version, semantics) {
     "update-many": UPDATE_STATEMENTS,
     "group-by": GROUP_OPS,
     "order-limit": ORDER_OPS,
+    join: JOIN_OPS,
   };
   for (const [name, count] of Object.entries(statements)) {
     const real = median(samples.get(name).real) / count - floorReal;
@@ -481,6 +553,9 @@ function markdownReport(samples, version, semantics) {
   );
   lines.push(
     `- **条件更新与删除同样是扫描加逐行改写**：\`update-many\` ${(median(samples.get("update-many").ours) / (UPDATE_STATEMENTS * GROUP_SIZE)).toFixed(3)}ms/行、\`delete-many\` ${(median(samples.get("delete-many").ours) / (DELETE_STATEMENTS * GROUP_SIZE)).toFixed(3)}ms/行。`,
+  );
+  lines.push(
+    `- **连接走等值哈希**：\`join\` ${(median(samples.get("join").ours) / JOIN_OPS).toFixed(3)}ms/语句，两侧各整表载入一次，\`ON o.id = b.id\` 的整数等值键建哈希表后逐行探测，不再逐对求值；\`grp\` 仍无索引，过滤在连接之后。`,
   );
   lines.push("");
   lines.push("## 语义差异（不计入性能比值）");
