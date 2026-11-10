@@ -1114,13 +1114,13 @@ impl From<Stats> for BenchStatsJson {
 /// 对一组毫秒样本求 median/p95/极值（nearest-rank，判定公式在上游 `database.harness`
 /// 的 golden vector 钉死），基准脚本的统计口径统一走这里，不在 JS 侧另写一份。
 #[napi]
-pub fn harness_bench_summary(samples_ms: Vec<f64>) -> BenchStatsJson {
-    summarize(&samples_ms).into()
+pub fn harness_bench_summary(samples_ms: Vec<f64>) -> Result<BenchStatsJson> {
+    summarize(&samples_ms).map(Into::into).map_err(harness_error)
 }
 
 /// 单次操作的归一毫秒（median / ops）。`ops` 为 0 时返回 NaN。
 #[napi]
-pub fn harness_bench_per_op(stats: BenchStatsJson, ops: u32) -> f64 {
+pub fn harness_bench_per_op(stats: BenchStatsJson, ops: u32) -> Result<f64> {
     per_op_ms(
         &Stats {
             median_ms: stats.median_ms,
@@ -1131,4 +1131,5 @@ pub fn harness_bench_per_op(stats: BenchStatsJson, ops: u32) -> f64 {
         },
         u64::from(ops),
     )
+    .map_err(harness_error)
 }
