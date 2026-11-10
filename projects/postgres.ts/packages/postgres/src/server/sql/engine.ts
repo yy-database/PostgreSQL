@@ -1182,6 +1182,103 @@ function naturalUsing(left: RowSet, right: RowSet): string[] {
     return names;
 }
 
+/**
+ * 等值连接快路径的键列类型：整数族在 `SqlValue` 里就是 JS number，
+ * `compareValues` 的相等与 `===` 一致，可以安全做哈希键。浮点与 `numeric`
+ * 的比较走另一条语义（NaN、十进制文本），留在逐对求值的路径里。
+ */
+const HASH_JOINABLE_KEYS = new Set(['int2', 'int4', 'int8', 'oid']);
+
+interface EquiPair {
+    leftIndex: number;
+    rightIndex: number;
+}
+
+/** 在单侧列里按（qualifier, name）唯一定位一个可见绑定，歧义或缺失返回 `-1`。 */
+function qualifiedBindingIndex(columns: Binding[], expr: ColumnExpr): number {
+    let found = -1;
+    for (let index = 0; index < columns.length; index += 1) {
+        const column = columns[index]!;
+        if (column.hidden || column.name !== expr.name) continue;
+        if (!matchesAlias(column, expr.qualifier!)) continue;
+        if (found !== -1) return -1;
+        found = index;
+    }
+    return found;
+}
+
+/**
+ * 把 `ON` 拆成可哈希的等值列对与其余合取。
+ *
+ * 只有带限定符的纯列引用 `=` 纯列引用、两侧类型都在整数族、且恰好各归一侧时才进
+ * 哈希计划；歧义引用在这里就按 `42702` 抛出（与逐对求值一致）。任何不满足的形状
+ * 原样退回嵌套循环，语义不变。
+ */
+function planEquiJoin(
+    item: Extract<FromItem, { kind: 'join' }>,
+    left: RowSet,
+    right: RowSet,
+): { pairs: EquiPair[]; rest: Expr[] } | null {
+    if (item.on === undefined) return null;
+    const pairs: EquiPair[] = [];
+    const rest: Expr[] = [];
+    for (const conjunct of flattenConjuncts(item.on)) {
+        if (conjunct.kind !== 'binary' || (conjunct as BinaryExpr).op !== '=') {
+            rest.push(conjunct);
+            continue;
+        }
+        const binary = conjunct as BinaryExpr;
+        if (binary.left.kind !== 'column' || binary.right.kind !== 'column') {
+            rest.push(conjunct);
+            continue;
+        }
+        const first = binary.left as ColumnExpr;
+        const second = binary.right as ColumnExpr;
+        if (first.qualifier === undefined || second.qualifier === undefined) {
+            rest.push(conjunct);
+            continue;
+        }
+        const firstLeft = qualifiedBindingIndex(left.columns, first);
+        const firstRight = qualifiedBindingIndex(right.columns, first);
+        const secondLeft = qualifiedBindingIndex(left.columns, second);
+        const secondRight = qualifiedBindingIndex(right.columns, second);
+        if (firstLeft !== -1 && firstRight !== -1 || firstLeft === -1 && firstRight === -1 || secondLeft !== -1 && secondRight !== -1) {
+            // 歧义或外层引用：原样交给逐对求值，抛出时机与嵌套循环一致。
+            rest.push(conjunct);
+            continue;
+        }
+        const pair: EquiPair | null =
+            firstLeft !== -1 && secondRight !== -1
+                ? { leftIndex: firstLeft, rightIndex: secondRight }
+                : firstRight !== -1 && secondLeft !== -1
+                    ? { leftIndex: secondLeft, rightIndex: firstRight }
+                    : null;
+        if (pair === null) {
+            rest.push(conjunct);
+            continue;
+        }
+        const leftType = left.columns[pair.leftIndex]!.type;
+        const rightType = right.columns[pair.rightIndex]!.type;
+        if (!HASH_JOINABLE_KEYS.has(leftType.key) || !HASH_JOINABLE_KEYS.has(rightType.key)) {
+            rest.push(conjunct);
+            continue;
+        }
+        pairs.push(pair);
+    }
+    return pairs.length > 0 ? { pairs, rest } : null;
+}
+
+/** 一条行的哈希键：整数列直接拼接十进制文本，`null` 行返回 `null` 表示永不匹配。 */
+function hashKey(row: SqlValue[], indexes: number[]): string | null {
+    let key = '';
+    for (const index of indexes) {
+        const value = row[index];
+        if (value === null) return null;
+        key += `${String(value)}\u0000`;
+    }
+    return key;
+}
+
 function onJoin(
     database: Database,
     item: Extract<FromItem, { kind: 'join' }>,
@@ -1194,17 +1291,57 @@ function onJoin(
     const rows: SqlValue[][] = [];
     const leftMatched = new Array<boolean>(left.rows.length).fill(false);
     const rightMatched = new Array<boolean>(right.rows.length).fill(false);
-    for (let leftIndex = 0; leftIndex < left.rows.length; leftIndex += 1) {
-        const leftRow = left.rows[leftIndex]!;
+    const equi = planEquiJoin(item, left, right);
+    if (equi !== null) {
+        // 等值列对建哈希表，把 O(左×右) 的逐对求值压成 O(左+右×命中)。
+        // 其余合取（非等值或不可哈希的等值）只在候选对上求值，语义与嵌套循环一致。
+        const leftIndexes = equi.pairs.map((pair) => pair.leftIndex);
+        const rightIndexes = equi.pairs.map((pair) => pair.rightIndex);
+        const build = new Map<string, number[]>();
         for (let rightIndex = 0; rightIndex < right.rows.length; rightIndex += 1) {
-            const rightRow = right.rows[rightIndex]!;
-            const row = [...leftRow, ...rightRow];
-            const context: Context = { columns, row, outer };
-            const keep = item.on === undefined ? true : evaluate(database, item.on, context, params);
-            if (keep !== true) continue;
-            rows.push(row);
-            leftMatched[leftIndex] = true;
-            rightMatched[rightIndex] = true;
+            const key = hashKey(right.rows[rightIndex]!, rightIndexes);
+            if (key === null) continue;
+            const bucket = build.get(key);
+            if (bucket === undefined) build.set(key, [rightIndex]);
+            else bucket.push(rightIndex);
+        }
+        for (let leftIndex = 0; leftIndex < left.rows.length; leftIndex += 1) {
+            const leftRow = left.rows[leftIndex]!;
+            const key = hashKey(leftRow, leftIndexes);
+            if (key === null) continue;
+            const bucket = build.get(key);
+            if (bucket === undefined) continue;
+            for (const rightIndex of bucket) {
+                const row = [...leftRow, ...right.rows[rightIndex]!];
+                if (equi.rest.length > 0) {
+                    const context: Context = { columns, row, outer };
+                    let keep = true;
+                    for (const conjunct of equi.rest) {
+                        if (evaluate(database, conjunct, context, params) !== true) {
+                            keep = false;
+                            break;
+                        }
+                    }
+                    if (!keep) continue;
+                }
+                rows.push(row);
+                leftMatched[leftIndex] = true;
+                rightMatched[rightIndex] = true;
+            }
+        }
+    } else {
+        for (let leftIndex = 0; leftIndex < left.rows.length; leftIndex += 1) {
+            const leftRow = left.rows[leftIndex]!;
+            for (let rightIndex = 0; rightIndex < right.rows.length; rightIndex += 1) {
+                const rightRow = right.rows[rightIndex]!;
+                const row = [...leftRow, ...rightRow];
+                const context: Context = { columns, row, outer };
+                const keep = item.on === undefined ? true : evaluate(database, item.on, context, params);
+                if (keep !== true) continue;
+                rows.push(row);
+                leftMatched[leftIndex] = true;
+                rightMatched[rightIndex] = true;
+            }
         }
     }
     const rightNulls = right.columns.map(() => null);
