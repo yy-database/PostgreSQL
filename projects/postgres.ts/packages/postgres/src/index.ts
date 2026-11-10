@@ -1,5 +1,9 @@
 export * from './client.ts';
 export * from './cli.ts';
+export * from './errors.ts';
+export * from './options.ts';
+export * from './postgresql.ts';
+export * from './session.ts';
 export * from './server/server.ts';
 export { loadNative, platformKey } from './native.ts';
 export type {
@@ -20,4 +24,7 @@ export type {
     StatementResult,
     Store,
     StoreRow,
+    TypedColumnInfo,
+    TypedExecutionReport,
+    TypedStatementResult,
 } from './native.ts';

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomInt } from 'node:crypto';
 
-import { loadNative, type ServerStore } from '../native.ts';
+import { loadNative } from '../native.ts';
 import { ServerError } from './errors.ts';
 import { cloneDatabase, databasePrefix, purgeDatabase, scopedStorage, storageFor } from './store.ts';
 import { createSessionRuntime, Database, type SessionRuntime, type Storage } from './sql/database.ts';
@@ -1902,77 +1902,132 @@ function rewriteParamTypes(statement: Statement, types: DataType[]): Statement {
     return rewrite(statement) as Statement;
 }
 
+/** One live protocol endpoint attached to a shared engine assembly. */
+export interface PostgresEndpointHandle {
+    host: string;
+    port: number;
+    /** Stops listening and destroys every session on this endpoint. */
+    close(): Promise<void>;
+}
+
+/**
+ * One data directory's engine state: the store lock, the catalogs, the
+ * transaction manager and the notification fan-out shared by every endpoint.
+ */
+export interface PostgresAssembly {
+    dataDir: string;
+    schemaPath: string;
+    /** Attaches one protocol endpoint; sessions on every endpoint drive this engine. */
+    serve(options: PostgresServerOptions): Promise<PostgresEndpointHandle>;
+    /** Closes every endpoint, then releases the data directory lock. */
+    close(): Promise<void>;
+}
+
+/** Takes one data directory's lock, seeds the catalogs and writes the schema projection. */
+export function createPostgresAssembly(dataDir: string): PostgresAssembly {
+    const store = new (loadNative().ServerStore)(dataDir);
+    const committed = storageFor(store);
+    // `local-0.yyds` remains the recovery truth. The projection is refreshed
+    // after the commit that changed schema metadata, so a reader never sees
+    // an export that is ahead of the catalog. A projection failure must not
+    // turn a committed statement into a client-visible error.
+    let clusterReady = false;
+    let cluster: ClusterStore;
+    const storage: Storage = {
+        // 索引访问路径依赖前缀与游标下推到原生层，这里必须原样透传。
+        scan: (namespace, prefix, after, before, limit) => committed.scan(namespace, prefix, after, before, limit),
+        commitChanges: (changes) => {
+            committed.commitChanges(changes);
+            if (!clusterReady || !changes.some((change) => touchesSchema(change.namespace))) return;
+            try {
+                writeSchemaExport(dataDir, committed, cluster.doc.databases.map((database) => database.datname));
+            } catch {
+                // The catalog commit already succeeded; the projection is
+                // rebuilt by the next schema commit or restart.
+            }
+        },
+    };
+    cluster = new ClusterStore(storage);
+    clusterReady = true;
+    writeSchemaExport(dataDir, storage, cluster.doc.databases.map((database) => database.datname));
+
+    const hub: NotificationHub = { sessions: new Set<Session>() };
+    const manager = new TransactionManager();
+    const endpoints = new Set<PostgresEndpointHandle>();
+    let closed = false;
+    return {
+        dataDir,
+        schemaPath: path.join(dataDir, SCHEMA_FILE),
+        serve: (options) =>
+            new Promise<PostgresEndpointHandle>((resolve, reject) => {
+                if (closed) {
+                    reject(new Error('the engine assembly is closed'));
+                    return;
+                }
+                const host = options.host ?? '127.0.0.1';
+                const sockets = new Set<net.Socket>();
+                const server = net.createServer((socket) => {
+                    sockets.add(socket);
+                    socket.on('close', () => sockets.delete(socket));
+                    const session = new Session(socket, options, storage, hub, cluster, manager);
+                    session.start();
+                });
+                const onError = (error: Error): void => {
+                    server.off('error', onError);
+                    reject(error);
+                };
+                server.once('error', onError);
+                server.listen(options.port ?? 0, host, () => {
+                    server.off('error', onError);
+                    const address = server.address();
+                    const port = typeof address === 'object' && address !== null ? address.port : 0;
+                    const endpoint: PostgresEndpointHandle = {
+                        host,
+                        port,
+                        close: () =>
+                            new Promise<void>((done) => {
+                                endpoints.delete(endpoint);
+                                for (const socket of sockets) socket.destroy();
+                                sockets.clear();
+                                server.close(() => done());
+                            }),
+                    };
+                    endpoints.add(endpoint);
+                    resolve(endpoint);
+                });
+            }),
+        close: async () => {
+            if (closed) return;
+            closed = true;
+            for (const endpoint of [...endpoints]) await endpoint.close();
+            endpoints.clear();
+            store.close();
+        },
+    };
+}
+
 /** Starts a protocol-v3 server that accepts real `psql` and `pg` clients. */
 export function startPostgresServer(options: PostgresServerOptions = {}): Promise<PostgresServerHandle> {
-    const dataDir = options.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-data-'));
-    let store: ServerStore;
-    let storage: Storage;
-    let cluster: ClusterStore;
-    let clusterReady = false;
+    let assembly: PostgresAssembly;
     try {
-        store = new (loadNative().ServerStore)(dataDir);
-        const committed = storageFor(store);
-        // `local-0.yyds` remains the recovery truth. The projection is refreshed
-        // after the commit that changed schema metadata, so a reader never sees
-        // an export that is ahead of the catalog. A projection failure must not
-        // turn a committed statement into a client-visible error.
-        storage = {
-            // 索引访问路径依赖前缀与游标下推到原生层，这里必须原样透传。
-            scan: (namespace, prefix, after, before, limit) => committed.scan(namespace, prefix, after, before, limit),
-            commitChanges: (changes) => {
-                committed.commitChanges(changes);
-                if (!clusterReady || !changes.some((change) => touchesSchema(change.namespace))) return;
-                try {
-                    writeSchemaExport(dataDir, committed, cluster.doc.databases.map((database) => database.datname));
-                } catch {
-                    // The catalog commit already succeeded; the projection is
-                    // rebuilt by the next schema commit or restart.
-                }
-            },
-        };
-        cluster = new ClusterStore(storage);
-        clusterReady = true;
-        writeSchemaExport(dataDir, storage, cluster.doc.databases.map((database) => database.datname));
+        assembly = createPostgresAssembly(options.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-data-')));
     } catch (error) {
         return Promise.reject(error);
     }
-
-    const sockets = new Set<net.Socket>();
-    const host = options.host ?? '127.0.0.1';
-    const hub: NotificationHub = { sessions: new Set<Session>() };
-    const manager = new TransactionManager();
-    const server = net.createServer((socket) => {
-        sockets.add(socket);
-        socket.on('close', () => sockets.delete(socket));
-        const session = new Session(socket, options, storage, hub, cluster, manager);
-        session.start();
-    });
-
-    return new Promise((resolve, reject) => {
-        const onError = (error: Error): void => {
-            store.close();
-            reject(error);
-        };
-        server.once('error', onError);
-        server.listen(options.port ?? 0, host, () => {
-            server.off('error', onError);
-            const address = server.address();
-            const port = typeof address === 'object' && address !== null ? address.port : 0;
-            resolve({
-                host,
-                port,
-                dataDir,
-                schemaPath: path.join(dataDir, SCHEMA_FILE),
-                close: () =>
-                    new Promise<void>((done) => {
-                        for (const socket of sockets) socket.destroy();
-                        sockets.clear();
-                        server.close(() => {
-                            store.close();
-                            done();
-                        });
-                    }),
-            });
-        });
-    });
+    return assembly.serve(options).then(
+        (endpoint) => ({
+            host: endpoint.host,
+            port: endpoint.port,
+            dataDir: assembly.dataDir,
+            schemaPath: assembly.schemaPath,
+            close: async () => {
+                await endpoint.close();
+                await assembly.close();
+            },
+        }),
+        async (error: Error) => {
+            await assembly.close();
+            throw error;
+        },
+    );
 }

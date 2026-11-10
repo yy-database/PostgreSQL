@@ -17,6 +17,8 @@ export interface ClientOptions {
     port: number;
     user: string;
     database: string;
+    /** Password for cleartext, MD5 or SCRAM-SHA-256 authentication. */
+    password?: string;
 }
 
 /** The `pid` and `secret key` from `BackendKeyData`, needed for `CancelRequest`. */
@@ -128,6 +130,26 @@ export interface PortalExecReport {
     suspended: boolean;
 }
 
+/** One result column together with the type OID the server assigned. */
+export interface TypedColumnInfo {
+    name: string;
+    typeOid: number;
+}
+
+/** One extended-protocol result set that kept its column type OIDs. */
+export interface TypedStatementResult {
+    columns: TypedColumnInfo[];
+    rows: DataRow[];
+    tag: string;
+}
+
+/** Outcome of one typed extended-protocol round trip. */
+export interface TypedExecutionReport {
+    results: TypedStatementResult[];
+    /** The decoded server error; `null` or `undefined` when the statement succeeded. */
+    error: ErrorInfo | null | undefined;
+}
+
 /** One named prepared statement on a live connection. */
 export interface PreparedStatement {
     name(): string;
@@ -152,6 +174,12 @@ export interface Connection {
     /** Sends a `CancelRequest` on a fresh socket; the main socket stays usable. */
     cancel(): void;
     executeWithParams(sql: string, params: (string | null)[], types: number[]): StatementResult[];
+    /**
+     * Runs one statement through the unnamed extended protocol and keeps each
+     * result column's `RowDescription` type OID. A server error arrives decoded
+     * in `error`; only transport and protocol failures throw.
+     */
+    executeWithParamsTyped(sql: string, params: (string | null)[], types: number[]): TypedExecutionReport;
     /** Runs one statement with explicit text or binary parameters and result formats. */
     executeWithParamFormats(
         sql: string,

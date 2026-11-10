@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { loadNative } from '@yydb/postgres';
+import { loadNative, PostgreSQL, PostgreSQLClient, PostgreSQLError } from '@yydb/postgres';
 
 const native = loadNative();
 
@@ -1404,6 +1404,413 @@ for (const item of loadCase('stress.json')) {
 stressConnection.close();
 
 // -------------------------------------------------------------------------------
+// Authoring surface: the `PostgreSQL` local engine and the `PostgreSQLClient`.
+// --------------------------------------------------------------------------
+const authoringStart = counters.executed;
+
+function assert(condition, message) {
+    if (!condition) throw new Error(message);
+}
+
+async function checkAsync(name, run) {
+    counters.executed += 1;
+    try {
+        await run();
+    } catch (error) {
+        counters.failed += 1;
+        failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
+const authoringDir = path.join(storeRoot, 'authoring');
+fs.rmSync(authoringDir, { recursive: true, force: true });
+fs.mkdirSync(authoringDir, { recursive: true });
+
+// Configuration validation happens in the constructor, before any resource.
+await checkAsync('authoring/local-storage-directory', async () => {
+    let raised = null;
+    try {
+        new PostgreSQL({ storage: { directory: '' } });
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError, 'expected a PostgreSQLError');
+    assert(raised.product === 'postgresql', 'product must be postgresql');
+    assert(raised.phase === 'configuration', 'bad options fail in the configuration phase');
+    assert(raised.execution === 'not-sent', 'configuration failures never reach the server');
+});
+await checkAsync('authoring/client-address-exclusive', async () => {
+    let raised = null;
+    try {
+        new PostgreSQLClient({ url: 'postgresql://localhost/x', endpoint: { host: 'h', port: 1 } });
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.phase === 'configuration', 'url and endpoint must be exclusive');
+});
+await checkAsync('authoring/client-address-required', async () => {
+    let raised = null;
+    try {
+        new PostgreSQLClient({});
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.phase === 'configuration', 'one of url or endpoint is required');
+});
+await checkAsync('authoring/client-url-identity-duplication', async () => {
+    let raised = null;
+    try {
+        new PostgreSQLClient({ url: 'postgresql://u:p@h/db', auth: { username: 'u', password: 'p' } });
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.phase === 'configuration', 'url credentials and auth must not duplicate');
+});
+await checkAsync('authoring/client-tls-rejected', async () => {
+    let raised = null;
+    try {
+        new PostgreSQLClient({ endpoint: { host: 'h', port: 1 }, tls: { serverName: 'h' } });
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.phase === 'configuration', 'tls must be rejected until the binding carries it');
+});
+await checkAsync('authoring/client-url-parsed', async () => {
+    const client = new PostgreSQLClient({ url: `postgresql://${config.user}@${config.host}:${config.port}/${config.database}` });
+    assert(client.state === 'new', 'construction must not connect');
+    await client.connect();
+    assert(client.state === 'ready', 'connect must reach ready');
+    const result = await client.query('select 1 as one');
+    assert(result.rows[0].one === 1, 'url-parsed client must query the server');
+    await client.close();
+    assert(client.state === 'closed', 'close must reach closed');
+});
+await checkAsync('authoring/client-state-guard', async () => {
+    const client = new PostgreSQLClient({ endpoint: { host: config.host, port: config.port } });
+    let raised = null;
+    try {
+        await client.query('select 1');
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.code === '08003' && raised.execution === 'not-sent', 'business calls before connect must fail not-sent');
+});
+
+const local = new PostgreSQL({ storage: { directory: authoringDir } });
+await checkAsync('authoring/local-open', async () => {
+    assert(local.state === 'new', 'construction must not open');
+    await local.open();
+    assert(local.state === 'open', 'open must reach open');
+});
+await checkAsync('authoring/local-open-merges', async () => {
+    await Promise.all([local.open(), local.open()]);
+    assert(local.state === 'open', 'concurrent open joins one operation');
+});
+await checkAsync('authoring/local-query-int4', async () => {
+    const result = await local.query('select 1::int4 as one');
+    assert(result.rows.length === 1 && result.rows[0].one === 1, 'int4 decodes to number');
+    assert(result.columns[0].name === 'one' && result.columns[0].typeOid === 23, 'columns carry name and type OID');
+    assert(result.command === 'SELECT', 'command is the tag verb');
+    assert(result.rowCount === 1n, 'rowCount is a bigint');
+});
+await checkAsync('authoring/local-query-int8', async () => {
+    const result = await local.query('select 9007199254740991::int8 as big');
+    assert(typeof result.rows[0].big === 'bigint' && result.rows[0].big === 9007199254740991n, 'int8 decodes to bigint');
+});
+await checkAsync('authoring/local-query-numeric', async () => {
+    const result = await local.query('select 0.1::numeric(10,3) as n');
+    assert(typeof result.rows[0].n === 'string', 'numeric stays an exact string value');
+    assert(/^\d+\.\d+$/.test(result.rows[0].n), 'numeric text keeps its scale');
+});
+await checkAsync('authoring/local-query-bytea', async () => {
+    const result = await local.query("select '\\x48656c6c6f'::bytea as b");
+    const bytes = result.rows[0].b;
+    assert(bytes instanceof Uint8Array, 'bytea decodes to Uint8Array');
+    assert(String([...bytes]) === '72,101,108,108,111', 'bytea bytes round trip');
+});
+await checkAsync('authoring/local-params-extended', async () => {
+    const result = await local.query('select $1::int8 as v, $2::text as t', [42n, 'x']);
+    assert(result.rows[0].v === 42n, 'bigint binds through the extended protocol');
+    assert(result.rows[0].t === 'x', 'string binds through the extended protocol');
+});
+await checkAsync('authoring/local-param-bytea', async () => {
+    const result = await local.query('select $1::bytea as b', [Uint8Array.from([1, 2, 3])]);
+    assert(result.rows[0].b instanceof Uint8Array && String([...result.rows[0].b]) === '1,2,3', 'Uint8Array binds as bytea');
+});
+await checkAsync('authoring/local-execute-ddl-dml', async () => {
+    const created = await local.execute('create table authoring_probe (id int4 primary key, name text)');
+    assert(created.command === 'CREATE' && created.rowCount === null, 'DDL reports the verb without a row count');
+    const inserted = await local.execute("insert into authoring_probe values (1, 'a'), (2, 'b')");
+    assert(inserted.command === 'INSERT' && inserted.rowCount === 2n, 'INSERT counts rows from the tag');
+});
+await checkAsync('authoring/local-duplicate-column', async () => {
+    let raised = null;
+    try {
+        await local.query('select 1 as a, 2 as a');
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.code === '42701', 'duplicate labels must fail object rows');
+    const arrayed = await local.query('select 1 as a, 2 as a', [], { rowMode: 'array' });
+    assert(String(arrayed.rows[0]) === '1,2', 'array row mode keeps both columns');
+});
+await checkAsync('authoring/local-transaction-commit', async () => {
+    let calls = 0;
+    await local.transaction(async (tx) => {
+        calls += 1;
+        await tx.execute('insert into authoring_probe values (10, $1)', ['t']);
+    });
+    assert(calls === 1, 'the transaction callback runs exactly once');
+    const after = await local.query('select count(*)::int4 as n from authoring_probe');
+    assert(after.rows[0].n === 3, 'committed rows are visible');
+});
+await checkAsync('authoring/local-transaction-rollback', async () => {
+    let calls = 0;
+    let raised = null;
+    try {
+        await local.transaction(async (tx) => {
+            calls += 1;
+            await tx.execute('insert into authoring_probe values (11, $1)', ['r']);
+            throw new Error('boom');
+        });
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof Error && raised.message === 'boom', 'the callback error surfaces');
+    assert(calls === 1, 'a rolled back transaction still ran the callback exactly once');
+    const after = await local.query('select count(*)::int4 as n from authoring_probe');
+    assert(after.rows[0].n === 3, 'rolled back rows are gone');
+});
+await checkAsync('authoring/local-transaction-savepoint', async () => {
+    await local.transaction(async (tx) => {
+        await tx.execute('insert into authoring_probe values (20, $1)', ['o']);
+        let inner = null;
+        try {
+            await tx.transaction(async (sp) => {
+                await sp.execute('insert into authoring_probe values (21, $1)', ['i']);
+                throw new Error('inner');
+            });
+        } catch (error) {
+            inner = error;
+        }
+        assert(inner instanceof Error && inner.message === 'inner', 'the savepoint error surfaces');
+    });
+    const after = await local.query('select count(*)::int4 as n from authoring_probe where id >= 20');
+    assert(after.rows[0].n === 1, 'the savepoint rolled back only its own insert');
+});
+await checkAsync('authoring/local-with-session-temp-table', async () => {
+    await local.withSession(async (session) => {
+        await session.execute('create temp table authoring_tmp (n int4)');
+        await session.execute('insert into authoring_tmp values (5)');
+        const seen = await session.query('select n from authoring_tmp');
+        assert(seen.rows[0].n === 5, 'the session sees its own temp table');
+    });
+});
+await checkAsync('authoring/local-error-envelope', async () => {
+    let raised = null;
+    try {
+        await local.query('select from from');
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError, 'statement failures use the envelope');
+    assert(raised.product === 'postgresql' && raised.code === '42601', 'the SQLSTATE travels with the failure');
+    assert(raised.phase === 'execute' && raised.execution === 'replied' && raised.retry === 'never', 'a server answer is replied and never auto-retried');
+});
+await checkAsync('authoring/local-constraint-envelope', async () => {
+    await local.execute('insert into authoring_probe values (99, $1)', ['dup']);
+    let raised = null;
+    try {
+        await local.execute('insert into authoring_probe values (99, $1)', ['dup']);
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.code === '23505', 'unique violations carry 23505');
+    assert(typeof raised.detail === 'string' && raised.detail.includes('already exists'), 'detail explains the duplicate');
+    assert(raised.constraint === 'authoring_probe_pkey', 'the constraint name travels in the envelope');
+    await local.execute('delete from authoring_probe where id = 99');
+});
+await checkAsync('authoring/local-listener-roundtrip', async () => {
+    const listener = await local.listen({ endpoint: { host: '127.0.0.1', port: 0 } });
+    const remote = new PostgreSQLClient({ endpoint: { host: listener.endpoint.host, port: listener.endpoint.port }, auth: { username: 'postgres', password: 'unused' } });
+    try {
+        assert(listener.endpoint.port > 0, 'listen reports the bound port');
+        await remote.connect();
+        const result = await remote.query('select count(*)::int4 as n from authoring_probe');
+        assert(result.rows[0].n === 4, 'a remote client reads the same engine');
+        await remote.execute('insert into authoring_probe values (30, $1)', ['remote']);
+        const localView = await local.query('select count(*)::int4 as n from authoring_probe');
+        assert(localView.rows[0].n === 5, 'writes through the listener are visible to the engine');
+    } finally {
+        await remote.close().catch(() => undefined);
+        await listener.close().catch(() => undefined);
+    }
+    const stillOpen = await local.query('select 1 as one');
+    assert(stillOpen.rows[0].one === 1, 'closing a listener leaves the engine open');
+});
+await checkAsync('authoring/local-listener-auth', async () => {
+    const listener = await local.listen({ endpoint: { host: '127.0.0.1', port: 0 }, authentication: { password: 'secret' } });
+    const wrong = new PostgreSQLClient({ endpoint: { host: '127.0.0.1', port: listener.endpoint.port }, auth: { username: 'postgres', password: 'wrong' } });
+    let raised = null;
+    try {
+        await wrong.connect();
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.code === '28P01' && raised.phase === 'connect', 'a bad password fails in the connect phase');
+    const right = new PostgreSQLClient({ endpoint: { host: '127.0.0.1', port: listener.endpoint.port }, auth: { username: 'postgres', password: 'secret' } });
+    await right.connect();
+    await right.close();
+    await listener.close();
+});
+await checkAsync('authoring/local-directory-locked', async () => {
+    const rival = new PostgreSQL({ storage: { directory: authoringDir } });
+    let raised = null;
+    try {
+        await rival.open();
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.phase === 'open', 'a second engine over the same directory fails to open');
+});
+await checkAsync('authoring/local-close-cascade', async () => {
+    await local.close();
+    assert(local.state === 'closed', 'close reaches the terminal state');
+    await local.close();
+    assert(local.state === 'closed', 'a repeated close succeeds');
+    let raised = null;
+    try {
+        await local.query('select 1');
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.code === '08003' && raised.execution === 'not-sent', 'calls after close fail not-sent');
+});
+await checkAsync('authoring/local-reopen-durability', async () => {
+    const reopened = new PostgreSQL({ storage: { directory: authoringDir } });
+    try {
+        await reopened.open();
+        const result = await reopened.query('select count(*)::int4 as n from authoring_probe');
+        assert(result.rows[0].n === 5, 'the durable directory keeps rows across open and close');
+    } finally {
+        await reopened.close().catch(() => undefined);
+    }
+});
+
+// The client against the live PostgreSQL core of the harness.
+const oracleClient = new PostgreSQLClient({ url: `postgresql://${config.user}@${config.host}:${config.port}/${config.database}`, pool: { max: 4 } });
+await checkAsync('authoring/oracle-connect', async () => {
+    await oracleClient.connect();
+    assert(oracleClient.state === 'ready', 'connect reaches ready');
+});
+await checkAsync('authoring/oracle-typed-columns', async () => {
+    const result = await oracleClient.query("select 1::int8 as big, 2::int4 as i, 3::numeric(10,2) as n, '\\x0102'::bytea as b, 'select'::text as t, 9007199254740993::int8 as huge");
+    assert(result.rows[0].big === 1n, 'int8 decodes to bigint');
+    assert(result.rows[0].i === 2, 'int4 decodes to number');
+    assert(result.rows[0].n === '3.00', 'numeric keeps the exact string value');
+    assert(result.rows[0].b instanceof Uint8Array && String([...result.rows[0].b]) === '1,2', 'bytea decodes to Uint8Array');
+    assert(result.rows[0].t === 'select', 'text stays a string');
+    assert(result.rows[0].huge === 9007199254740993n, 'int8 keeps full precision beyond 2^53');
+});
+await checkAsync('authoring/oracle-params', async () => {
+    const result = await oracleClient.query('select $1::int8 + 1 as v', [41n]);
+    assert(result.rows[0].v === 42n, 'bigint binds as int8 through the real extended protocol');
+});
+await checkAsync('authoring/oracle-transaction-rollback', async () => {
+    await oracleClient.execute('create table authoring_ten (n int4 primary key)');
+    await oracleClient.execute('insert into authoring_ten values (1), (2), (3)');
+    let raised = null;
+    try {
+        await oracleClient.transaction(async (tx) => {
+            await tx.execute('insert into authoring_ten values (4)');
+            throw new Error('undo');
+        });
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof Error && raised.message === 'undo', 'the callback error surfaces');
+    const after = await oracleClient.query('select count(*)::int8 as c from authoring_ten');
+    assert(after.rows[0].c === 3n, 'the rollback removed the insert');
+});
+await checkAsync('authoring/oracle-constraint-envelope', async () => {
+    let raised = null;
+    try {
+        await oracleClient.execute('insert into authoring_ten values (1)');
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.code === '23505', 'the oracle answers 23505');
+    assert(raised.constraint === 'authoring_ten_pkey', 'the oracle constraint name travels in the envelope');
+});
+await checkAsync('authoring/oracle-returning-via-query', async () => {
+    const result = await oracleClient.query('insert into authoring_ten values (99) returning n');
+    assert(result.rows[0].n === 99, 'RETURNING rows come back through query');
+    assert(!('lastInsertId' in result), 'no fabricated lastInsertId on the envelope');
+    assert(result.command === 'INSERT' && result.rowCount === 1n, 'RETURNING keeps the INSERT tag');
+    await oracleClient.execute('delete from authoring_ten where n = 99');
+});
+await checkAsync('authoring/oracle-iterate-lazy', async () => {
+    await oracleClient.execute('insert into authoring_ten values (4), (5), (6), (7), (8), (9), (10)');
+    const seen = await oracleClient.withSession(async (session) => {
+        const prepared = await session.prepare('select n from authoring_ten order by n');
+        assert(prepared.columns().length === 1 && prepared.columns()[0].name === 'n', 'prepared columns name the result');
+        const collected = [];
+        for await (const row of prepared.iterate([], { batchSize: 3 })) collected.push(row.n);
+        await prepared.close();
+        return collected;
+    });
+    assert(seen.length === 10, 'the portal cursor delivers every row');
+    assert(seen[0] === '1' && seen[9] === '10', 'portal rows arrive in order as wire text');
+});
+await checkAsync('authoring/oracle-iterate-break', async () => {
+    const first = await oracleClient.withSession(async (session) => {
+        const prepared = await session.prepare('select n from authoring_ten order by n');
+        const rows = [];
+        for await (const row of prepared.iterate([], { batchSize: 2 })) {
+            rows.push(row.n);
+            if (rows.length === 3) break;
+        }
+        await prepared.close();
+        const after = await session.query('select count(*)::int8 as c from authoring_ten');
+        return { rows: rows.join(','), after: after.rows[0].c };
+    });
+    assert(first.rows === '1,2,3', 'an early break stops pulling batches');
+    assert(first.after === 10n, 'the session stays usable after the cursor closed');
+});
+await checkAsync('authoring/oracle-prepared-invalidates-with-session', async () => {
+    let escaped = null;
+    await oracleClient.withSession(async (session) => {
+        escaped = await session.prepare('select n from authoring_ten limit 1');
+    });
+    let raised = null;
+    try {
+        for await (const row of escaped.iterate()) void row;
+    } catch (error) {
+        raised = error;
+    }
+    assert(raised instanceof PostgreSQLError && raised.code === '08003', 'handles kept outside the scope become inert');
+});
+await checkAsync('authoring/oracle-close-own-connections', async () => {
+    await oracleClient.close();
+    assert(oracleClient.state === 'closed', 'close reaches closed');
+    const second = new PostgreSQLClient({ endpoint: { host: config.host, port: config.port }, database: config.database });
+    await second.connect();
+    const result = await second.query('select 1 as one');
+    assert(result.rows[0].one === 1, 'closing one client leaves the server reachable');
+    await second.close();
+});
+await checkAsync('authoring/oracle-cleanup', async () => {
+    const cleanup = new PostgreSQLClient({ endpoint: { host: config.host, port: config.port }, database: config.database });
+    await cleanup.connect();
+    await cleanup.execute('drop table authoring_ten');
+    await cleanup.close();
+});
+
+// Safety net: a failed assertion above must not leave open handles behind.
+if (local.state !== 'closed') await local.close().catch(() => undefined);
+await oracleClient.close().catch(() => undefined);
+
+// -------------------------------------------------------------------------------
 // Result.
 // -------------------------------------------------------------------------
 const summary = {
@@ -1415,7 +1822,8 @@ const summary = {
         cli: cliExecuted - paramsExecuted,
         protocol: protocolExecuted - cliExecuted,
         store: storeExecuted - protocolExecuted,
-        stress: counters.executed - storeExecuted,
+        stress: authoringStart - storeExecuted,
+        authoring: counters.executed - authoringStart,
     },
     cases: actual,
     failures,

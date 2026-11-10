@@ -30,6 +30,8 @@ pub struct ClientOptions {
     pub port: u16,
     pub user: String,
     pub database: String,
+    /// Password for cleartext, MD5 or SCRAM-SHA-256 authentication.
+    pub password: Option<String>,
 }
 
 /// The `pid` and `secret key` from `BackendKeyData`, needed for `CancelRequest`.
@@ -154,6 +156,33 @@ pub struct PortalExecReport {
     pub suspended: bool,
 }
 
+/// One result column together with the type OID the server assigned.
+#[napi(object)]
+#[derive(Clone)]
+pub struct TypedColumnInfo {
+    pub name: String,
+    pub type_oid: u32,
+}
+
+/// One extended-protocol result set that kept its column type OIDs.
+#[napi(object)]
+pub struct TypedStatementResult {
+    pub columns: Vec<TypedColumnInfo>,
+    pub rows: Vec<DataRow>,
+    pub tag: String,
+}
+
+/// Outcome of one typed extended-protocol round trip.
+///
+/// A server `ErrorResponse` arrives decoded in `error`; only transport and
+/// protocol failures throw, because those leave the connection unusable.
+#[napi(object)]
+pub struct TypedExecutionReport {
+    pub results: Vec<TypedStatementResult>,
+    /// The decoded server error, or `null` when the statement succeeded.
+    pub error: Option<ErrorInfo>,
+}
+
 /// One stored row.
 #[napi(object)]
 pub struct StoreRow {
@@ -254,6 +283,45 @@ impl Connection {
             .execute_with_params(&sql, &values, &types)
             .map(|results| results.into_iter().map(statement).collect())
             .map_err(native)
+    }
+
+    /// Runs one statement through the unnamed extended-protocol round trip and
+    /// keeps each result column's `RowDescription` type OID.
+    ///
+    /// A server error is returned decoded in `error` instead of thrown, so the
+    /// caller can read `SQLSTATE`, detail and constraint fields. Transport and
+    /// protocol failures still throw because they poison the connection.
+    #[napi]
+    pub fn execute_with_params_typed(
+        &self,
+        sql: String,
+        params: Vec<Option<String>>,
+        types: Vec<u32>,
+    ) -> Result<TypedExecutionReport> {
+        let owned: Vec<PostgresParam<'_>> = params.iter().map(|value| PostgresParam::text(value.as_deref())).collect();
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        match connection.execute_with_param_formats_typed(&sql, &owned, &types, &[]) {
+            Ok(results) => Ok(TypedExecutionReport {
+                results: results
+                    .into_iter()
+                    .map(|result| TypedStatementResult {
+                        columns: result
+                            .columns
+                            .into_iter()
+                            .map(|column| TypedColumnInfo { name: column.name, type_oid: column.type_oid })
+                            .collect(),
+                        rows: result.rows.into_iter().map(|values| DataRow { values }).collect(),
+                        tag: result.tag,
+                    })
+                    .collect(),
+                error: None,
+            }),
+            Err(error @ PostgresError::Server { .. }) => {
+                Ok(TypedExecutionReport { results: Vec::new(), error: error_info(&error) })
+            }
+            Err(error) => Err(native(error)),
+        }
     }
 
     /// Prepares a named statement and describes its parameters and columns.
@@ -490,6 +558,10 @@ impl PreparedStatement {
 #[napi]
 pub fn connect(options: ClientOptions) -> Result<Connection> {
     let config = ClientConfig::new(options.host, options.port, options.user, options.database);
+    let config = match options.password {
+        Some(password) => config.with_password(password),
+        None => config,
+    };
     CoreConnection::open(&config).map(|inner| Connection { inner: Arc::new(Mutex::new(Some(inner))) }).map_err(native)
 }
 
