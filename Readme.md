@@ -14,9 +14,10 @@ surfaces on top.
   from `database-client`'s `pgsql` client.
 - **Wire server.** `startPostgresServer` in
   `projects/postgres.ts/packages/postgres/src/server/` listens on TCP and speaks
-  protocol v3 as the backend: startup, trust or cleartext-password
-  authentication, `SET`, `SHOW`, DDL/DML, the catalog subset `psql` needs for
-  `\dt` and `\d`, and `ErrorResponse` plus `ReadyForQuery` on failure. Rows live
+  protocol v3 as the backend: startup, trust, cleartext-password or
+  SCRAM-SHA-256 authentication, `SET`, `SHOW`, DDL/DML, the catalog subset
+  `psql` needs for `\dt`, `\dv` and `\d`, and `ErrorResponse` plus
+  `ReadyForQuery` on failure. Rows live
   in `.yyds`/`.yykv` through the native `ServerStore` primitive; the SQL parser,
   catalog projection and executor are TypeScript under `server/sql/`, so the
   Rust side keeps no server main loop. `postgres-server --port 5432 --data-dir DIR`
@@ -40,9 +41,8 @@ catalog SQL `psql` sends for `\dt` and `\d`. Types are `int2`/`int4`/`int8`/
 `timestamptz`/`uuid`; constraints are `NOT NULL`, literal `DEFAULT`,
 `PRIMARY KEY` and `UNIQUE`.
 
-Still missing: `numeric`, cursors, `ALTER` beyond constraint operations, views,
-`EXPLAIN`, grouping by a primary key's functional dependency, and ordered-set
-aggregates.
+Still missing: `ALTER` beyond constraint operations, `EXPLAIN`, grouping by a
+primary key's functional dependency, and ordered-set aggregates.
 `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL` joins with `ON` or `USING`, and
 `count`/`sum`/`avg`/`min`/`max`/`string_agg`/`array_agg`/`bool_and`/`bool_or`/
 `every` with `DISTINCT`, `FILTER` and aggregate `ORDER BY`, are gated against
@@ -90,8 +90,11 @@ unchanged and remains unrelated to the client suites.
 
 `postgres-server --port 5432 --data-dir DIR` (or `startPostgresServer`) listens
 on TCP and speaks protocol v3 as the backend. It answers startup,
-`AuthenticationOk` for trust and `AuthenticationCleartextPassword` for
-`--password`, `SET`, `SHOW`, `SELECT`, DDL/DML, and closes on `Terminate`. Every
+`AuthenticationOk` for trust, `AuthenticationCleartextPassword` for
+`--password`, and the `AuthenticationSASL` exchange for `--auth scram`, where
+the verifier stored by `CREATE ROLE ... PASSWORD` / `ALTER ROLE ... PASSWORD`
+is the only accepted credential. It then serves `SET`, `SHOW`, `SELECT`,
+DDL/DML, and closes on `Terminate`. Every
 statement failure is `ErrorResponse` followed by `ReadyForQuery`, so the session
 survives.
 
@@ -99,12 +102,20 @@ Storage layout under `--data-dir`:
 
 - `postmaster.pid` is the lock. A second server started on the same directory
   fails with `lock file "..." already exists: another server owns this data
-  directory` and never starts listening. A hard kill leaves the file behind,
-  exactly like PostgreSQL, so the operator removes it once the old process is
-  gone.
-- `local-0.yyds` holds the catalog document. `local-0.yykv` holds shards; the
-  catalog is `pg_catalog/catalog`, and each user relation is `pg_data.<relOid>`
-  with zero-padded row ids as keys.
+  directory` and never starts listening. The first line records the owning
+  process id. A hard kill leaves the file behind, exactly like PostgreSQL, but
+  the next start reads the recorded pid and checks whether that process is
+  still alive: a live holder keeps the refusal, a dead one has its stale lock
+  reclaimed automatically and the server takes the directory. A clean shutdown
+  — `close()`, `SIGINT` or `SIGTERM` — removes the file.
+- `local-0.yyds` holds the catalog documents. `local-0.yykv` holds the primary
+  shard: the catalog is `pg_catalog/catalog`, the cluster directory is
+  `pg_cluster`, and sequence high-water marks live beside them.
+- Every table and its own indexes live together in
+  `shards/local-<relOid>-<hex database>/`, a self-contained single-shard
+  directory with its own `.yyds`/`.yykv`/`postmaster.pid` files. A DML commit
+  therefore re-encodes only the group it touched, and opening a data directory
+  sweeps unreferenced shard directories.
 - `sql-schema.v0.json` is a `yyds-sql-schema/v0` projection of the same catalogs,
   rewritten atomically after every schema commit so a data directory carries the
   artifact set the yyds gateways expect. It is never read back for recovery, and
@@ -121,8 +132,10 @@ Storage layout under `--data-dir`:
 Two accepted limitations, recorded so the next change does not need a fresh
 investigation:
 
-1. **Whole-shard re-encode.** `FileShard::commit_changes` re-encodes the entire
-   shard on every commit. Splitting one shard per table is the planned fix.
+1. **Per-group commits.** Each table group is its own shard, so a statement that
+   touches several groups commits them one at a time with the catalog ordered
+   last (or first, for a drop). A crash between groups loses at most the
+   unacknowledged statement, but it is not one atomic commit across groups.
 2. **One handle.** One `ServerStore` handle per process owns one data directory.
    Concurrent writers are serialised by the native mutex instead of having a
    shared page cache.
@@ -210,7 +223,11 @@ compared modulo process, transaction, tuple and source-location ids. A client
 that disappears mid-transaction leaves no rows, and a `COMMIT` already on the
 wire completes exactly once.
 
-`numeric`, cursors and `ALTER` remain `0A000` + `DETAIL`.
+`CREATE VIEW`/`DROP VIEW` store the query text, expand it on read, track
+dependencies for `2BP01` and the cascade notices, and project `pg_views`.
+`VACUUM`/`ANALYZE` are accepted as no-ops with PostgreSQL's transaction rule and
+non-table warning. `ALTER` beyond constraint operations remains `0A000` +
+`DETAIL`.
 
 Build cost of bringing `database-storage` (and `vos`) into the native graph,
 measured once on this machine with clean release target directories:
@@ -292,13 +309,14 @@ through `encodeCancelRequest`, including a zero and a negative key pair.
 
 PGlite is not an oracle for cancellation: its socket server consumes the
 packet and closes silently because there is no backend process to signal.
-`statement_timeout` is accepted and reported by `SHOW`, but not enforced: a
-query that ran 5.6 s with `statement_timeout = '100ms'` still completed.
-Therefore `57014 query canceled` cannot be produced by the only engine
-available here; termination semantics are recorded as an **oracle limitation**
-and are not asserted. What is asserted is what the client owns: the packet
-bytes, and that a cancel followed by a normal statement on the same session
-still returns `SELECT 1`.
+The server side enforces `statement_timeout` on its own: a statement that runs
+past its deadline is cancelled at the next row boundary with SQLSTATE `57014`
+(`canceling statement due to statement timeout`), and an open transaction block
+enters the aborted state until `ROLLBACK`, the way PostgreSQL 16 does. `0`, the
+default, disables the deadline. Termination semantics against an external
+engine remain recorded as an **oracle limitation**: what is asserted is what
+the client owns — the packet bytes, and that a cancel followed by a normal
+statement on the same session still returns `SELECT 1`.
 
 **Connection interruption.** A read that ends after a partial result, a frame
 that declares more bytes than arrive, and a peer that closes before
@@ -314,9 +332,9 @@ listener.
 **Timeout and idle.** The socket timeout is a per-read limit, not a session
 deadline: a six-second idle gap leaves the session usable and the next
 statement returns normally. A statement slower than that limit fails the call
-and, through the poison rule above, cannot leave half a result behind. This
-repository has no `statement_timeout` GUC of its own; the boundary it owns is
-the 5 s socket read limit.
+and, through the poison rule above, cannot leave half a result behind. The
+client socket keeps that 5 s per-read limit and is not a statement deadline;
+`statement_timeout` is enforced by the server as described above.
 
 **COPY subprotocol.** `Connection::copy_in(sql, chunks)` writes the chunks as
 `CopyData` only after the server answered `CopyInResponse`, then sends
@@ -391,9 +409,9 @@ full 1 MB payloads plus a parseable `sql-schema.v0.json`. Commits stage a
 temporary snapshot and rename it only after the bytes are durable, so an I/O
 failure before the rename keeps the previous snapshot and no repair step is
 needed. No injected error was used; the volume itself ran out of space. A
-graceful `SIGTERM` still leaves `postmaster.pid` behind, so the operator step
-above (confirm the process is gone, delete the file) applies unchanged and
-automatic stale-lock detection remains out of scope here.
+graceful `SIGTERM` removes `postmaster.pid`; a hard kill leaves it behind, and
+the next start reclaims the lock automatically once the recorded process is
+gone, so no operator step is needed for stale locks.
 
 **Long-running sessions.** A 90-minute soak held two sessions open while
 running a count every five seconds, opening and closing a fresh connection
@@ -438,9 +456,10 @@ and the TypeScript server supplies the relational semantics:
   change batch to `ServerStore.commitChanges`.
 
 Atomicity comes from `FileShard::commit_changes`, not from a second
-`commit_many` path on the standalone `Store`. The remaining write-granularity
-cost is that every commit re-encodes the whole shard; per-table shards are the
-planned fix.
+`commit_many` path on the standalone `Store`. Table groups are sharded per
+relation, so a plain DML commit re-encodes only the target group's bytes; the
+catalog stays in the primary shard and commits after the data, or before it on
+a drop.
 
 ## Commit messages
 

@@ -41,6 +41,8 @@ export const DATA_NAMESPACE_PREFIX = 'pg_data.';
 export const SEQUENCE_STATE_NAMESPACE = 'pg_sequence_state';
 /** Secondary index entries, one namespace per index oid. */
 export const INDEX_NAMESPACE_PREFIX = 'pg_index.';
+/** Row-id high-water marks, one namespace per relation, beside the relation's rows. */
+export const ROWID_NAMESPACE_PREFIX = 'pg_rowid.';
 
 export function dataNamespace(relOid: number): string {
     return `${DATA_NAMESPACE_PREFIX}${relOid}`;
@@ -48,6 +50,10 @@ export function dataNamespace(relOid: number): string {
 
 export function indexNamespace(indexOid: number): string {
     return `${INDEX_NAMESPACE_PREFIX}${indexOid}`;
+}
+
+export function rowIdNamespace(relOid: number): string {
+    return `${ROWID_NAMESPACE_PREFIX}${relOid}`;
 }
 
 /** One index access path consumed by the current statement, for `EXPLAIN ANALYZE`. */
@@ -109,6 +115,8 @@ export interface SessionRuntime {
     lastBySequence: Map<number, number>;
     /** Live `pg_cursors` rows for the portals this session has open. */
     pgCursors?: () => CursorViewRow[];
+    /** Session value of `password_encryption`, read when a role password is stored. */
+    passwordEncryption?: () => string;
 }
 
 export function createSessionRuntime(user = 'postgres', database = 'postgres'): SessionRuntime {
@@ -134,6 +142,10 @@ export class Database {
     private readonly writes = new Map<number, Map<string, SqlValue[] | null>>();
     /** Index entries written by this message, keyed by index oid then encoded key. */
     private readonly indexWrites = new Map<number, Map<string, SqlValue[] | null>>();
+    /** Row-id counters loaded for this copy, so one scan serves every insert. */
+    private readonly rowIdCounters = new Map<number, number>();
+    /** Row-id counters this message advanced, persisted beside the relation's rows. */
+    private readonly rowIdWrites = new Map<number, number>();
     /** Index access paths the executor really consumed in the current statement. */
     readonly scanStats: IndexScanStat[] = [];
     private catalogDirty = false;
@@ -238,6 +250,8 @@ export class Database {
         for (const [relOid, rows] of this.tables) copy.tables.set(relOid, new Map(rows));
         for (const [relOid, rows] of this.writes) copy.writes.set(relOid, new Map(rows));
         for (const [indexOid, rows] of this.indexWrites) copy.indexWrites.set(indexOid, new Map(rows));
+        for (const [relOid, next] of this.rowIdCounters) copy.rowIdCounters.set(relOid, next);
+        for (const [relOid, next] of this.rowIdWrites) copy.rowIdWrites.set(relOid, next);
         copy.catalogDirty = this.catalogDirty;
         copy.rolesDirty = this.rolesDirty;
         copy.clusterDirty = this.clusterDirty;
@@ -302,11 +316,34 @@ export class Database {
         return total;
     }
 
+    /**
+     * Hands out the next row id for one relation.
+     *
+     * The high-water mark lives in `pg_rowid.<relOid>`, beside the relation's
+     * rows, so a plain INSERT commits only that table group instead of
+     * rewriting the catalog. A catalog written by an older release carries the
+     * counter in `nextRowId`; the largest visible row id is the third floor, so
+     * neither migration nor a deleted tail can hand out a key twice.
+     */
     nextRowId(relOid: number): string {
-        const key = String(relOid);
-        const next = this.catalog.nextRowId[key] ?? 1;
-        this.catalog.nextRowId[key] = next + 1;
-        this.catalogDirty = true;
+        let next = this.rowIdCounters.get(relOid);
+        if (next === undefined) {
+            next = 1;
+            const legacy = this.catalog.nextRowId[String(relOid)];
+            if (typeof legacy === 'number' && Number.isSafeInteger(legacy) && legacy > next) next = legacy;
+            const stored = this.storage.scan(rowIdNamespace(relOid)).find((row) => decode(row.key) === 'next');
+            if (stored !== undefined) {
+                const value = Number(decode(stored.value));
+                if (Number.isSafeInteger(value) && value > next) next = value;
+            }
+            for (const rowId of this.table(relOid).keys()) {
+                const value = Number(rowId);
+                if (Number.isSafeInteger(value) && value + 1 > next) next = value + 1;
+            }
+            this.rowIdCounters.set(relOid, next);
+        }
+        this.rowIdCounters.set(relOid, next + 1);
+        this.rowIdWrites.set(relOid, next + 1);
         return String(next).padStart(10, '0');
     }
 
@@ -427,6 +464,10 @@ export class Database {
         for (const [relOid, rows] of other.writes) this.writes.set(relOid, rows);
         this.indexWrites.clear();
         for (const [indexOid, rows] of other.indexWrites) this.indexWrites.set(indexOid, rows);
+        this.rowIdCounters.clear();
+        for (const [relOid, next] of other.rowIdCounters) this.rowIdCounters.set(relOid, next);
+        this.rowIdWrites.clear();
+        for (const [relOid, next] of other.rowIdWrites) this.rowIdWrites.set(relOid, next);
         this.catalogDirty = other.catalogDirty;
         this.rolesDirty = other.rolesDirty;
         this.clusterDirty = other.clusterDirty;
@@ -485,6 +526,14 @@ export class Database {
                 });
             }
         }
+        for (const [relOid, next] of this.rowIdWrites) {
+            changes.push({
+                kind: 'put',
+                namespace: rowIdNamespace(relOid),
+                key: encode('next'),
+                value: encode(String(next)),
+            });
+        }
         if (this.catalogDirty) {
             changes.push({
                 kind: 'put',
@@ -509,6 +558,7 @@ export class Database {
         }
         this.writes.clear();
         this.indexWrites.clear();
+        this.rowIdWrites.clear();
         this.catalogDirty = false;
         this.rolesDirty = false;
         this.clusterDirty = false;

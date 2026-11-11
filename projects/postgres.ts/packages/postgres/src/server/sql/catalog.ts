@@ -25,8 +25,8 @@ export interface UserRelation {
     oid: number;
     name: string;
     namespace: number;
-    /** `r` for a table, `i` for an index, `S` for a serial sequence. */
-    relkind: 'r' | 'i' | 'S';
+    /** `r` for a table, `i` for an index, `S` for a serial sequence, `v` for a view. */
+    relkind: 'r' | 'i' | 'S' | 'v';
     relam: number;
     owner: number;
     relhasindex: boolean;
@@ -120,6 +120,13 @@ export interface UserSequence {
     lastValue: number;
 }
 
+export interface UserView {
+    /** `pg_class` oid of the view relation this definition belongs to. */
+    oid: number;
+    /** Source spelling of the stored `SELECT`, rendered by `pg_views`. */
+    definition: string;
+}
+
 export interface CatalogDoc {
     version: number;
     nextOid: number;
@@ -130,6 +137,8 @@ export interface CatalogDoc {
     indexes: UserIndex[];
     constraints: UserConstraint[];
     sequences: UserSequence[];
+    /** Definitions of the `relkind = 'v'` relations, keyed by view oid. */
+    views: UserView[];
     /** `nspacl` literals keyed by namespace oid; a missing key means the seeded default. */
     namespaceAcls?: Record<string, string>;
 }
@@ -144,6 +153,7 @@ export function emptyCatalog(): CatalogDoc {
         indexes: [],
         constraints: [],
         sequences: [],
+        views: [],
         namespaceAcls: {},
     };
 }
@@ -851,6 +861,13 @@ const SYSTEM_RELATIONS: SystemRelation[] = [
             ['creation_time', typeOf('timestamptz')],
         ),
     },
+    {
+        // A view over the user relations with `relkind = 'v'`.
+        name: 'pg_views',
+        oid: 12028,
+        view: true,
+        columns: columns(['schemaname', name], ['viewname', name], ['viewowner', name], ['definition', text]),
+    },
 ];
 
 const SYSTEM_BY_NAME = new Map(SYSTEM_RELATIONS.map((relation) => [relation.name, relation]));
@@ -1219,6 +1236,17 @@ export function catalogTables(
     for (const relation of SYSTEM_RELATIONS) push('pg_class', systemClassRow(relation));
     for (const relation of doc.relations) push('pg_class', classRow(relation));
 
+    for (const relation of doc.relations) {
+        if (relation.relkind !== 'v') continue;
+        const stored = doc.views.find((view) => view.oid === relation.oid);
+        push('pg_views', {
+            schemaname: SYSTEM_NAMESPACES.find((namespace) => namespace.oid === relation.namespace)?.name ?? 'public',
+            viewname: relation.name,
+            viewowner: pgGetUserById(relation.owner, roles),
+            definition: stored?.definition ?? null,
+        });
+    }
+
     for (const relation of SYSTEM_RELATIONS) {
         relation.columns.forEach((column, index) => {
             push('pg_attribute', {
@@ -1418,7 +1446,7 @@ export function catalogTables(
             rolreplication: role.rolreplication,
             rolbypassrls: role.rolbypassrls,
             rolconnlimit: role.rolconnlimit,
-            rolpassword: null,
+            rolpassword: role.rolpassword === undefined ? null : '********',
             rolvaliduntil: null,
             rolconfig: null,
         });
@@ -1668,5 +1696,7 @@ export function assertCatalog(value: unknown): CatalogDoc {
     if (!value || typeof value !== 'object') throw new ServerError('XX000', 'catalog document is missing');
     const doc = value as CatalogDoc;
     if (doc.version !== CATALOG_VERSION) throw new ServerError('XX000', `unsupported catalog version ${String(doc.version)}`);
+    // Catalogs written before views existed carry no `views` array.
+    if (doc.views === undefined) doc.views = [];
     return doc;
 }

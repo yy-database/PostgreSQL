@@ -75,6 +75,24 @@ export function authenticationCleartextPassword(): Buffer {
     return frame('R', int32(3));
 }
 
+/** `AuthenticationSASL`: the mechanism list, terminated by an empty string. */
+export function authenticationSasl(mechanisms: string[]): Buffer {
+    const parts = [int32(10)];
+    for (const mechanism of mechanisms) parts.push(Buffer.from(mechanism), Buffer.from([0]));
+    parts.push(Buffer.from([0]));
+    return frame('R', Buffer.concat(parts));
+}
+
+/** `AuthenticationSASLContinue`, carrying one SCRAM challenge. */
+export function authenticationSaslContinue(data: string): Buffer {
+    return frame('R', Buffer.concat([int32(11), Buffer.from(data)]));
+}
+
+/** `AuthenticationSASLFinal`, carrying the server signature. */
+export function authenticationSaslFinal(data: string): Buffer {
+    return frame('R', Buffer.concat([int32(12), Buffer.from(data)]));
+}
+
 export function parameterStatus(name: string, value: string): Buffer {
     return frame('S', Buffer.concat([Buffer.from(name), Buffer.from([0]), Buffer.from(value), Buffer.from([0])]));
 }
@@ -104,12 +122,28 @@ export function rowDescription(fields: RowField[]): Buffer {
     return frame('T', Buffer.concat(parts));
 }
 
-export function dataRow(values: (string | null)[]): Buffer {
+/**
+ * One `DataRow`. A `Buffer` cell travels as raw binary bytes; a string cell is
+ * sent as its UTF-8 text form; `null` is a SQL `NULL` with length `-1`.
+ */
+export function dataRow(values: (string | Buffer | null)[]): Buffer {
     const parts = [int16(values.length)];
     for (const value of values) {
-        parts.push(value === null ? int32(-1) : Buffer.concat([int32(Buffer.byteLength(value)), Buffer.from(value)]));
+        if (value === null) {
+            parts.push(int32(-1));
+        } else if (Buffer.isBuffer(value)) {
+            parts.push(int32(value.length), value);
+        } else {
+            const buffer = Buffer.from(value);
+            parts.push(int32(buffer.length), buffer);
+        }
     }
     return frame('D', Buffer.concat(parts));
+}
+
+/** `PortalSuspended`: an `Execute` hit its row limit with rows still pending. */
+export function portalSuspended(): Buffer {
+    return frame('s');
 }
 
 export function commandComplete(tag: string): Buffer {

@@ -1,0 +1,7 @@
+          List of relations
+ Schema |   Name    | Type |  Owner   
+--------+-----------+------+----------
+ public | dv_join   | view | postgres
+ public | dv_simple | view | postgres
+(2 rows)
+

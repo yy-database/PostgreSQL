@@ -156,6 +156,61 @@ function bigintBuffer(value) {
     return buffer;
 }
 
+/** Builds a `Bind` message that also declares result format codes. */
+function bindFrameResults(portal, statement, paramFormats, values, resultFormats) {
+    const parts = [Buffer.from(portal), Buffer.from([0]), Buffer.from(statement), Buffer.from([0])];
+    const formatCount = Buffer.alloc(2);
+    formatCount.writeInt16BE(paramFormats.length);
+    parts.push(formatCount);
+    for (const format of paramFormats) parts.push(int16Buffer(format));
+    const valueCount = Buffer.alloc(2);
+    valueCount.writeInt16BE(values.length);
+    parts.push(valueCount);
+    for (const value of values) {
+        if (value === null) parts.push(int32Buffer(-1));
+        else parts.push(int32Buffer(value.length), value);
+    }
+    const resultCount = Buffer.alloc(2);
+    resultCount.writeInt16BE(resultFormats.length);
+    parts.push(resultCount);
+    for (const format of resultFormats) parts.push(int16Buffer(format));
+    return frame('B', Buffer.concat(parts));
+}
+
+/** Builds an `Execute` message; `maxRows` of `0` runs the portal to completion. */
+function executeFrame(portal, maxRows) {
+    return frame('E', Buffer.concat([Buffer.from(portal), Buffer.from([0]), int32Buffer(maxRows)]));
+}
+
+/** Builds a `Describe` message aimed at a portal. */
+function describePortalFrame(name) {
+    return frame('D', Buffer.concat([Buffer.from('P'), Buffer.from(name), Buffer.from([0])]));
+}
+
+/** Splits a `DataRow` payload into per-column hex; a SQL `NULL` reads 'NULL'. */
+function dataRowCells(payload) {
+    const count = payload.readInt16BE(0);
+    const cells = [];
+    let offset = 2;
+    for (let index = 0; index < count; index += 1) {
+        const length = payload.readInt32BE(offset);
+        offset += 4;
+        if (length < 0) {
+            cells.push('NULL');
+            continue;
+        }
+        cells.push(payload.subarray(offset, offset + length).toString('hex'));
+        offset += length;
+    }
+    return cells;
+}
+
+/** Reads the `CommandComplete` tag out of the message, or `null` when absent. */
+function commandTag(messages) {
+    const complete = messages.find((message) => message.tag === 'C');
+    return complete === undefined ? null : complete.payload.subarray(0, -1).toString('utf8');
+}
+
 class Wire {
     constructor(socket) {
         this.socket = socket;
@@ -308,6 +363,7 @@ export async function runServerStage(repositoryRoot, harnessDir) {
     const batchJoin = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-join-')) });
     const batchAgg = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-agg-')) });
     const batchIndex = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-index-')) });
+    const batchView = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-view-')) });
     try {
         await check('startup/trust', async () => {
             const wire = await openSocket(trust.host, trust.port);
@@ -406,7 +462,17 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             const name = Buffer.from([0]);
             wire.send(frame('P', Buffer.concat([name, Buffer.from('SELECT $1'), Buffer.from([0]), Buffer.from([0, 0])])));
             wire.send(
-                frame('B', Buffer.concat([name, name, Buffer.from([0, 0]), Buffer.from([0, 1]), Buffer.from([255, 255, 255, 255])])),
+                frame(
+                    'B',
+                    Buffer.concat([
+                        name,
+                        name,
+                        Buffer.from([0, 0]),
+                        Buffer.from([0, 1]),
+                        Buffer.from([255, 255, 255, 255]),
+                        Buffer.from([0, 0]),
+                    ]),
+                ),
             );
             wire.send(frame('D', Buffer.concat([Buffer.from('P'), name])));
             wire.send(frame('E', Buffer.concat([name, Buffer.from([0, 0, 0, 0])])));
@@ -524,6 +590,193 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             const messages = await wire.readUntilReady();
             requireTags(messages, '12TDCZ');
             assert(JSON.stringify(firstRow(messages)) === '["12.34"]', `binary numeric is ${JSON.stringify(firstRow(messages))}`);
+            wire.close();
+        });
+
+        await check('extended/binary-result-int4', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            wire.send(parseFrame('s1', 'SELECT 42::int4', []));
+            wire.send(bindFrameResults('p1', 's1', [], [], [1]));
+            wire.send(describePortalFrame('p1'));
+            wire.send(executeFrame('p1', 0));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12TDCZ');
+            const [field] = rowFields(messages[2].payload);
+            assert(field.format === 1, `RowDescription format is ${field.format}`);
+            assert(JSON.stringify(dataRowCells(messages[3].payload)) === '["0000002a"]', `binary int4 result is ${JSON.stringify(dataRowCells(messages[3].payload))}`);
+            wire.close();
+        });
+
+        await check('extended/binary-result-scalars', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            const sql =
+                "SELECT true::bool, 42::int2, 42::int4, 1234567890123::int8, 0.5::float4, 0.25::float8, " +
+                "'hi'::text, '\\x0041ff'::bytea, 12.34::numeric, '2000-01-01'::date, '1999-12-31'::date, " +
+                "'2000-01-01 00:00:00'::timestamp, '1999-12-31 23:59:59.999999'::timestamp, " +
+                "'2024-02-29 12:34:56.789+08'::timestamptz, '0f8fad5b-d9cb-469f-a165-70867728950e'::uuid, NULL::int4";
+            wire.send(parseFrame('s1', sql, []));
+            wire.send(bindFrameResults('p1', 's1', [], [], [1]));
+            wire.send(executeFrame('p1', 0));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12TDCZ');
+            const expected = [
+                '01', '002a', '0000002a', '0000011f71fb04cb', '3f000000', '3fd0000000000000',
+                '6869', '0041ff', '0002000000000002000c0d48', '00000000', 'ffffffff',
+                '0000000000000000', 'ffffffffffffffff', '0002b57c8cd56608',
+                '0f8fad5bd9cb469fa16570867728950e', 'NULL',
+            ];
+            assert(JSON.stringify(dataRowCells(messages[3].payload)) === JSON.stringify(expected), `binary result scalars are ${JSON.stringify(dataRowCells(messages[3].payload))}`);
+            wire.close();
+        });
+
+        await check('extended/binary-result-mixed', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            wire.send(parseFrame('s1', "SELECT 7::int4, 'x'::text", []));
+            wire.send(bindFrameResults('p1', 's1', [], [], [1, 0]));
+            wire.send(describePortalFrame('p1'));
+            wire.send(executeFrame('p1', 0));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12TDCZ');
+            const formats = rowFields(messages[2].payload).map((field) => field.format);
+            assert(JSON.stringify(formats) === '[1,0]', `formats are ${JSON.stringify(formats)}`);
+            const cells = dataRowCells(messages[3].payload);
+            assert(JSON.stringify(cells) === JSON.stringify(['00000007', '78']), `mixed cells are ${JSON.stringify(cells)}`);
+            wire.close();
+        });
+
+        await check('extended/binary-result-numeric-specials', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            wire.send(parseFrame('s1', "SELECT 'NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric, 0::numeric, 0.0001::numeric", []));
+            wire.send(bindFrameResults('p1', 's1', [], [], [1]));
+            wire.send(executeFrame('p1', 0));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12TDCZ');
+            const expected = ['00000000c0000000', '00000000d0000020', '00000000f0000020', '0000000000000000', '0001ffff000000040001'];
+            assert(JSON.stringify(dataRowCells(messages[3].payload)) === JSON.stringify(expected), `numeric specials are ${JSON.stringify(dataRowCells(messages[3].payload))}`);
+            wire.close();
+        });
+
+        await check('extended/portal-suspend-batches', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            await wire.query('CREATE TABLE portal_batch_probe (n int)');
+            await wire.query('INSERT INTO portal_batch_probe VALUES (1),(2),(3),(4),(5)');
+            await wire.query('BEGIN');
+            wire.send(parseFrame('st', 'SELECT n FROM portal_batch_probe ORDER BY n', []));
+            wire.send(bindFrameResults('pp', 'st', [], [], []));
+            wire.send(describePortalFrame('pp'));
+            wire.send(executeFrame('pp', 2));
+            wire.send(frame('S'));
+            const first = await wire.readUntilReady();
+            requireTags(first, '12TDDsZ');
+            const firstRows = first.filter((message) => message.tag === 'D').map((message) => dataRowValues(message.payload));
+            assert(JSON.stringify(firstRows) === '[["1"],["2"]]', `first batch is ${JSON.stringify(firstRows)}`);
+            wire.send(describePortalFrame('pp'));
+            wire.send(executeFrame('pp', 2));
+            wire.send(frame('S'));
+            const second = await wire.readUntilReady();
+            requireTags(second, 'TDDsZ');
+            wire.send(describePortalFrame('pp'));
+            wire.send(executeFrame('pp', 2));
+            wire.send(frame('S'));
+            const third = await wire.readUntilReady();
+            requireTags(third, 'TDCZ');
+            assert(commandTag(third) === 'SELECT 1', `final batch tag is ${commandTag(third)}`);
+            await wire.query('COMMIT');
+            wire.close();
+        });
+
+        await check('extended/portal-exact-multiple', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            await wire.query('CREATE TABLE portal_exact_probe (n int)');
+            await wire.query('INSERT INTO portal_exact_probe VALUES (1),(2),(3),(4),(5),(6)');
+            await wire.query('BEGIN');
+            wire.send(parseFrame('st', 'SELECT n FROM portal_exact_probe ORDER BY n', []));
+            wire.send(bindFrameResults('pp', 'st', [], [], []));
+            wire.send(describePortalFrame('pp'));
+            wire.send(executeFrame('pp', 3));
+            wire.send(frame('S'));
+            requireTags(await wire.readUntilReady(), '12TDDDsZ');
+            wire.send(describePortalFrame('pp'));
+            wire.send(executeFrame('pp', 3));
+            wire.send(frame('S'));
+            const exact = await wire.readUntilReady();
+            requireTags(exact, 'TDDDsZ');
+            assert(commandTag(exact) === null, 'a full batch suspends even when the portal ran dry');
+            wire.send(describePortalFrame('pp'));
+            wire.send(executeFrame('pp', 3));
+            wire.send(frame('S'));
+            const done = await wire.readUntilReady();
+            requireTags(done, 'TCZ');
+            assert(commandTag(done) === 'SELECT 0', `exhausted portal tag is ${commandTag(done)}`);
+            await wire.query('COMMIT');
+            wire.close();
+        });
+
+        await check('extended/portal-lost-at-sync', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            wire.send(parseFrame('st', 'SELECT n FROM portal_batch_probe ORDER BY n', []));
+            wire.send(bindFrameResults('lp', 'st', [], [], []));
+            wire.send(frame('S'));
+            requireTags(await wire.readUntilReady(), '12Z');
+            wire.send(executeFrame('lp', 2));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, 'EZ');
+            assert(onlyError(messages).code === '34000', `lost portal error is ${onlyError(messages).code}`);
+            const after = await wire.query('SELECT 1');
+            requireTags(after, 'TDCZ');
+            wire.close();
+        });
+
+        await check('extended/portal-close-completed', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            await wire.query('BEGIN');
+            wire.send(parseFrame('st', 'SELECT n FROM portal_batch_probe ORDER BY n', []));
+            wire.send(bindFrameResults('cp', 'st', [], [], []));
+            wire.send(describePortalFrame('cp'));
+            wire.send(executeFrame('cp', 1));
+            wire.send(frame('S'));
+            requireTags(await wire.readUntilReady(), '12TDsZ');
+            wire.send(frame('C', Buffer.concat([Buffer.from('P'), Buffer.from('cp'), Buffer.from([0])])));
+            wire.send(frame('S'));
+            requireTags(await wire.readUntilReady(), '3Z');
+            wire.send(describePortalFrame('cp'));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, 'EZ');
+            assert(onlyError(messages).code === '34000', `closed portal describe is ${onlyError(messages).code}`);
+            await wire.query('ROLLBACK');
+            wire.close();
+        });
+
+        await check('extended/portal-empty-limit', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            await wire.query('BEGIN');
+            wire.send(parseFrame('st', 'SELECT n FROM portal_batch_probe WHERE n > 100', []));
+            wire.send(bindFrameResults('ep', 'st', [], [], []));
+            wire.send(describePortalFrame('ep'));
+            wire.send(executeFrame('ep', 5));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12TCZ');
+            assert(commandTag(messages) === 'SELECT 0', `empty portal tag is ${commandTag(messages)}`);
+            await wire.query('COMMIT');
+            wire.close();
+        });
+
+        await check('extended/portal-command-limit', async () => {
+            const wire = await openTrustSession(trust.host, trust.port);
+            wire.send(parseFrame('st', 'INSERT INTO portal_exact_probe VALUES (7)', []));
+            wire.send(bindFrameResults('ip', 'st', [], [], []));
+            wire.send(executeFrame('ip', 5));
+            wire.send(frame('S'));
+            const messages = await wire.readUntilReady();
+            requireTags(messages, '12CZ');
+            assert(commandTag(messages) === 'INSERT 0 1', `command portal tag is ${commandTag(messages)}`);
             wire.close();
         });
 
@@ -678,6 +931,76 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             assert(error && error.code === '28P01', `pg rejection is ${error?.code}`);
         });
 
+        await check('driver/pg-scram', async () => {
+            const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-scram-'));
+            const seed = await startPostgresServer({ dataDir });
+            try {
+                const client = new pg.Client({ host: seed.host, port: seed.port, user: 'postgres', database: 'postgres' });
+                await client.connect();
+                try {
+                    const altered = await client.query("ALTER ROLE postgres PASSWORD 'scram-secret'");
+                    assert(altered.command === 'ALTER', `ALTER ROLE tag is ${altered.command}`);
+                    await client.query("CREATE ROLE scram_other LOGIN PASSWORD 'other-secret'");
+                    await client.query('CREATE ROLE scram_less LOGIN');
+                    const encrypted = await client.query('SHOW password_encryption');
+                    assert(encrypted.rows[0].password_encryption === 'scram-sha-256', `password_encryption is ${JSON.stringify(encrypted.rows)}`);
+                    const masked = await client.query(
+                        "SELECT rolname, rolpassword FROM pg_roles WHERE rolname IN ('postgres', 'scram_other', 'scram_less') ORDER BY rolname",
+                    );
+                    assert(
+                        JSON.stringify(masked.rows) ===
+                            JSON.stringify([
+                                { rolname: 'postgres', rolpassword: '********' },
+                                { rolname: 'scram_less', rolpassword: null },
+                                { rolname: 'scram_other', rolpassword: '********' },
+                            ]),
+                        `pg_roles passwords are ${JSON.stringify(masked.rows)}`,
+                    );
+                    await client.query("SET password_encryption = 'md5'");
+                    const md5 = await client.query("CREATE ROLE md5_role LOGIN PASSWORD 'x'").then(
+                        () => null,
+                        (error) => error,
+                    );
+                    assert(md5?.code === '0A000', `md5 password storage is ${md5?.code}`);
+                    await client.query("SET password_encryption = 'scram-sha-256'");
+                } finally {
+                    await client.end();
+                }
+            } finally {
+                await seed.close();
+            }
+
+            const scram = await startPostgresServer({ dataDir, auth: { scram: true } });
+            try {
+                for (const [user, password] of [
+                    ['postgres', 'scram-secret'],
+                    ['scram_other', 'other-secret'],
+                ]) {
+                    const client = new pg.Client({ host: scram.host, port: scram.port, user, database: 'postgres', password });
+                    await client.connect();
+                    try {
+                        const one = await client.query('SELECT 1');
+                        assert(one.rows[0]?.['?column?'] === 1, `SCRAM login as ${user} returned ${JSON.stringify(one.rows)}`);
+                    } finally {
+                        await client.end();
+                    }
+                }
+                for (const [user, password, label] of [
+                    ['postgres', 'wrong', 'wrong password'],
+                    ['scram_less', 'anything', 'no stored verifier'],
+                ]) {
+                    const client = new pg.Client({ host: scram.host, port: scram.port, user, database: 'postgres', password });
+                    const error = await client.connect().then(
+                        () => null,
+                        (reason) => reason,
+                    );
+                    assert(error?.code === '28P01', `${label} rejection is ${error?.code}`);
+                }
+            } finally {
+                await scram.close();
+            }
+        });
+
         const withClient = async (server, body) => {
             const client = new pg.Client({ host: server.host, port: server.port, user: 'postgres', database: 'postgres' });
             await client.connect();
@@ -742,6 +1065,141 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 assert(failure?.code === '22P02', `batch error is ${failure?.code}`);
                 const after = await client.query('SELECT id FROM t ORDER BY id');
                 assert(JSON.stringify(after.rows) === '[{"id":2}]', `rows after rollback are ${JSON.stringify(after.rows)}`);
+            });
+        });
+
+        await check('view/create-query', async () => {
+            await withClient(batchView, async (client) => {
+                await client.query('CREATE TABLE view_base (id int PRIMARY KEY, name text)');
+                await client.query("INSERT INTO view_base VALUES (1, 'one'), (2, 'two')");
+                const created = await client.query('CREATE VIEW view_simple AS SELECT id, name AS shout FROM view_base');
+                assert(created.command === 'CREATE', `view command tag is ${created.command}`);
+                const rows = await client.query('SELECT id, shout FROM view_simple ORDER BY id');
+                assert(
+                    JSON.stringify(rows.rows) === JSON.stringify([{ id: 1, shout: 'one' }, { id: 2, shout: 'two' }]),
+                    `view rows are ${JSON.stringify(rows.rows)}`,
+                );
+                const meta = await client.query("SELECT viewname, definition FROM pg_views WHERE viewname = 'view_simple'");
+                assert(meta.rowCount === 1, `pg_views returned ${meta.rowCount} rows`);
+                assert(
+                    /SELECT id, name AS shout FROM view_base/.test(meta.rows[0].definition),
+                    `pg_views definition is ${meta.rows[0].definition}`,
+                );
+                const relkind = await client.query("SELECT relkind FROM pg_class WHERE relname = 'view_simple'");
+                assert(relkind.rows[0]?.relkind === 'v', `view relkind is ${relkind.rows[0]?.relkind}`);
+                // The view reads live rows instead of copying them.
+                await client.query("INSERT INTO view_base VALUES (3, 'three')");
+                const live = await client.query('SELECT count(*) AS total FROM view_simple');
+                assert(live.rows[0].total === '3', `view count is ${live.rows[0].total}`);
+            });
+        });
+
+        await check('view/or-replace', async () => {
+            await withClient(batchView, async (client) => {
+                const code = async (sql) => {
+                    try {
+                        await client.query(sql);
+                        return null;
+                    } catch (error) {
+                        return error.code;
+                    }
+                };
+                const appended = await client.query('CREATE OR REPLACE VIEW view_simple AS SELECT id, name AS shout, name FROM view_base');
+                assert(appended.command === 'CREATE', `replace tag is ${appended.command}`);
+                assert(
+                    (await code('CREATE OR REPLACE VIEW view_simple AS SELECT name AS renamed, id AS shout, name FROM view_base')) === '42P16',
+                    'renaming a view column must be 42P16',
+                );
+                assert((await code('CREATE OR REPLACE VIEW view_simple AS SELECT id FROM view_base')) === '42P16', 'dropping a view column must be 42P16');
+                assert((await code('CREATE OR REPLACE VIEW view_base AS SELECT 1 AS x')) === '42809', 'replacing a table must be 42809');
+                const duplicate = await client.query('CREATE VIEW view_simple AS SELECT 1 AS x').then(
+                    () => null,
+                    (error) => error,
+                );
+                assert(duplicate?.code === '42P07', `duplicate view is ${duplicate?.code}`);
+                const columns = await client.query("SELECT attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'view_simple' AND a.attnum > 0 ORDER BY a.attnum");
+                assert(
+                    JSON.stringify(columns.rows.map((row) => row.attname)) === JSON.stringify(['id', 'shout', 'name']),
+                    `view columns are ${JSON.stringify(columns.rows)}`,
+                );
+            });
+        });
+
+        await check('view/dependencies', async () => {
+            await withClient(batchView, async (client) => {
+                await client.query('CREATE VIEW view_join AS SELECT a.id, b.name FROM view_simple a JOIN view_base b ON a.id = b.id');
+                const blocked = await client.query('DROP VIEW view_simple').then(
+                    () => null,
+                    (error) => error,
+                );
+                assert(blocked?.code === '2BP01', `dependent view drop is ${blocked?.code}`);
+                const notices = [];
+                const collect = (notice) => notices.push(notice);
+                client.on('notice', collect);
+                try {
+                    const dropped = await client.query('DROP VIEW view_simple CASCADE');
+                    assert(dropped.command === 'DROP', `cascade tag is ${dropped.command}`);
+                } finally {
+                    client.off('notice', collect);
+                }
+                assert(
+                    notices.some((notice) => /drop cascades to view view_join/.test(notice.message)),
+                    `cascade notices are ${JSON.stringify(notices.map((notice) => notice.message))}`,
+                );
+                const remaining = await client.query("SELECT count(*) AS total FROM pg_class WHERE relname = 'view_join'");
+                assert(remaining.rows[0].total === '0', `cascade left ${remaining.rows[0].total} view relations`);
+            });
+        });
+
+        await check('view/table-cascade', async () => {
+            await withClient(batchView, async (client) => {
+                await client.query('CREATE TABLE cascade_base (id int PRIMARY KEY)');
+                await client.query('CREATE VIEW cascade_v AS SELECT id FROM cascade_base');
+                await client.query('CREATE VIEW cascade_v2 AS SELECT id FROM cascade_v');
+                const blocked = await client.query('DROP TABLE cascade_base').then(
+                    () => null,
+                    (error) => error,
+                );
+                assert(blocked?.code === '2BP01', `dependent table drop is ${blocked?.code}`);
+                const dropped = await client.query('DROP TABLE cascade_base CASCADE');
+                assert(dropped.command === 'DROP', `cascade table tag is ${dropped.command}`);
+                const left = await client.query("SELECT count(*) AS total FROM pg_class WHERE relname IN ('cascade_v', 'cascade_v2')");
+                assert(left.rows[0].total === '0', `table cascade left ${left.rows[0].total} views`);
+            });
+        });
+
+        await check('maintenance/vacuum-analyze', async () => {
+            await withClient(batchView, async (client) => {
+                const code = async (sql) => {
+                    try {
+                        await client.query(sql);
+                        return null;
+                    } catch (error) {
+                        return error.code;
+                    }
+                };
+                assert((await client.query('VACUUM')).command === 'VACUUM', 'bare VACUUM tag');
+                assert((await client.query('VACUUM FULL FREEZE VERBOSE ANALYZE view_base')).command === 'VACUUM', 'legacy VACUUM options');
+                assert((await client.query('VACUUM (FULL, VERBOSE) view_base')).command === 'VACUUM', 'parenthesized VACUUM options');
+                assert((await client.query('ANALYZE view_base')).command === 'ANALYZE', 'ANALYZE tag');
+                assert((await client.query('ANALYZE view_base (id)')).command === 'ANALYZE', 'ANALYZE column tag');
+                assert((await code('ANALYZE missing_table')) === '42P01', 'ANALYZE of a missing table must be 42P01');
+                assert((await code('ANALYZE view_base (nope)')) === '42703', 'ANALYZE of a missing column must be 42703');
+                assert((await code('BEGIN; VACUUM')) === '25001', 'VACUUM inside a transaction must be 25001');
+                await client.query('ROLLBACK');
+                await client.query('CREATE VIEW maintenance_view AS SELECT id FROM view_base');
+                const warnings = [];
+                const collect = (notice) => warnings.push(notice);
+                client.on('notice', collect);
+                try {
+                    await client.query('VACUUM maintenance_view');
+                } finally {
+                    client.off('notice', collect);
+                }
+                assert(
+                    warnings.some((notice) => notice.severity === 'WARNING' && /cannot vacuum non-tables/.test(notice.message)),
+                    `VACUUM warnings are ${JSON.stringify(warnings)}`,
+                );
             });
         });
 
@@ -896,6 +1354,22 @@ export async function runServerStage(repositoryRoot, harnessDir) {
                 const expected = fs.readFileSync(path.join(harnessDir, 'fixtures', 'psql-d-t.txt'), 'utf8');
                 assert(result.stdout === expected, `psql \\d t differs from the real fixture:\n${result.stdout}`);
                 lines.push(`  \\d t matches pg16 fixture (${expected.length} bytes)`);
+            });
+
+            await check('psql/describe-dv', async () => {
+                const dv = await startPostgresServer({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-dv-')) });
+                try {
+                    await runOn(dv, 'CREATE TABLE dv_base (id int PRIMARY KEY, name text)');
+                    await runOn(dv, 'CREATE VIEW dv_simple AS SELECT id, name FROM dv_base');
+                    await runOn(dv, 'CREATE VIEW dv_join AS SELECT a.id, b.name FROM dv_simple a JOIN dv_base b ON a.id = b.id');
+                    const result = await runOn(dv, '\\dv');
+                    assert(result.status === 0, `psql exited ${result.status}: ${result.stderr}`);
+                    const expected = fs.readFileSync(path.join(harnessDir, 'fixtures', 'psql-dv.txt'), 'utf8');
+                    assert(result.stdout === expected, `psql \\dv differs from the real fixture:\n${result.stdout}`);
+                    lines.push(`  \\dv matches pg16 fixture (${expected.length} bytes)`);
+                } finally {
+                    await dv.close();
+                }
             });
 
             const describeB3 = (name, sql, fixture) =>
@@ -1175,8 +1649,10 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             child.kill('SIGKILL');
             await exited;
             assert(fs.existsSync(pidFile), 'a crashed server leaves postmaster.pid behind');
-            const restart = await capture(startPostgresServer({ dataDir: dir }));
-            assert(restart !== null && /already exists/.test(restart.message), `restart on a stale lock is ${restart?.message}`);
+            const restarted = await startPostgresServer({ dataDir: dir });
+            assert(fs.existsSync(pidFile), 'the stale-lock takeover rewrites postmaster.pid');
+            await restarted.close();
+            assert(!fs.existsSync(pidFile), 'the takeover releases postmaster.pid on close');
         });
 
         // Batch 4: query breadth, all checked through the `pg` driver.
@@ -2749,5 +3225,6 @@ export async function runServerStage(repositoryRoot, harnessDir) {
         await batchJoin.close();
         await batchAgg.close();
         await batchIndex.close();
+        await batchView.close();
     }
 }

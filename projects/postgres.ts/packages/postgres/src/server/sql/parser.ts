@@ -353,6 +353,41 @@ export interface DropTableStatement {
     cascade: boolean;
 }
 
+export interface CreateViewStatement {
+    kind: 'create-view';
+    view: RelationRef;
+    orReplace: boolean;
+    /** Optional column alias list; fewer aliases than query columns is legal. */
+    columns: string[] | undefined;
+    select: SelectStatement;
+    /** Source spelling of the stored query, kept as the view definition text. */
+    source: string;
+}
+
+export interface DropViewStatement {
+    kind: 'drop-view';
+    /** Every name in `DROP VIEW a, b`, each optionally schema-qualified. */
+    views: RelationRef[];
+    ifExists: boolean;
+    cascade: boolean;
+}
+
+export interface VacuumStatement {
+    kind: 'vacuum';
+    full: boolean;
+    freeze: boolean;
+    verbose: boolean;
+    analyze: boolean;
+    table: RelationRef | undefined;
+}
+
+export interface AnalyzeStatement {
+    kind: 'analyze';
+    verbose: boolean;
+    table: RelationRef | undefined;
+    columns: string[] | undefined;
+}
+
 export interface IndexKey {
     /** Column name for a plain key, absent for an expression key. */
     column?: string;
@@ -418,6 +453,8 @@ export interface RoleOptions {
     rolreplication?: boolean;
     rolbypassrls?: boolean;
     rolconnlimit?: number;
+    /** `PASSWORD 'text'`; `null` for `PASSWORD NULL`; absent when the clause is missing. */
+    password?: string | null;
 }
 
 export interface CreateRoleStatement {
@@ -570,6 +607,10 @@ export type Statement =
     | DeleteStatement
     | CreateTableStatement
     | DropTableStatement
+    | CreateViewStatement
+    | DropViewStatement
+    | VacuumStatement
+    | AnalyzeStatement
     | CreateIndexStatement
     | DropIndexStatement
     | CreateDatabaseStatement
@@ -911,6 +952,8 @@ class Parser {
         if (token.upper === 'DELETE') return this.parseDelete();
         if (token.upper === 'CREATE') return this.parseCreate();
         if (token.upper === 'DROP') return this.parseDrop();
+        if (token.upper === 'VACUUM') return this.parseVacuum();
+        if (token.upper === 'ANALYZE' || token.upper === 'ANALYSE') return this.parseAnalyze();
         if (token.upper === 'ALTER') return this.parseAlter();
         if (token.upper === 'GRANT') return this.parseGrant();
         if (token.upper === 'REVOKE') return this.parseRevoke();
@@ -938,6 +981,17 @@ class Parser {
         if (token.upper === 'UNLISTEN') return this.parseUnlisten();
         if (token.upper === 'NOTIFY') return this.parseNotify();
         throw new ServerError('0A000', 'feature not supported', `statement is not implemented: ${token.upper || 'end of input'}`);
+    }
+
+    /** Parses a query body: `SELECT`, `WITH ... SELECT` or a bare `VALUES` list. */
+    parseQuery(): SelectStatement {
+        if (this.at('WITH')) {
+            const withClause = this.parseWith();
+            const select = this.parseSelect();
+            select.with = withClause;
+            return select;
+        }
+        return this.parseSelect();
     }
 
     private signedInteger(): number {
@@ -2161,6 +2215,9 @@ class Parser {
 
     private parseCreate(): Statement {
         this.expect('CREATE');
+        const orReplace = this.at('OR') ? (this.next(), this.expect('REPLACE'), true) : false;
+        if (this.at('VIEW')) return this.parseCreateView(orReplace);
+        if (orReplace) throw syntax('syntax error', this.peek());
         if (this.at('DATABASE')) return this.parseCreateDatabase();
         if (this.at('ROLE')) return this.parseCreateRole();
         if (this.at('UNIQUE') || this.at('INDEX')) return this.parseCreateIndex();
@@ -2230,6 +2287,33 @@ class Parser {
         } while (this.accept(','));
         this.expect(')');
         return { kind: 'create-table', table, ifNotExists, columns, constraints, persistence };
+    }
+
+    /** `CREATE [OR REPLACE] VIEW name [(col, ...)] AS <query>`. */
+    private parseCreateView(orReplace: boolean): CreateViewStatement {
+        this.expect('VIEW');
+        const view = this.parseRelationRef();
+        let columns: string[] | undefined;
+        if (this.at('(')) {
+            this.next();
+            columns = [];
+            do {
+                columns.push(this.identifier());
+            } while (this.accept(','));
+            this.expect(')');
+        }
+        this.expect('AS');
+        const start = this.peek().start;
+        let select: SelectStatement;
+        if (this.at('WITH')) {
+            const withClause = this.parseWith();
+            select = this.parseSelect();
+            select.with = withClause;
+        }
+        else {
+            select = this.parseSelect();
+        }
+        return { kind: 'create-view', view, orReplace, columns, select, source: this.sourceSince(start) };
     }
 
     private parseCreateDatabase(): CreateDatabaseStatement {
@@ -2639,6 +2723,17 @@ class Parser {
         this.expect('DROP');
         if (this.at('DATABASE')) return this.parseDropDatabase();
         if (this.at('ROLE')) return this.parseDropRole();
+        if (this.at('VIEW')) {
+            this.next();
+            const ifExists = this.at('IF') ? (this.next(), this.expect('EXISTS'), true) : false;
+            const views: RelationRef[] = [];
+            do {
+                views.push(this.parseRelationRef());
+            } while (this.accept(','));
+            const cascade = this.accept('CASCADE');
+            this.accept('RESTRICT');
+            return { kind: 'drop-view', views, ifExists, cascade };
+        }
         if (this.at('INDEX')) {
             this.next();
             const concurrently = this.accept('CONCURRENTLY');
@@ -2664,6 +2759,97 @@ class Parser {
         const cascade = this.accept('CASCADE');
         this.accept('RESTRICT');
         return { kind: 'drop-table', table, ifExists, cascade };
+    }
+
+    /**
+     * `VACUUM [ ( option [, ...] ) ] [ table ]` plus the legacy keyword form
+     * `VACUUM [FULL] [FREEZE] [VERBOSE] [ANALYZE] [table]`.
+     */
+    private parseVacuum(): VacuumStatement {
+        this.expect('VACUUM');
+        const options = { full: false, freeze: false, verbose: false, analyze: false };
+        const applyOption = (token: Token): void => {
+            switch (token.upper) {
+                case 'FULL':
+                    options.full = true;
+                    break;
+                case 'FREEZE':
+                    options.freeze = true;
+                    break;
+                case 'VERBOSE':
+                    options.verbose = true;
+                    break;
+                case 'ANALYZE':
+                case 'ANALYSE':
+                    options.analyze = true;
+                    break;
+                default:
+                    throw new ServerError('42601', `unrecognized parameter "${token.value.toLowerCase()}"`);
+            }
+        };
+        if (this.accept('(')) {
+            do {
+                const token = this.peek();
+                if (token.kind !== 'ident' && token.kind !== 'qident') throw syntax('syntax error: expected a VACUUM option', token);
+                this.next();
+                applyOption(token);
+                this.accept('=');
+                if (this.at('TRUE') || this.at('FALSE') || this.at('ON') || this.at('OFF')) this.next();
+            } while (this.accept(','));
+            this.expect(')');
+        }
+        else {
+            for (;;) {
+                if (this.at('FULL')) {
+                    this.next();
+                    options.full = true;
+                    continue;
+                }
+                if (this.at('FREEZE')) {
+                    this.next();
+                    options.freeze = true;
+                    continue;
+                }
+                if (this.at('VERBOSE')) {
+                    this.next();
+                    options.verbose = true;
+                    continue;
+                }
+                if (this.at('ANALYZE') || this.at('ANALYSE')) {
+                    this.next();
+                    options.analyze = true;
+                    continue;
+                }
+                break;
+            }
+        }
+        let table: RelationRef | undefined;
+        const token = this.peek();
+        if ((token.kind === 'ident' || token.kind === 'qident') && !this.at('ANALYZE') && !this.at('ANALYSE')) {
+            table = this.parseRelationRef();
+        }
+        return { kind: 'vacuum', ...options, table };
+    }
+
+    /** `ANALYZE [VERBOSE] [table [(col, ...)]]`. */
+    private parseAnalyze(): AnalyzeStatement {
+        this.next();
+        const verbose = this.accept('VERBOSE');
+        let table: RelationRef | undefined;
+        let columns: string[] | undefined;
+        const token = this.peek();
+        if (token.kind === 'ident' || token.kind === 'qident') {
+            table = this.parseRelationRef();
+            if (this.at('(')) {
+                this.next();
+                columns = [];
+                do {
+                    columns.push(this.identifier());
+                } while (this.accept(','));
+                this.expect(')');
+            }
+        }
+        return { kind: 'analyze', verbose, table, columns };
     }
 
     private parseDropDatabase(): DropDatabaseStatement {
@@ -2790,9 +2976,17 @@ class Parser {
                 options.rolconnlimit = this.signedInteger();
                 continue;
             }
-            // Passwords and validity dates are accepted but not stored; this
-            // server authenticates with a single configured password.
-            if (this.at('PASSWORD') || this.at('VALID')) {
+            if (this.at('PASSWORD')) {
+                this.next();
+                const value = this.next();
+                if (value.kind === 'string') options.password = value.value;
+                else if (value.upper === 'NULL') options.password = null;
+                else throw syntax('syntax error: expected a password string or NULL', value);
+                continue;
+            }
+            // Validity dates are accepted but not stored; this server has no
+            // password expiry.
+            if (this.at('VALID')) {
                 this.next();
                 if (this.peek().upper === 'UNTIL') this.next();
                 this.next();
@@ -2898,6 +3092,19 @@ export function parseStatement(sql: string): Statement {
     const trailing = parser.peek();
     if (trailing.kind !== 'eof') throw syntax('syntax error', trailing);
     return statement;
+}
+
+/**
+ * Parses the query body of a view definition: `SELECT`, `WITH` or `VALUES`.
+ * A stored `VALUES` list is a legal view body even though a bare `VALUES`
+ * statement is not dispatched at the top level.
+ */
+export function parseViewQuery(sql: string): SelectStatement {
+    const parser = new Parser(sql);
+    const query = parser.parseQuery();
+    const trailing = parser.peek();
+    if (trailing.kind !== 'eof') throw syntax('syntax error', trailing);
+    return query;
 }
 
 /** Parses one expression in isolation, used by the harness and DDL defaults. */

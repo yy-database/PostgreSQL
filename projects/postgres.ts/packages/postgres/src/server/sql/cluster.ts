@@ -21,6 +21,12 @@ export interface ClusterRole {
     rolreplication: boolean;
     rolbypassrls: boolean;
     rolconnlimit: number;
+    /**
+     * The `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` secret
+     * derived from the role password; absent when the role has no password.
+     * The cleartext password itself is never stored.
+     */
+    rolpassword?: string;
 }
 
 /** The two roles `initdb` seeds; both exist before any user role is created. */

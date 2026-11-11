@@ -1,7 +1,7 @@
 /** Decodes the binary parameter formats clients such as psycopg send on `Bind`. */
 
 import { ServerError } from '../errors.ts';
-import { typeFromOid, type SqlValue } from './types.ts';
+import { formatValue, numericSpecial, typeFromOid, type DataType, type SqlValue } from './types.ts';
 
 const PG_EPOCH_MS = Date.UTC(2000, 0, 1);
 const DAY_MS = 86_400_000;
@@ -272,5 +272,175 @@ export function decodeBinaryParameter(buffer: Buffer, typeOidValue: number): Sql
                     : `binary parameter type ${named.key} is not implemented`,
             );
         }
+    }
+}
+
+/** Days between 1970-01-01 and 2000-01-01, the epoch PostgreSQL timestamps use. */
+const PG_EPOCH_DAYS = 10_957;
+
+/** Proleptic-Gregorian days since 1970-01-01, Howard Hinnant's `days_from_civil`. */
+function daysFromCivil(year: number, month: number, day: number): number {
+    const y = year - (month <= 2 ? 1 : 0);
+    const era = Math.floor(y / 400);
+    const yoe = y - era * 400;
+    const doy = Math.floor((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5) + day - 1;
+    const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+const TIMESTAMP_OUTPUT = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?(Z|[+-]\d{2}(?::?\d{2})?)?$/;
+
+/** Microseconds since 2000-01-01 00:00:00, with the zone offset folded into UTC. */
+function timestampMicros(text: string): bigint {
+    const match = TIMESTAMP_OUTPUT.exec(text);
+    if (match === null) throw new ServerError('22P02', `invalid timestamp output "${text}"`);
+    const days = BigInt(daysFromCivil(Number(match[1]), Number(match[2]), Number(match[3])) - PG_EPOCH_DAYS);
+    const seconds = BigInt(Number(match[4]) * 3600 + Number(match[5]) * 60 + Number(match[6]));
+    const fraction = BigInt((match[7] ?? '.0').slice(1).padEnd(6, '0'));
+    let micros = days * DAY_MICROS + seconds * 1_000_000n + fraction;
+    const zone = match[8];
+    if (zone !== undefined && zone !== 'Z') {
+        const digits = zone.slice(1).replace(':', '');
+        const offsetSeconds = BigInt(Number(digits.slice(0, 2)) * 3600 + Number(digits.slice(2) ?? 0) * 60);
+        micros -= (zone[0] === '-' ? -1n : 1n) * offsetSeconds * 1_000_000n;
+    }
+    return micros;
+}
+
+function numericHeader(digits: number, weight: number, sign: number, scale: number, groups: number[]): Buffer {
+    const buffer = Buffer.alloc(8 + groups.length * 2);
+    buffer.writeInt16BE(digits, 0);
+    buffer.writeInt16BE(weight, 2);
+    buffer.writeUInt16BE(sign, 4);
+    buffer.writeUInt16BE(scale, 6);
+    for (let index = 0; index < groups.length; index += 1) buffer.writeInt16BE(groups[index]!, 8 + index * 2);
+    return buffer;
+}
+
+/**
+ * Encodes decimal text into PostgreSQL's base-10000 `numeric` wire form.
+ *
+ * `weight` is the power of 10000 of the first digit group, leading and trailing
+ * zero groups are dropped, and the infinities carry the scale PostgreSQL does:
+ * `NaN` reports `0`, the infinities report `32`.
+ */
+function encodeBinaryNumeric(text: string): Buffer {
+    const special = numericSpecial(text);
+    if (special === 'NaN') return numericHeader(0, 0, 0xc000, 0, []);
+    if (special === 'Infinity') return numericHeader(0, 0, 0xd000, 32, []);
+    if (special === '-Infinity') return numericHeader(0, 0, 0xf000, 32, []);
+    const match = /^([+-]?)(\d+)?(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text);
+    const intDigits = match?.[2] ?? '';
+    const fracDigits = match?.[3] ?? '';
+    if (match === null || (intDigits === '' && fracDigits === '')) {
+        throw new ServerError('22P02', `invalid numeric output "${text}"`);
+    }
+    const exponent = match[4] === undefined ? 0 : Number(match[4]);
+    let digits = intDigits + fracDigits;
+    let scale = fracDigits.length - exponent;
+    if (scale < 0) {
+        digits += '0'.repeat(-scale);
+        scale = 0;
+    }
+    const integer = scale === 0 ? digits : digits.slice(0, digits.length - scale) || '0';
+    const fraction = scale === 0 ? '' : digits.slice(digits.length - scale);
+    const negative = match[1] === '-' && BigInt(digits) !== 0n;
+    const groups: number[] = [];
+    const intPadded = integer.padStart(Math.ceil(integer.length / 4) * 4, '0');
+    for (let index = 0; index < intPadded.length; index += 4) groups.push(Number(intPadded.slice(index, index + 4)));
+    const fracPadded = fraction.padEnd(Math.ceil(fraction.length / 4) * 4, '0');
+    for (let index = 0; index < fracPadded.length; index += 4) groups.push(Number(fracPadded.slice(index, index + 4)));
+    let weight = Math.ceil(integer.length / 4) - 1;
+    while (groups.length > 0 && groups[0] === 0) {
+        groups.shift();
+        weight -= 1;
+    }
+    while (groups.length > 0 && groups[groups.length - 1] === 0) groups.pop();
+    if (groups.length === 0) weight = 0;
+    return numericHeader(groups.length, weight, negative ? 0x4000 : 0, scale, groups);
+}
+
+/**
+ * Encodes one result value in the binary `DataRow` format for `type`.
+ *
+ * `NULL` becomes `null`, which the frame layer renders as a `-1` length. Every
+ * scalar PostgreSQL sends as bytes gets its own branch; text-like types, the
+ * catalog vectors and arrays carry their textual form as raw UTF-8.
+ */
+export function encodeBinaryValue(value: SqlValue, type: DataType): Buffer | null {
+    if (value === null) return null;
+    const text = formatValue(value, type) ?? '';
+    switch (type.key) {
+        case 'bool':
+            return Buffer.from([text === 't' ? 1 : 0]);
+        case 'int2': {
+            const buffer = Buffer.alloc(2);
+            buffer.writeInt16BE(Number(text));
+            return buffer;
+        }
+        case 'int4': {
+            const buffer = Buffer.alloc(4);
+            buffer.writeInt32BE(Number(text));
+            return buffer;
+        }
+        case 'int8': {
+            const buffer = Buffer.alloc(8);
+            buffer.writeBigInt64BE(BigInt(text));
+            return buffer;
+        }
+        case 'float4': {
+            const buffer = Buffer.alloc(4);
+            buffer.writeFloatBE(Number(text));
+            return buffer;
+        }
+        case 'float8': {
+            const buffer = Buffer.alloc(8);
+            buffer.writeDoubleBE(Number(text));
+            return buffer;
+        }
+        case 'numeric':
+            return encodeBinaryNumeric(text);
+        case 'bytea': {
+            const hex = /^\\x([0-9a-fA-F]*)$/.exec(text);
+            return hex === null ? Buffer.from(text, 'utf8') : Buffer.from(hex[1]!, 'hex');
+        }
+        case 'uuid':
+            return Buffer.from(text.replace(/-/g, ''), 'hex');
+        case 'date': {
+            const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+            if (match === null) throw new ServerError('22P02', `invalid date output "${text}"`);
+            const buffer = Buffer.alloc(4);
+            buffer.writeInt32BE(daysFromCivil(Number(match[1]), Number(match[2]), Number(match[3])) - PG_EPOCH_DAYS);
+            return buffer;
+        }
+        case 'timestamp': {
+            const buffer = Buffer.alloc(8);
+            buffer.writeBigInt64BE(timestampMicros(text.replace(/\s*(?:Z|[+-]\d{2}(?::?\d{2})?)$/, '')));
+            return buffer;
+        }
+        case 'timestamptz': {
+            const buffer = Buffer.alloc(8);
+            buffer.writeBigInt64BE(timestampMicros(text));
+            return buffer;
+        }
+        case 'oid':
+        case 'regclass':
+        case 'regtype':
+        case 'regnamespace':
+        case 'regproc':
+        case 'regprocedure':
+        case 'regoperator':
+        case 'regdictionary':
+        case 'regconfig':
+        case 'regrole': {
+            if (/^\d+$/.test(text)) {
+                const buffer = Buffer.alloc(4);
+                buffer.writeUInt32BE(Number(text));
+                return buffer;
+            }
+            return Buffer.from(text, 'utf8');
+        }
+        default:
+            return Buffer.from(text, 'utf8');
     }
 }

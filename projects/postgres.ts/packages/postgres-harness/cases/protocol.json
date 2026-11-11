@@ -167,6 +167,33 @@
             "paramFormats": [0, 1],
             "resultFormats": [0, 1],
             "expectHex": "4200000021000000020000000100020000000137000000040000002a000200000001"
+        },
+        {
+            "name": "bind-binary-result-only",
+            "portal": "p",
+            "statement": "s",
+            "params": [],
+            "paramFormats": [],
+            "resultFormats": [1],
+            "expectHex": "4200000010700073000000000000010001"
+        },
+        {
+            "name": "bind-three-binary-results",
+            "portal": "",
+            "statement": "",
+            "params": [{ "format": 0, "value": "1" }],
+            "paramFormats": [0],
+            "resultFormats": [1, 1, 1],
+            "expectHex": "4200000019000000010000000100000001310003000100010001"
+        },
+        {
+            "name": "bind-text-result-explicit",
+            "portal": "",
+            "statement": "",
+            "params": [],
+            "paramFormats": [],
+            "resultFormats": [0],
+            "expectHex": "420000000e00000000000000010000"
         }
     ],
     "decodeError": [
@@ -215,6 +242,11 @@
         {
             "name": "row-binary-format",
             "payloadHex": "00016100000000000000000000170004ffffffff0001",
+            "expectError": "binary PostgreSQL results are unsupported"
+        },
+        {
+            "name": "row-second-column-binary",
+            "payloadHex": "00026100000000000000000000170004ffffffff00006200000000000000000000170004ffffffff0001",
             "expectError": "binary PostgreSQL results are unsupported"
         },
         {

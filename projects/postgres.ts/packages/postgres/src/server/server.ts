@@ -6,6 +6,15 @@ import { randomInt } from 'node:crypto';
 
 import { loadNative } from '../native.ts';
 import { ServerError } from './errors.ts';
+import {
+    SCRAM_CHANNEL_BINDING_NO,
+    type ScramSecret,
+    parseScramVerifier,
+    scramClientProofValid,
+    scramFields,
+    scramNonce,
+    scramServerSignature,
+} from './scram.ts';
 import { cloneDatabase, databasePrefix, purgeDatabase, scopedStorage, storageFor } from './store.ts';
 import { createSessionRuntime, Database, type SessionRuntime, type Storage } from './sql/database.ts';
 import { SCHEMA_FILE, touchesSchema, writeSchemaExport } from './sql/schema_export.ts';
@@ -23,13 +32,24 @@ import {
     type Statement,
     type TransactionStatement,
 } from './sql/parser.ts';
-import { decodeBinaryParameter } from './sql/binary.ts';
-import { describeSelect, inferParameterTypes, runStatement, type Field, type Outcome } from './sql/engine.ts';
+import { decodeBinaryParameter, encodeBinaryValue } from './sql/binary.ts';
+import {
+    armStatementDeadline,
+    describeSelect,
+    inferParameterTypes,
+    restoreStatementDeadline,
+    runStatement,
+    type Field,
+    type Outcome,
+} from './sql/engine.ts';
 import { LockWait, snapshotIsolation, TransactionManager, type IsolationLevel, type TransactionHandle } from './sql/transaction.ts';
 import { TEXT, formatValue, parseLiteral, typeLength, typeOid, type SqlValue, type DataType } from './sql/types.ts';
 import {
     authenticationCleartextPassword,
     authenticationOk,
+    authenticationSasl,
+    authenticationSaslContinue,
+    authenticationSaslFinal,
     backendKeyData,
     bindComplete,
     closeComplete,
@@ -48,6 +68,7 @@ import {
     parameterDescription,
     parameterStatus,
     parseComplete,
+    portalSuspended,
     readyForQuery,
     rowDescription,
     SSL_REQUEST,
@@ -58,8 +79,16 @@ import {
     type RowField,
 } from './protocol.ts';
 
-/** Authentication the server offers: no password, or one cleartext password. */
-export type ServerAuth = 'trust' | { password: string };
+/**
+ * Authentication the server offers.
+ *
+ * - `trust`: no password.
+ * - `{ password }`: cleartext password over the wire, kept for compatibility.
+ * - `{ scram: true }`: SCRAM-SHA-256 against the verifier stored on each role
+ *   by `CREATE ROLE ... PASSWORD` / `ALTER ROLE ... PASSWORD`. A role without a
+ *   stored verifier is rejected, never silently trusted.
+ */
+export type ServerAuth = 'trust' | { password: string } | { scram: true };
 
 export interface PostgresServerOptions {
     /** Address to listen on. Defaults to `127.0.0.1`. */
@@ -126,6 +155,56 @@ const GUC_REPORTED = new Set([
     'TimeZone',
 ]);
 
+/** Milliseconds per accepted timeout unit, the way PostgreSQL's `parse_int` reads them. */
+const TIMEOUT_UNITS = new Map<string, number>([
+    ['', 1],
+    ['us', 0.001],
+    ['usec', 0.001],
+    ['usecs', 0.001],
+    ['microsecond', 0.001],
+    ['microseconds', 0.001],
+    ['ms', 1],
+    ['msec', 1],
+    ['msecs', 1],
+    ['millisecond', 1],
+    ['milliseconds', 1],
+    ['s', 1000],
+    ['sec', 1000],
+    ['secs', 1000],
+    ['second', 1000],
+    ['seconds', 1000],
+    ['min', 60_000],
+    ['mins', 60_000],
+    ['minute', 60_000],
+    ['minutes', 60_000],
+    ['h', 3_600_000],
+    ['hr', 3_600_000],
+    ['hrs', 3_600_000],
+    ['hour', 3_600_000],
+    ['hours', 3_600_000],
+    ['d', 86_400_000],
+    ['day', 86_400_000],
+    ['days', 86_400_000],
+    ['w', 604_800_000],
+    ['week', 604_800_000],
+    ['weeks', 604_800_000],
+]);
+
+/**
+ * Reads one timeout GUC value like PostgreSQL: a bare number is milliseconds,
+ * an optional unit suffix scales it, and `0` disables the timeout.
+ */
+function parseTimeoutMs(name: string, text: string): number {
+    const match = /^(\d+(?:\.\d+)?|\.\d+)\s*([a-z]*)$/i.exec(text.trim());
+    if (match === null || match[1] === undefined) {
+        throw new ServerError('22023', `invalid value for parameter "${name}": "${text}"`);
+    }
+    const unit = (match[2] ?? '').toLowerCase();
+    const multiplier = TIMEOUT_UNITS.get(unit);
+    if (multiplier === undefined) throw new ServerError('22023', `unit "${unit}" is not recognized`);
+    return Math.round(Number(match[1]) * multiplier);
+}
+
 /** Boolean GUCs render `on`/`off` on `SHOW` and in `ParameterStatus`. */
 const GUC_BOOLEAN = new Set([
     'default_transaction_read_only',
@@ -155,6 +234,7 @@ for (const [canonical, value] of [
     ['default_transaction_read_only', 'off'],
     ['in_hot_standby', 'off'],
     ['max_connections', '100'],
+    ['password_encryption', 'scram-sha-256'],
     ['search_path', '"$user", public'],
     ['extra_float_digits', '1'],
     ['bytea_output', 'hex'],
@@ -242,6 +322,32 @@ function wireRows(outcome: { fields: Field[]; rows: SqlValue[][] }): (string | n
             return formatValue(value, type);
         }),
     );
+}
+
+/**
+ * Applies a `Bind` result-format list onto the columns of a `RowDescription`.
+ *
+ * The wire shape is: zero codes → every column text; one code → that code for
+ * every column; `n` codes → one per column, with missing codes defaulting to
+ * text. PostgreSQL accepts the same three shapes; anything else is rejected by
+ * `handleBind` before we ever reach this helper.
+ */
+function applyResultFormats(fields: RowField[], resultFormats: number[]): RowField[] {
+    if (resultFormats.length === 0) return fields;
+    const single = resultFormats.length === 1;
+    return fields.map((field, index) => ({
+        ...field,
+        format: single ? resultFormats[0] : resultFormats[index] ?? 0,
+    }));
+}
+
+/** One `DataRow`'s cells, binary where the portal asked for format code `1`. */
+function binaryCells(row: SqlValue[], fields: Field[], resultFormats: number[]): (string | Buffer | null)[] {
+    return row.map((value, index) => {
+        const type = fields[index]?.type ?? TEXT;
+        const format = resultFormats.length === 0 ? 0 : resultFormats.length === 1 ? resultFormats[0] : resultFormats[index] ?? 0;
+        return format === 1 ? encodeBinaryValue(value, type) : formatValue(value, type);
+    });
 }
 
 function unquote(value: string): string {
@@ -337,6 +443,22 @@ interface SqlPrepared {
     types: DataType[];
 }
 
+/** One bound portal: the `Bind` inputs plus the state a suspended `Execute` resumes from. */
+interface PortalState {
+    statement: string;
+    parameters: SqlValue[];
+    /** Result format codes from `Bind`; empty means every column is text. */
+    resultFormats: number[];
+    /** `true` once a `Describe` has answered, so `Execute` skips `RowDescription`. */
+    described: boolean;
+    /** Materialized by the first `Execute`; later batches continue from `position`. */
+    outcome?: ServerOutcome;
+    /** Only a plain `SELECT` portal suspends, like PostgreSQL's `PORTAL_ONE_SELECT`. */
+    suspendable: boolean;
+    /** Rows already sent for `outcome`. */
+    position: number;
+}
+
 /**
  * Decodes frontend messages while driving the backend side of protocol v3.
  *
@@ -360,9 +482,14 @@ class Session {
     private startupPhase = true;
     private startupParameters = new Map<string, string>();
     private awaitingPassword = false;
+    /** SCRAM-SHA-256 handshake state; `null` outside that window. */
+    private scram:
+        | { phase: 'initial' }
+        | { phase: 'final'; clientFirstBare: string; serverFirst: string; combinedNonce: string; verifier: ScramSecret }
+        | null = null;
     private state: SessionState | null = null;
     private prepared = new Map<string, { sql: string; parameterOids: number[] }>();
-    private portals = new Map<string, { statement: string; parameters: SqlValue[]; described: boolean }>();
+    private portals = new Map<string, PortalState>();
     private extendedFailed = false;
     private closing = false;
     private readonly runtime: SessionRuntime = createSessionRuntime();
@@ -435,6 +562,8 @@ class Session {
                 isScrollable: cursor.scroll,
                 creationTime: cursor.creationTime,
             }));
+        this.runtime.passwordEncryption = () =>
+            this.state?.parameters.get('password_encryption') ?? GUC_DEFAULTS.get('password_encryption') ?? 'scram-sha-256';
         hub.sessions.add(this);
     }
 
@@ -632,6 +761,11 @@ class Session {
             return;
         }
         this.startupPhase = false;
+        if ('scram' in this.auth) {
+            this.scram = { phase: 'initial' };
+            this.socket.write(authenticationSasl(['SCRAM-SHA-256']));
+            return;
+        }
         this.awaitingPassword = true;
         this.socket.write(authenticationCleartextPassword());
     }
@@ -689,10 +823,91 @@ class Session {
         this.socket.write(readyForQuery('I'));
     }
 
+    /**
+     * One SASL step of the startup exchange: `SASLInitialResponse` carrying the
+     * client-first message, then `SASLResponse` carrying the client-final one.
+     * Channel binding is not implemented, so the server advertises only
+     * `SCRAM-SHA-256` and a client that asks for `SCRAM-SHA-256-PLUS` is
+     * rejected, the way a real PostgreSQL without TLS behaves.
+     */
+    private handleSaslMessage(tag: string, payload: Buffer): void {
+        const user = this.startupParameters.get('user') ?? '';
+        const phase = this.scram?.phase;
+        if (tag !== 'p') {
+            this.fail('08P01', `expected ${phase === 'final' ? 'SASLResponse' : 'SASLInitialResponse'}, but got message type ${tag.charCodeAt(0)}`);
+            return;
+        }
+        if (phase === 'initial') {
+            const mechanism = cstring(payload, 0);
+            if (mechanism.value !== 'SCRAM-SHA-256') {
+                this.fail('08P01', `unsupported SASL mechanism "${mechanism.value}"`);
+                return;
+            }
+            if (payload.length < mechanism.next + 4) {
+                this.fail('08P01', 'invalid SASLInitialResponse message length');
+                return;
+            }
+            const length = payload.readInt32BE(mechanism.next);
+            if (length < 0 || payload.length < mechanism.next + 4 + length) {
+                this.fail('08P01', 'invalid SASLInitialResponse message length');
+                return;
+            }
+            const clientFirst = payload.subarray(mechanism.next + 4, mechanism.next + 4 + length).toString('utf8');
+            if (!clientFirst.startsWith('n,,')) {
+                this.fail('08P01', 'SCRAM channel binding is not supported');
+                return;
+            }
+            const clientFirstBare = clientFirst.slice(3);
+            const fields = scramFields(clientFirstBare);
+            const clientNonce = fields.get('r');
+            // PostgreSQL authenticates the startup-packet user and treats the
+            // SCRAM `n=` field as advisory; node-postgres sends `n=*`.
+            if (clientNonce === undefined || clientNonce.length === 0 || fields.get('n') === undefined) {
+                this.fail('08P01', 'invalid SCRAM first message');
+                return;
+            }
+            const stored = this.cluster.findRole(user)?.rolpassword;
+            const verifier = stored === undefined ? null : parseScramVerifier(stored);
+            if (verifier === null) {
+                this.fail('28P01', `password authentication failed for user "${user}"`);
+                return;
+            }
+            const combinedNonce = `${clientNonce}${scramNonce()}`;
+            const serverFirst = `r=${combinedNonce},s=${verifier.salt.toString('base64')},i=${verifier.iterations}`;
+            this.scram = { phase: 'final', clientFirstBare, serverFirst, combinedNonce, verifier };
+            this.socket.write(authenticationSaslContinue(serverFirst));
+            return;
+        }
+
+        if (this.scram === null || this.scram.phase !== 'final') {
+            this.fail('08P01', 'invalid SCRAM final message');
+            return;
+        }
+        const { clientFirstBare, serverFirst, combinedNonce, verifier } = this.scram;
+        const fields = scramFields(payload.toString('utf8'));
+        if (fields.get('c') !== SCRAM_CHANNEL_BINDING_NO || fields.get('r') !== combinedNonce || fields.get('p') === undefined) {
+            this.fail('08P01', 'invalid SCRAM final message');
+            return;
+        }
+        const clientFinalWithoutProof = `c=${SCRAM_CHANNEL_BINDING_NO},r=${combinedNonce}`;
+        const authMessage = `${clientFirstBare},${serverFirst},${clientFinalWithoutProof}`;
+        if (!scramClientProofValid(verifier, authMessage, fields.get('p') as string)) {
+            this.fail('28P01', `password authentication failed for user "${user}"`);
+            return;
+        }
+        this.scram = null;
+        this.socket.write(authenticationSaslFinal(`v=${scramServerSignature(verifier, authMessage)}`));
+        this.completeAuthentication();
+    }
+
     private handleMessage(tag: string, payload: Buffer): void {
+        if (this.scram !== null) {
+            this.handleSaslMessage(tag, payload);
+            return;
+        }
         if (this.awaitingPassword && tag === 'p') {
             const password = cstring(payload, 0).value;
-            if (this.auth !== 'trust' && password === this.auth.password) {
+            if (typeof this.auth === 'object' && 'password' in this.auth && password === this.auth.password) {
                 this.completeAuthentication();
                 return;
             }
@@ -1206,6 +1421,11 @@ class Session {
                 );
             }
             value = level;
+        } else if (key === 'statement_timeout') {
+            // Validate like PostgreSQL's `parse_int`; the executor re-reads the
+            // stored text per statement, so the value itself stays as entered.
+            parseTimeoutMs(key, text);
+            value = text;
         } else if (GUC_BOOLEAN.has(key)) {
             value = normalizeBoolean(key, text);
         } else if (key === 'TimeZone' && text.toUpperCase() === 'UTC') {
@@ -1230,10 +1450,29 @@ class Session {
     }
 
     /**
+     * Arms `statement_timeout` around one statement. The executor checks the
+     * deadline at row boundaries, so a scan, join or aggregate that runs past
+     * it aborts with `57014`; inside a transaction block the statement error
+     * then puts the block in the aborted state, exactly like PostgreSQL.
+     * `0` (the default) leaves the deadline unarmed.
+     */
+    private runParsed(state: SessionState, database: Database, statement: Statement, parameters: SqlValue[], topLevel = true): ServerOutcome {
+        const raw = state.parameters.get('statement_timeout') ?? GUC_DEFAULTS.get('statement_timeout') ?? '0';
+        const ms = parseTimeoutMs('statement_timeout', raw);
+        const deadline = ms <= 0 ? Number.POSITIVE_INFINITY : Date.now() + ms;
+        const previous = armStatementDeadline(deadline);
+        try {
+            return this.runParsedArmed(state, database, statement, parameters, topLevel);
+        } finally {
+            restoreStatementDeadline(previous);
+        }
+    }
+
+    /**
      * Runs one statement: session GUCs, then session-owned SQL, then the engine.
      * `topLevel` is false for every statement of a multi-statement simple query.
      */
-    private runParsed(state: SessionState, database: Database, statement: Statement, parameters: SqlValue[], topLevel = true): ServerOutcome {
+    private runParsedArmed(state: SessionState, database: Database, statement: Statement, parameters: SqlValue[], topLevel = true): ServerOutcome {
         this.assertWritable(statement);
         switch (statement.kind) {
             case 'copy': {
@@ -1295,6 +1534,11 @@ class Session {
             case 'drop-index':
                 if (statement.concurrently && (this.transaction !== null || !topLevel)) {
                     throw new ServerError('25001', 'DROP INDEX CONCURRENTLY cannot run inside a transaction block');
+                }
+                return runStatement(database, statement, parameters);
+            case 'vacuum':
+                if (this.transaction !== null || !topLevel) {
+                    throw new ServerError('25001', 'VACUUM cannot run inside a transaction block');
                 }
                 return runStatement(database, statement, parameters);
             case 'create-table': {
@@ -1600,9 +1844,30 @@ class Session {
                 }
                 parameters.push(decodeBinaryParameter(buffer, oid));
             }
-            this.portals.set(portal.value, { statement: statement.value, parameters, described: false });
+            if (offset + 2 > payload.length) throw new ServerError('08P01', 'invalid Bind message: missing result format count');
+            const resultFormatCount = payload.readInt16BE(offset);
+            offset += 2;
+            const resultFormats: number[] = [];
+            for (let index = 0; index < resultFormatCount; index += 1) {
+                if (offset + 2 > payload.length) throw new ServerError('08P01', 'invalid Bind message: truncated result formats');
+                const format = payload.readInt16BE(offset);
+                offset += 2;
+                if (format !== 0 && format !== 1) throw new ServerError('08P01', `invalid result format code ${format}`);
+                resultFormats.push(format);
+            }
+            this.portals.set(portal.value, {
+                statement: statement.value,
+                parameters,
+                resultFormats,
+                described: false,
+                suspendable: false,
+                position: 0,
+            });
             this.socket.write(bindComplete());
         } catch (error) {
+            // Like PostgreSQL, any `Bind` failure inside a transaction block
+            // aborts the block; the next statement is refused until it ends.
+            if (this.transaction !== null) this.abortTransaction();
             this.sendExtendedError(error);
         }
     }
@@ -1636,29 +1901,39 @@ class Session {
                 const prepared = this.prepared.get(portal.statement);
                 if (!prepared) throw new ServerError('26000', `prepared statement "${portal.statement}" does not exist`);
                 portal.described = true;
-                this.socket.write(this.describeSql(prepared.sql, portal.parameters.length));
+                this.socket.write(this.describeSql(prepared.sql, portal.parameters.length, portal.resultFormats));
                 return;
             }
             throw new ServerError('08P01', `invalid DESCRIBE message subtype ${kind}`);
         } catch (error) {
+            // A `Describe` failure aborts the transaction block too, so the
+            // block's `COMMIT` reports `ROLLBACK` like PostgreSQL's.
+            if (this.transaction !== null) this.abortTransaction();
             this.sendExtendedError(error);
         }
     }
 
-    private describeSql(sql: string, parameterCount: number): Buffer {
+    /**
+     * Builds the `RowDescription` (or `NoData`) a `Describe` answers with.
+     *
+     * `resultFormats` come from the portal's `Bind`; a statement `Describe` has
+     * no portal yet, so PostgreSQL always answers text there and the default is
+     * empty.
+     */
+    private describeSql(sql: string, parameterCount: number, resultFormats: number[] = []): Buffer {
         const statement = sql.trim();
         if (statement.length === 0) return noData();
         const show = /^show\s+(?:"([^"]+)"|([a-z_][a-z0-9_.]*))$/i.exec(statement);
         const showName = show?.[1] ?? show?.[2];
         if (showName !== undefined) {
             const name = canonicalGuc(showName) ?? showName.toLowerCase();
-            return rowDescription([{ name, typeOid: TEXT_OID, typeLength: -1 }]);
+            return rowDescription(applyResultFormats([{ name, typeOid: TEXT_OID, typeLength: -1 }], resultFormats));
         }
         const parsed = parseStatement(statement);
         if (parsed.kind !== 'select') return noData();
         const placeholders = Array.from({ length: parameterCount }, () => null);
         const database = this.transaction?.database ?? Database.open(this.storage, this.cluster, this.runtime);
-        return rowDescription(wireFields(describeSelect(database, parsed, placeholders)));
+        return rowDescription(applyResultFormats(wireFields(describeSelect(database, parsed, placeholders)), resultFormats));
     }
 
     private handleExecute(payload: Buffer): void {
@@ -1668,13 +1943,23 @@ class Session {
             return;
         }
         try {
-            const portalName = cstring(payload, 0).value;
-            const portal = this.portals.get(portalName);
-            if (!portal) throw new ServerError('34000', `portal "${portalName}" does not exist`);
+            const portalName = cstring(payload, 0);
+            const maxRows = payload.readInt32BE(portalName.next);
+            if (maxRows < 0) throw new ServerError('08P01', 'invalid row limit in Execute message');
+            const portal = this.portals.get(portalName.value);
+            if (!portal) throw new ServerError('34000', `portal "${portalName.value}" does not exist`);
             const prepared = this.prepared.get(portal.statement);
             if (!prepared) throw new ServerError('26000', `prepared statement "${portal.statement}" does not exist`);
-            const outcome = this.executeStatement(prepared.sql, portal.parameters);
-            this.emitOutcome(outcome, portal.described);
+            if (portal.outcome === undefined) {
+                portal.outcome = this.executeStatement(prepared.sql, portal.parameters);
+                // Only a plain `SELECT` portal suspends, like PostgreSQL's
+                // `PORTAL_ONE_SELECT`; utility and modifying statements run to
+                // completion whatever row limit arrives.
+                portal.suspendable =
+                    portal.outcome.kind === 'rows' && /^(?:select|with|table|values)\b/i.test(prepared.sql.trim());
+                portal.position = 0;
+            }
+            this.emitPortal(portal, maxRows);
         } catch (error) {
             if (error instanceof LockWait) {
                 const handle = this.transaction?.handle ?? this.implicitHandle;
@@ -1698,6 +1983,43 @@ class Session {
         this.pump();
     }
 
+    /**
+     * Streams one `Execute` batch from a portal's materialized rows.
+     *
+     * A positive row limit stops after that many rows and answers
+     * `PortalSuspended` without a `CommandComplete`, leaving the portal alive at
+     * its read position; the next `Execute` on the same portal continues there.
+     * A limit of `0` runs the portal to completion. The completion tag counts
+     * the rows this `Execute` sent, so the final batch of a suspended portal
+     * reports `SELECT <batch size>`, exactly like PostgreSQL.
+     */
+    private emitPortal(portal: PortalState, maxRows: number): void {
+        const outcome = portal.outcome;
+        if (outcome === undefined) return;
+        if (outcome.kind !== 'rows') {
+            this.emitOutcome(outcome, portal.described);
+            return;
+        }
+        const rows = outcome.rows;
+        const start = portal.position;
+        const limit = maxRows === 0 || !portal.suspendable ? rows.length - start : maxRows;
+        const end = Math.min(start + Math.max(limit, 0), rows.length);
+        const parts: Buffer[] = [];
+        if (!portal.described) parts.push(rowDescription(applyResultFormats(wireFields(outcome.fields), portal.resultFormats)));
+        for (let index = start; index < end; index += 1) parts.push(dataRow(binaryCells(rows[index]!, outcome.fields, portal.resultFormats)));
+        portal.position = end;
+        // PostgreSQL suspends whenever the batch filled the requested limit, even
+        // when the portal happened to run dry exactly there; the next `Execute`
+        // then answers zero rows and the completion tag.
+        const sent = end - start;
+        if (portal.suspendable && maxRows > 0 && sent === maxRows) {
+            parts.push(portalSuspended());
+        } else {
+            parts.push(commandComplete(portal.suspendable ? `SELECT ${sent}` : outcome.tag));
+        }
+        this.socket.write(Buffer.concat(parts));
+    }
+
     private handleClose(payload: Buffer): void {
         const kind = String.fromCharCode(payload[0] ?? 0);
         const name = cstring(payload, 1).value;
@@ -1708,7 +2030,10 @@ class Session {
 
     private handleSync(): void {
         this.extendedFailed = false;
-        this.portals.delete('');
+        // `Sync` ends the implicit transaction, and every portal bound inside it
+        // dies with the transaction. Only an open explicit transaction keeps a
+        // named portal — and with it a suspended `Execute` position — alive.
+        if (this.transaction === null) this.portals.clear();
         this.socket.write(readyForQuery(this.transactionStatus()));
     }
 
@@ -1725,7 +2050,7 @@ class Session {
                 this.socket.write(parameterStatus(parameter.name, parameter.value));
             }
             for (const notice of outcome.notices ?? []) {
-                this.socket.write(noticeResponse({ severity: 'NOTICE', code: notice.code, message: notice.message }));
+                this.socket.write(noticeResponse({ severity: notice.severity ?? 'NOTICE', code: notice.code, message: notice.message }));
             }
             this.socket.write(commandComplete(outcome.tag));
             return;
@@ -1787,6 +2112,14 @@ function writeVerb(statement: Statement): string | undefined {
             return 'CREATE TABLE';
         case 'drop-table':
             return 'DROP TABLE';
+        case 'create-view':
+            return 'CREATE VIEW';
+        case 'drop-view':
+            return 'DROP VIEW';
+        case 'vacuum':
+            return 'VACUUM';
+        case 'analyze':
+            return 'ANALYZE';
         case 'create-index':
             return 'CREATE INDEX';
         case 'drop-index':

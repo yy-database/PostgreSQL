@@ -29,6 +29,7 @@ import {
 } from './catalog.ts';
 import type { Database, IndexScanStat } from './database.ts';
 import { type ClusterRole, findRole, hasDatabasePrivilege, roleIsSuperuser } from './cluster.ts';
+import { deriveScramSecret, formatScramVerifier, parseScramVerifier } from '../scram.ts';
 import { defaultAcl, defaultNamespaceAcl, formatAcl, grantAcl, parseAcl, privilegeLetters, revokeAcl } from './acl.ts';
 import {
     checkGrant,
@@ -48,11 +49,14 @@ import {
     type ColumnDef,
     type ColumnExpr,
     type CommonTableExpression,
+    type AnalyzeStatement,
     type CreateIndexStatement,
     type CreateTableStatement,
+    type CreateViewStatement,
     type DeleteStatement,
     type DropIndexStatement,
     type DropTableStatement,
+    type DropViewStatement,
     type ExplainStatement,
     type Expr,
     type FrameBound,
@@ -78,9 +82,11 @@ import {
     type RevokeStatement,
     type UnaryExpr,
     type UpdateStatement,
+    type VacuumStatement,
     type WindowFrame,
     type WindowSpec,
     parseExpression,
+    parseViewQuery,
 } from './parser.ts';
 import {
     BOOL,
@@ -100,6 +106,32 @@ import {
     typeOid,
 } from './types.ts';
 
+/**
+ * Cooperative `statement_timeout` deadline: epoch milliseconds, `Infinity`
+ * when unarmed. The session arms it around one statement and the executor
+ * checks it at row boundaries, so a long scan, join or aggregate aborts with
+ * `57014` the way PostgreSQL cancels a timed-out statement.
+ */
+let statementDeadline = Number.POSITIVE_INFINITY;
+
+/** Arms one statement's deadline and returns the value it replaced. */
+export function armStatementDeadline(deadline: number): number {
+    const previous = statementDeadline;
+    statementDeadline = Math.min(previous, deadline);
+    return previous;
+}
+
+/** Restores the deadline a previous arm returned. */
+export function restoreStatementDeadline(deadline: number): void {
+    statementDeadline = deadline;
+}
+
+/** Aborts the running statement once its armed deadline has passed. */
+function checkStatementDeadline(): void {
+    if (statementDeadline === Number.POSITIVE_INFINITY || Date.now() <= statementDeadline) return;
+    throw new ServerError('57014', 'canceling statement due to statement timeout');
+}
+
 export interface Field {
     name: string;
     type: DataType;
@@ -107,7 +139,7 @@ export interface Field {
 
 export type Outcome =
     | { kind: 'rows'; fields: Field[]; rows: SqlValue[][]; tag: string }
-    | { kind: 'command'; tag: string; notices?: { code: string; message: string }[] };
+    | { kind: 'command'; tag: string; notices?: { code: string; message: string; severity?: 'NOTICE' | 'WARNING' }[] };
 
 interface Binding {
     alias: string;
@@ -167,6 +199,14 @@ function emptyTagName(statement: Statement): string {
             return 'CREATE TABLE';
         case 'drop-table':
             return 'DROP TABLE';
+        case 'create-view':
+            return 'CREATE VIEW';
+        case 'drop-view':
+            return 'DROP VIEW';
+        case 'vacuum':
+            return 'VACUUM';
+        case 'analyze':
+            return 'ANALYZE';
         case 'create-index':
             return 'CREATE INDEX';
         case 'drop-index':
@@ -193,6 +233,14 @@ export function runStatement(database: Database, statement: Statement, params: S
             return createTable(database, statement);
         case 'drop-table':
             return dropTable(database, statement);
+        case 'create-view':
+            return createView(database, statement);
+        case 'drop-view':
+            return dropView(database, statement);
+        case 'vacuum':
+            return runVacuum(database, statement);
+        case 'analyze':
+            return runAnalyze(database, statement);
         case 'insert':
             return insertRows(database, statement, params);
         case 'update':
@@ -583,6 +631,7 @@ function executeCore(
     // WHERE runs per input row; grouping and windows need the surviving rows.
     const rows: Context[] = [];
     for (const row of from.rows) {
+        checkStatementDeadline();
         const context: Context = { columns: from.columns, row, outer };
         if (core.where) {
             const keep = evaluate(database, core.where, context, params);
@@ -1299,6 +1348,7 @@ function onJoin(
         const rightIndexes = equi.pairs.map((pair) => pair.rightIndex);
         const build = new Map<string, number[]>();
         for (let rightIndex = 0; rightIndex < right.rows.length; rightIndex += 1) {
+            checkStatementDeadline();
             const key = hashKey(right.rows[rightIndex]!, rightIndexes);
             if (key === null) continue;
             const bucket = build.get(key);
@@ -1306,12 +1356,14 @@ function onJoin(
             else bucket.push(rightIndex);
         }
         for (let leftIndex = 0; leftIndex < left.rows.length; leftIndex += 1) {
+            checkStatementDeadline();
             const leftRow = left.rows[leftIndex]!;
             const key = hashKey(leftRow, leftIndexes);
             if (key === null) continue;
             const bucket = build.get(key);
             if (bucket === undefined) continue;
             for (const rightIndex of bucket) {
+                checkStatementDeadline();
                 const row = [...leftRow, ...right.rows[rightIndex]!];
                 if (equi.rest.length > 0) {
                     const context: Context = { columns, row, outer };
@@ -1331,8 +1383,10 @@ function onJoin(
         }
     } else {
         for (let leftIndex = 0; leftIndex < left.rows.length; leftIndex += 1) {
+            checkStatementDeadline();
             const leftRow = left.rows[leftIndex]!;
             for (let rightIndex = 0; rightIndex < right.rows.length; rightIndex += 1) {
+                checkStatementDeadline();
                 const rightRow = right.rows[rightIndex]!;
                 const row = [...leftRow, ...rightRow];
                 const context: Context = { columns, row, outer };
@@ -1403,8 +1457,10 @@ function usingJoin(
     const leftMatched = new Array<boolean>(left.rows.length).fill(false);
     const rightMatched = new Array<boolean>(right.rows.length).fill(false);
     for (let leftIndex = 0; leftIndex < left.rows.length; leftIndex += 1) {
+        checkStatementDeadline();
         const leftRow = left.rows[leftIndex]!;
         for (let rightIndex = 0; rightIndex < right.rows.length; rightIndex += 1) {
+            checkStatementDeadline();
             const rightRow = right.rows[rightIndex]!;
             let matched = true;
             for (let position = 0; position < names.length; position += 1) {
@@ -1457,7 +1513,12 @@ function usingJoin(
 function crossJoin(left: RowSet, right: RowSet): RowSet {
     const columns = [...left.columns, ...right.columns];
     const rows: SqlValue[][] = [];
-    for (const leftRow of left.rows) for (const rightRow of right.rows) rows.push([...leftRow, ...rightRow]);
+    for (const leftRow of left.rows) {
+        for (const rightRow of right.rows) {
+            checkStatementDeadline();
+            rows.push([...leftRow, ...rightRow]);
+        }
+    }
     return { columns, rows };
 }
 
@@ -1507,6 +1568,7 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
     const relation = relationByName(database.catalog, ref.name);
     if (!relation) throw new ServerError('42P01', `relation "${ref.name}" does not exist`, undefined, ref.start);
     checkGrantOnTable(database, relation, 'SELECT');
+    if (relation.relkind === 'v') return expandView(database, relation, ref, params, context);
     const columns: ColumnMeta[] = database.catalog.columns
         .filter((column) => column.relid === relation.oid)
         .sort((left, right) => left.attnum - right.attnum)
@@ -1534,7 +1596,11 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
         );
         if (plan !== null) return scanIndexRows(database, relation, columns, alias, plan, ordered.limit, true);
     }
-    const rows = [...database.table(relation.oid).values()].map((row) => [...row, relation.oid]);
+    const rows: SqlValue[][] = [];
+    for (const row of database.table(relation.oid).values()) {
+        checkStatementDeadline();
+        rows.push([...row, relation.oid]);
+    }
     return {
         columns: [
             ...columns.map((column) => ({ alias, name: column.name, type: column.type })),
@@ -1542,6 +1608,42 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
         ],
         rows,
     };
+}
+
+/** View oids currently being expanded, for the `42P17` cycle guard. */
+const viewExpansions: number[] = [];
+
+/**
+ * Expands a view relation by running its stored query, so a view never copies
+ * data. Column names and types come from the definition captured at
+ * `CREATE VIEW` time, the rows from the live base relations.
+ */
+function expandView(database: Database, relation: UserRelation, ref: RelationRef, params: SqlValue[], outer: Context | undefined): RowSet {
+    if (viewExpansions.includes(relation.oid)) {
+        throw new ServerError('42P17', `infinite recursion detected in rules for relation "${relation.name}"`);
+    }
+    const stored = database.catalog.views.find((view) => view.oid === relation.oid);
+    if (stored === undefined) throw new ServerError('42P01', `relation "${relation.name}" does not exist`, undefined, ref.start);
+    const alias = ref.alias ?? ref.name;
+    const declared = database.catalog.columns
+        .filter((column) => column.relid === relation.oid)
+        .sort((left, right) => left.attnum - right.attnum);
+    viewExpansions.push(relation.oid);
+    try {
+        const select = parseViewQuery(stored.definition);
+        const result = executeSelect(database, select, params, outer);
+        return {
+            columns: result.fields.map((field, index) => {
+                const column = declared[index];
+                return column === undefined
+                    ? { alias, name: field.name, type: field.type }
+                    : { alias, name: column.name, type: typeByOid(column.typeOid, column.typmod) };
+            }),
+            rows: result.rows,
+        };
+    } finally {
+        viewExpansions.pop();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2067,7 +2169,12 @@ function evaluateAggregate(database: Database, expr: FunctionExpr, context: Cont
         outer: context.outer ? { columns: context.outer.columns, outer: undefined } : undefined,
     };
     const argumentTypes = expr.args.map((arg) => fieldType(database, arg, scope, params));
-    const columns = expr.args.map((arg) => rows.map((row) => evaluate(database, arg, row, params)));
+    const columns = expr.args.map((arg) =>
+        rows.map((row) => {
+            checkStatementDeadline();
+            return evaluate(database, arg, row, params);
+        }),
+    );
     return aggregateValue(name, columns, expr.distinct === true, expr.name, argumentTypes[0]);
 }
 
@@ -3029,6 +3136,16 @@ function dropTable(database: Database, statement: DropTableStatement): Outcome {
     }
     if (relation.relkind !== 'r') throw new ServerError('42P01', `table "${statement.table.name}" does not exist`);
     checkTableOwner(database, relation);
+    const viewDependents = dependentViewClosure(catalog, relation.name);
+    if (viewDependents.length > 0 && !statement.cascade) {
+        throw new ServerError(
+            '2BP01',
+            `cannot drop table ${relation.name} because other objects depend on it`,
+            viewDependents.map((view) => `view ${view.name} depends on table ${relation.name}`).join('\n'),
+            undefined,
+            'Use DROP ... CASCADE to drop the dependent objects too.',
+        );
+    }
     const referencing = catalog.relations.filter((candidate) => catalog.constraints.some((constraint) => constraint.confrelid === relation.oid && constraint.contype === 'f' && constraint.relid === candidate.oid));
     if (referencing.length > 0 && !statement.cascade) {
         throw new ServerError(
@@ -3047,8 +3164,302 @@ function dropTable(database: Database, statement: DropTableStatement): Outcome {
     catalog.sequences = catalog.sequences.filter((sequence) => sequence.relid !== relation.oid);
     delete catalog.nextRowId[String(relation.oid)];
     for (const key of [...database.table(relation.oid).keys()]) database.deleteRow(relation.oid, key);
+    const notices: { code: string; message: string; severity?: 'NOTICE' | 'WARNING' }[] = [];
+    for (const view of viewDependents) {
+        removeViewRelation(database, view);
+        notices.push({ code: '00000', message: `drop cascades to view ${view.name}` });
+    }
     database.markCatalogDirty();
-    return { kind: 'command', tag: 'DROP TABLE' };
+    return notices.length === 0 ? { kind: 'command', tag: 'DROP TABLE' } : { kind: 'command', tag: 'DROP TABLE', notices };
+}
+
+// ---------------------------------------------------------------------------
+// Views
+// ---------------------------------------------------------------------------
+
+/**
+ * Views whose stored definition reads the relation called `name`.
+ *
+ * Dependencies are tracked by name, the same way the engine resolves every
+ * other relation reference. The walk covers `FROM` items, expression
+ * subqueries and `WITH` clauses, so a view nested over another view is found.
+ */
+function dependentViews(catalog: CatalogDoc, name: string): UserRelation[] {
+    const wanted = name.toLowerCase();
+    const refs = (select: SelectStatement): boolean => {
+        const coreRefs = (core: SelectStatement['core']): boolean =>
+            core.from.some((item) => itemRefs(item, wanted)) ||
+            core.targets.some((target) => exprRefs(target.expr, wanted)) ||
+            (core.where !== undefined && exprRefs(core.where, wanted)) ||
+            core.groupBy.some((expr) => exprRefs(expr, wanted)) ||
+            (core.having !== undefined && exprRefs(core.having, wanted));
+        return (
+            select.with?.ctes.some((cte) => refs(cte.select)) === true ||
+            coreRefs(select.core) ||
+            select.unions.some((union) => coreRefs(union.core))
+        );
+    };
+    const itemRefs = (item: FromItem, name2: string): boolean => {
+        if (item.kind === 'relation') return item.args === undefined && item.name.toLowerCase() === name2;
+        if (item.kind === 'subquery') return refs(item.select);
+        return itemRefs(item.left, name2) || itemRefs(item.right, name2);
+    };
+    const exprRefs = (expr: Expr, name2: string): boolean => {
+        switch (expr.kind) {
+            case 'subquery':
+                return refs((expr as SubqueryExpr).select);
+            case 'exists':
+                return refs((expr as { select: SelectStatement }).select);
+            case 'in': {
+                const node = expr as InExpr;
+                if (node.select !== undefined && refs(node.select)) return true;
+                return node.list.some((item) => exprRefs(item, name2));
+            }
+            default:
+                return expressionChildren(expr).some((child) => exprRefs(child, name2));
+        }
+    };
+    return catalog.relations.filter((relation) => {
+        if (relation.relkind !== 'v') return false;
+        const stored = catalog.views.find((view) => view.oid === relation.oid);
+        if (stored === undefined) return false;
+        try {
+            return refs(parseViewQuery(stored.definition));
+        } catch {
+            return false;
+        }
+    });
+}
+
+/**
+ * Every view that depends on `name`, directly or through another view, so a
+ * cascading drop removes the whole chain instead of leaving a dangling view.
+ * `exclude` keeps the relation being dropped out of its own dependent list.
+ */
+function dependentViewClosure(catalog: CatalogDoc, name: string, exclude?: number): UserRelation[] {
+    const found: UserRelation[] = [];
+    const seen = new Set<number>();
+    const pending = [name.toLowerCase()];
+    const searched = new Set(pending);
+    while (pending.length > 0) {
+        const current = pending.shift()!;
+        for (const view of dependentViews(catalog, current)) {
+            if (seen.has(view.oid) || view.oid === exclude) continue;
+            seen.add(view.oid);
+            found.push(view);
+            if (!searched.has(view.name.toLowerCase())) {
+                searched.add(view.name.toLowerCase());
+                pending.push(view.name.toLowerCase());
+            }
+        }
+    }
+    return found;
+}
+
+/** Removes a view relation and its columns from the catalog document. */
+function removeViewRelation(database: Database, relation: UserRelation): void {
+    const catalog = database.catalog;
+    catalog.relations = catalog.relations.filter((candidate) => candidate.oid !== relation.oid);
+    catalog.columns = catalog.columns.filter((column) => column.relid !== relation.oid);
+    catalog.views = catalog.views.filter((view) => view.oid !== relation.oid);
+}
+
+/**
+ * Resolves the output columns of a stored view query. The query runs once so a
+ * missing base relation fails at `CREATE VIEW`, the way PostgreSQL parses the
+ * definition at definition time.
+ */
+function resolveViewColumns(database: Database, select: SelectStatement, aliases: string[] | undefined): { name: string; type: DataType }[] {
+    const result = executeSelect(database, select, [], undefined);
+    if (aliases !== undefined && aliases.length > result.fields.length) {
+        throw new ServerError('42601', 'CREATE VIEW specifies more column names than columns');
+    }
+    const names = aliases ?? result.fields.map((field) => field.name);
+    const columns = result.fields.map((field, index) => ({ name: names[index] ?? field.name, type: field.type }));
+    const seen = new Set<string>();
+    for (const column of columns) {
+        if (seen.has(column.name)) throw new ServerError('42701', `column "${column.name}" specified more than once`);
+        seen.add(column.name);
+    }
+    return columns;
+}
+
+function createView(database: Database, statement: CreateViewStatement): Outcome {
+    const catalog = database.catalog;
+    if (statement.view.schema !== undefined && statement.view.schema !== 'public') {
+        throw new ServerError('3F000', `schema "${statement.view.schema}" does not exist`);
+    }
+    const existing = relationByName(catalog, statement.view.name);
+    if (existing !== undefined && statement.orReplace && existing.relkind !== 'v') {
+        throw new ServerError('42809', `"${statement.view.name}" is not a view`);
+    }
+    if (existing !== undefined && !statement.orReplace) {
+        throw new ServerError('42P07', `relation "${statement.view.name}" already exists`);
+    }
+    checkGrant(database, { type: 'schema', name: 'public' }, 'CREATE');
+    const columns = resolveViewColumns(database, statement.select, statement.columns);
+    if (existing !== undefined) {
+        // `CREATE OR REPLACE VIEW` may only append columns; existing names and
+        // types keep their positions, matching `checkViewTupleDesc`.
+        const previous = catalog.columns
+            .filter((column) => column.relid === existing.oid)
+            .sort((left, right) => left.attnum - right.attnum);
+        if (previous.length > columns.length) throw new ServerError('42P16', 'cannot drop columns from view');
+        for (let index = 0; index < previous.length; index += 1) {
+            const old = previous[index]!;
+            const next = columns[index]!;
+            if (old.name !== next.name) {
+                throw new ServerError(
+                    '42P16',
+                    `cannot change name of view column "${old.name}" to "${next.name}"`,
+                    undefined,
+                    undefined,
+                    'Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead.',
+                );
+            }
+            const oldType = typeByOid(old.typeOid, old.typmod);
+            if (oldType.key !== next.type.key || oldType.typmod !== next.type.typmod) {
+                throw new ServerError(
+                    '42P16',
+                    `cannot change data type of view column "${old.name}" from ${formatType(oldType)} to ${formatType(next.type)}`,
+                );
+            }
+        }
+        catalog.columns = catalog.columns.filter((column) => column.relid !== existing.oid);
+        columns.forEach((column, index) => {
+            catalog.columns.push({
+                relid: existing.oid,
+                attnum: index + 1,
+                name: column.name,
+                typeOid: typeOid(column.type),
+                typmod: column.type.typmod,
+                notNull: false,
+                defaultText: null,
+                defaultValue: null,
+                defaultKind: null,
+                sequenceOid: null,
+                defaultOid: null,
+                identity: '',
+            });
+        });
+        const stored = catalog.views.find((view) => view.oid === existing.oid);
+        if (stored !== undefined) stored.definition = statement.source;
+        database.markCatalogDirty();
+        return { kind: 'command', tag: 'CREATE VIEW' };
+    }
+    const viewOid = allocateOid(catalog);
+    catalog.relations.push({
+        oid: viewOid,
+        name: statement.view.name,
+        namespace: PUBLIC_NAMESPACE,
+        relkind: 'v',
+        relam: 0,
+        owner: currentRoleOid(database),
+        relhasindex: false,
+    });
+    columns.forEach((column, index) => {
+        catalog.columns.push({
+            relid: viewOid,
+            attnum: index + 1,
+            name: column.name,
+            typeOid: typeOid(column.type),
+            typmod: column.type.typmod,
+            notNull: false,
+            defaultText: null,
+            defaultValue: null,
+            defaultKind: null,
+            sequenceOid: null,
+            defaultOid: null,
+            identity: '',
+        });
+    });
+    catalog.views.push({ oid: viewOid, definition: statement.source });
+    database.markCatalogDirty();
+    return { kind: 'command', tag: 'CREATE VIEW' };
+}
+
+function dropView(database: Database, statement: DropViewStatement): Outcome {
+    const catalog = database.catalog;
+    const notices: { code: string; message: string; severity?: 'NOTICE' | 'WARNING' }[] = [];
+    for (const ref of statement.views) {
+        const relation = relationByName(catalog, ref.name);
+        if (relation === undefined || relation.relkind !== 'v') {
+            if (statement.ifExists) {
+                notices.push({ code: '00000', message: `view "${ref.name}" does not exist, skipping` });
+                continue;
+            }
+            throw new ServerError('42P01', `view "${ref.name}" does not exist`, undefined, ref.start);
+        }
+        checkTableOwner(database, relation);
+        const dependents = dependentViewClosure(catalog, relation.name, relation.oid);
+        if (dependents.length > 0 && !statement.cascade) {
+            throw new ServerError(
+                '2BP01',
+                `cannot drop view ${relation.name} because other objects depend on it`,
+                dependents.map((view) => `view ${view.name} depends on view ${relation.name}`).join('\n'),
+                undefined,
+                'Use DROP ... CASCADE to drop the dependent objects too.',
+            );
+        }
+        removeViewRelation(database, relation);
+        for (const view of dependents) {
+            removeViewRelation(database, view);
+            notices.push({ code: '00000', message: `drop cascades to view ${view.name}` });
+        }
+    }
+    database.markCatalogDirty();
+    return notices.length === 0 ? { kind: 'command', tag: 'DROP VIEW' } : { kind: 'command', tag: 'DROP VIEW', notices };
+}
+
+// ---------------------------------------------------------------------------
+// VACUUM / ANALYZE
+// ---------------------------------------------------------------------------
+
+/**
+ * `VACUUM` and `ANALYZE` share the relation checks: a missing relation is
+ * `42P01`, anything that is not a table or index is skipped with a `01000`
+ * warning. The engine keeps no dead tuples, so both commands are no-ops.
+ */
+function maintenanceTarget(database: Database, table: RelationRef): { skipped: boolean; name: string } | null {
+    const relation = relationByName(database.catalog, table.name);
+    if (relation === undefined) {
+        if (systemColumns(table.name) !== undefined && table.schema === undefined) return null;
+        throw new ServerError('42P01', `relation "${table.name}" does not exist`, undefined, table.start);
+    }
+    if (relation.relkind !== 'r' && relation.relkind !== 'i') {
+        return { skipped: true, name: relation.name };
+    }
+    return { skipped: false, name: relation.name };
+}
+
+function runVacuum(database: Database, statement: VacuumStatement): Outcome {
+    const notices: { code: string; message: string; severity?: 'NOTICE' | 'WARNING' }[] = [];
+    if (statement.table !== undefined) {
+        const target = maintenanceTarget(database, statement.table);
+        if (target !== null && target.skipped) {
+            notices.push({ code: '01000', severity: 'WARNING', message: `skipping "${target.name}" --- cannot vacuum non-tables or special system tables` });
+        }
+    }
+    return notices.length === 0 ? { kind: 'command', tag: 'VACUUM' } : { kind: 'command', tag: 'VACUUM', notices };
+}
+
+function runAnalyze(database: Database, statement: AnalyzeStatement): Outcome {
+    const notices: { code: string; message: string; severity?: 'NOTICE' | 'WARNING' }[] = [];
+    if (statement.table !== undefined) {
+        const target = maintenanceTarget(database, statement.table);
+        if (target !== null && target.skipped) {
+            notices.push({ code: '01000', severity: 'WARNING', message: `skipping "${target.name}" --- cannot analyze non-tables or special system tables` });
+        }
+        else if (target !== null && statement.columns !== undefined) {
+            const columns = database.catalog.columns.filter((column) => column.relid === relationByName(database.catalog, statement.table!.name)?.oid);
+            for (const name of statement.columns) {
+                if (!columns.some((column) => column.name === name)) {
+                    throw new ServerError('42703', `column "${name}" of relation "${target.name}" does not exist`);
+                }
+            }
+        }
+    }
+    return notices.length === 0 ? { kind: 'command', tag: 'ANALYZE' } : { kind: 'command', tag: 'ANALYZE', notices };
 }
 
 // ---------------------------------------------------------------------------
@@ -4185,6 +4596,22 @@ function canCreateRoles(actor: ClusterRole): boolean {
     return actor.rolsuper || actor.rolcreaterole;
 }
 
+/**
+ * Derives the stored secret for one `PASSWORD` clause. `password_encryption`
+ * defaults to `scram-sha-256`; `md5` is accepted by `SET` but rejected here
+ * because this server does not implement the MD5 handshake. A literal that is
+ * already a SCRAM verifier is stored as written, like PostgreSQL.
+ */
+function rolePasswordVerifier(database: Database, password: string): string {
+    const encryption = database.session.passwordEncryption?.() ?? 'scram-sha-256';
+    if (encryption.toLowerCase() === 'md5') throw new ServerError('0A000', 'md5 password authentication is not supported');
+    if (password.startsWith('SCRAM-SHA-256$')) {
+        if (parseScramVerifier(password) === null) throw new ServerError('22023', 'invalid SCRAM verifier');
+        return password;
+    }
+    return formatScramVerifier(deriveScramSecret(password));
+}
+
 function createRole(database: Database, statement: CreateRoleStatement): Outcome {
     const actor = currentRole(database);
     if (!canCreateRoles(actor)) throw new ServerError('42501', 'permission denied to create role');
@@ -4204,6 +4631,9 @@ function createRole(database: Database, statement: CreateRoleStatement): Outcome
         rolreplication: statement.options.rolreplication ?? false,
         rolbypassrls: statement.options.rolbypassrls ?? false,
         rolconnlimit: statement.options.rolconnlimit ?? -1,
+        ...(typeof statement.options.password === 'string'
+            ? { rolpassword: rolePasswordVerifier(database, statement.options.password) }
+            : {}),
     });
     database.markRolesDirty();
     return command('CREATE ROLE');
@@ -4257,7 +4687,12 @@ function alterRole(database: Database, statement: AlterRoleStatement): Outcome {
         renameAclReferences(database, target.rolname, statement.rename);
         target.rolname = statement.rename;
     }
-    for (const [key, value] of Object.entries(statement.options) as [keyof ClusterRole, boolean | number][]) {
+    if (statement.options.password !== undefined) {
+        target.rolpassword =
+            statement.options.password === null ? undefined : rolePasswordVerifier(database, statement.options.password);
+    }
+    const { password: _password, ...flags } = statement.options;
+    for (const [key, value] of Object.entries(flags) as [keyof ClusterRole, boolean | number][]) {
         (target[key] as boolean | number) = value;
     }
     database.markRolesDirty();
