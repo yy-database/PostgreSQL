@@ -962,6 +962,103 @@ impl ServerStoreChange {
     }
 }
 
+/// Whether a process with this id is still running, the way PostgreSQL checks
+/// `postmaster.pid` before refusing a data directory.
+///
+/// Windows opens the process with `PROCESS_QUERY_LIMITED_INFORMATION` and
+/// treats `STILL_ACTIVE` as alive; Unix sends signal `0`, where success or
+/// `EPERM` both mean the process exists. PID reuse is accepted exactly as
+/// PostgreSQL accepts it: a recycled id keeps the lock owned.
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    type Dword = u32;
+    type Handle = *mut c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x1000;
+    const STILL_ACTIVE: Dword = 259;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: Dword, inherit_handle: i32, process_id: Dword) -> Handle;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut Dword) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: Dword = 0;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        queried && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    const EPERM: i32 = 1;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn __error() -> *mut i32;
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe extern "C" {
+        fn __errno_location() -> *mut i32;
+    }
+
+    let Ok(pid) = i32::try_from(pid)
+    else {
+        return false;
+    };
+    unsafe {
+        if kill(pid, 0) == 0 {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        let errno_ptr = __error();
+        #[cfg(not(target_os = "macos"))]
+        let errno_ptr = __errno_location();
+        *errno_ptr == EPERM
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn process_exists(_pid: u32) -> bool {
+    true
+}
+
+/// Drops a `postmaster.pid` whose recorded process is gone, so the next
+/// `ServerStore::open` takes the directory instead of asking the operator to
+/// delete the file. A live holder, an unreadable file or an unparseable first
+/// line all leave the lock in place and let the open fail as before.
+fn clear_stale_lock(data_dir: &str) {
+    let lock = std::path::Path::new(data_dir).join(database_client::pgsql::postmaster::LOCK_FILE);
+    let Ok(bytes) = std::fs::read(&lock)
+    else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let Some(first) = text.lines().next()
+    else {
+        return;
+    };
+    let Ok(pid) = first.trim().parse::<u32>()
+    else {
+        return;
+    };
+    if process_exists(pid) {
+        return;
+    }
+    let _ = std::fs::remove_file(&lock);
+}
+
 /// One durable server data directory: `.yyds` catalog, `.yykv` shard and lock.
 #[pyclass]
 pub struct ServerStore {
@@ -970,8 +1067,11 @@ pub struct ServerStore {
 
 #[pymethods]
 impl ServerStore {
+    /// Opens or creates the data directory and takes its lock, reclaiming a
+    /// `postmaster.pid` whose holder process is gone.
     #[new]
     fn new(data_dir: String) -> PyResult<Self> {
+        clear_stale_lock(&data_dir);
         CoreServerStore::open(&data_dir).map(|inner| Self { inner: Mutex::new(Some(inner)) }).map_err(native)
     }
 
