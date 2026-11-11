@@ -96,7 +96,7 @@ export function copyColumnCount(database: Database, statement: CopyStatement): n
     return copySource(database, statement).fields.length;
 }
 
-function escapeText(value: string): string {
+function escapeText(value: string, delimiter: string): string {
     let output = '';
     for (const character of value) {
         switch (character) {
@@ -122,7 +122,7 @@ function escapeText(value: string): string {
                 output += '\\v';
                 break;
             default:
-                output += character;
+                output += character === delimiter ? `\\${character}` : character;
         }
     }
     return output;
@@ -204,7 +204,7 @@ export function copyOut(database: Database, statement: CopyStatement): { data: s
     const options = resolveCopyOptions(statement.options);
     const source = copySource(database, statement);
     const render = (text: string | null): string =>
-        text === null ? options.nullString : options.format === 'csv' ? quoteCsv(text, options) : escapeText(text);
+        text === null ? options.nullString : options.format === 'csv' ? quoteCsv(text, options) : escapeText(text, options.delimiter);
     const lines: string[] = [];
     if (options.header) lines.push(source.fields.map((field) => render(field.name)).join(options.delimiter));
     for (const row of source.rows) {
@@ -221,6 +221,8 @@ export function copyOut(database: Database, statement: CopyStatement): { data: s
 interface CsvRecord {
     fields: string[];
     quoted: boolean[];
+    /** Original bytes of the record, echoed by COPY context messages. */
+    raw: string;
 }
 
 function parseCsvRecords(input: string, options: ResolvedCopyOptions): CsvRecord[] {
@@ -232,22 +234,26 @@ function parseCsvRecords(input: string, options: ResolvedCopyOptions): CsvRecord
     let inQuotes = false;
     let started = false;
     let index = 0;
+    let recordStart = 0;
     const pushField = (): void => {
         fields.push(field);
         quotedFlags.push(quoted);
         field = '';
         quoted = false;
     };
-    const endRecord = (): void => {
+    const endRecord = (end: number): void => {
         pushField();
-        records.push({ fields, quoted: quotedFlags });
+        const raw = input.slice(recordStart, end).replace(/\r$/, '');
+        records.push({ fields, quoted: quotedFlags, raw });
         fields = [];
         quotedFlags = [];
         started = false;
+        recordStart = end + 1;
     };
     while (index < input.length) {
         const character = input[index]!;
         if (!inQuotes && !started && fields.length === 0 && field.length === 0) {
+            // `\.` on a line of its own ends the data, as PostgreSQL's parser does.
             const rest = input.slice(index);
             if (rest === '\\.' || rest === '\\.\n' || rest === '\\.\r\n' || rest.startsWith('\\.\n') || rest.startsWith('\\.\r\n')) {
                 break;
@@ -288,7 +294,7 @@ function parseCsvRecords(input: string, options: ResolvedCopyOptions): CsvRecord
             continue;
         }
         if (character === '\n') {
-            endRecord();
+            endRecord(index);
             index += 1;
             continue;
         }
@@ -297,7 +303,7 @@ function parseCsvRecords(input: string, options: ResolvedCopyOptions): CsvRecord
                 index += 1;
                 continue;
             }
-            endRecord();
+            endRecord(index);
             index += 1;
             continue;
         }
@@ -305,18 +311,46 @@ function parseCsvRecords(input: string, options: ResolvedCopyOptions): CsvRecord
         started = true;
         index += 1;
     }
-    if (started || field.length > 0) endRecord();
+    if (started || field.length > 0) endRecord(index);
     return records;
 }
 
+/** Splits one text-format line, leaving backslash escapes in the raw fields. */
+function splitTextFields(line: string, delimiter: string): string[] {
+    const fields: string[] = [];
+    let field = '';
+    let index = 0;
+    while (index < line.length) {
+        const character = line[index]!;
+        if (character === '\\' && index + 1 < line.length) {
+            field += character + line[index + 1]!;
+            index += 2;
+            continue;
+        }
+        if (character === delimiter) {
+            fields.push(field);
+            field = '';
+            index += 1;
+            continue;
+        }
+        field += character;
+        index += 1;
+    }
+    fields.push(field);
+    return fields;
+}
+
 function parseTextRecords(input: string, options: ResolvedCopyOptions): CsvRecord[] {
+    if (input.length === 0) return [];
     const records: CsvRecord[] = [];
-    for (const rawLine of input.split('\n')) {
+    const lines = input.split('\n');
+    // The final newline terminates the last record instead of starting one.
+    if (input.endsWith('\n')) lines.pop();
+    for (const rawLine of lines) {
         const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
         if (line === '\\.') break;
-        if (line.length === 0) continue;
-        const fields = line.split(options.delimiter).map((value) => unescapeText(value));
-        records.push({ fields, quoted: fields.map((value) => value !== options.nullString) });
+        const fields = splitTextFields(line, options.delimiter);
+        records.push({ fields, quoted: fields.map((value) => value !== options.nullString), raw: line });
     }
     return records;
 }
@@ -337,14 +371,9 @@ export function copyIn(database: Database, statement: CopyStatement, input: stri
     let inserted = 0;
     for (const [index, record] of records.entries()) {
         const line = index + 1 + headerOffset;
-        if (record.fields.length !== source.fields.length) {
-            throw withContext(
-                new ServerError(
-                    '22P04',
-                    `missing data for column "${source.fields[record.fields.length]?.name ?? '?'}"`
-                ),
-                `COPY ${tableName}, line ${line}`,
-            );
+        const context = `COPY ${tableName}, line ${line}: "${record.raw}"`;
+        if (record.fields.length > source.fields.length) {
+            throw withContext(new ServerError('22P04', 'extra data after last expected column'), context);
         }
         const values: Expr[] = record.fields.map((raw, fieldIndex) => {
             const field = source.fields[fieldIndex]!;
@@ -352,16 +381,23 @@ export function copyIn(database: Database, statement: CopyStatement, input: stri
                 ? !record.quoted[fieldIndex] && raw === options.nullString
                 : raw === options.nullString;
             if (isNull) return { kind: 'literal', value: null, text: 'NULL' } satisfies Expr;
+            // The null string is matched against the raw field, so only a real
+            // value is unescaped; `\N` under `NULL 'NA'` therefore becomes `N`.
+            const text = options.format === 'csv' ? raw : unescapeText(raw);
             try {
-                parseLiteral(raw, field.type);
+                parseLiteral(text, field.type);
             } catch (error) {
                 if (error instanceof ServerError) {
-                    error.context = `COPY ${tableName}, line ${line}, column ${field.name}: "${raw}"`;
+                    error.context = `COPY ${tableName}, line ${line}, column ${field.name}: "${text}"`;
                 }
                 throw error;
             }
-            return { kind: 'literal', value: raw, text: raw, numeric: false } satisfies Expr;
+            return { kind: 'literal', value: text, text, numeric: false } satisfies Expr;
         });
+        // PostgreSQL parses the fields it has before reporting the first missing one.
+        if (record.fields.length < source.fields.length) {
+            throw withContext(new ServerError('22P04', `missing data for column "${source.fields[record.fields.length]?.name ?? '?'}"`), context);
+        }
         const insert = {
             kind: 'insert' as const,
             table,
@@ -375,6 +411,7 @@ export function copyIn(database: Database, statement: CopyStatement, input: stri
             runStatement(database, insert, []);
         } catch (error) {
             if (error instanceof ServerError && error.context === undefined) {
+                // Constraint failures get the line but not the raw row, like PostgreSQL.
                 throw withContext(error, `COPY ${tableName}, line ${line}`);
             }
             throw error;
