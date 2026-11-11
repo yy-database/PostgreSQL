@@ -1545,6 +1545,10 @@ function buildRelation(database: Database, ref: RelationRef, params: SqlValue[],
             const columns = functionColumns(ref);
             return { columns, rows: values.map((value, index) => (ref.ordinality === true ? [value, index + 1] : [value])) };
         }
+        if (lowered === 'pg_listening_channels' && ref.args.length === 0) {
+            const channels = database.session.pgListeningChannels?.() ?? [];
+            return { columns: functionColumns(ref), rows: channels.map((channel) => [channel]) };
+        }
         throw new ServerError('42883', `function ${ref.name}(${ref.args.length} arguments) does not exist`, undefined, ref.start);
     }
     const system = ref.schema === 'pg_catalog' ? systemColumns(ref.name) : ref.schema === undefined ? systemColumns(ref.name) : undefined;

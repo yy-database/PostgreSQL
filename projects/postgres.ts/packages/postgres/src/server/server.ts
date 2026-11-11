@@ -414,8 +414,15 @@ export function scanStatements(sql: string): { text: string; start: number }[] {
         .filter((part) => part.text.length > 0);
 }
 
-/** An engine result plus the streamed `COPY ... TO STDOUT` payload. */
-type ServerOutcome = (Outcome & { parameters?: { name: string; value: string }[] }) | { kind: 'copy-out'; data: string; rows: number; columns: number };
+/**
+ * An engine result plus the streamed `COPY ... TO STDOUT` payload.
+ *
+ * `flush` marks the command that ends an implicit transaction, so its queued
+ * `NOTIFY` frames go out after `CommandComplete` and before `ReadyForQuery`.
+ */
+type ServerOutcome =
+    | (Outcome & { parameters?: { name: string; value: string }[]; flush?: boolean })
+    | { kind: 'copy-out'; data: string; rows: number; columns: number; flush?: boolean };
 
 /** Sessions share one hub so `NOTIFY` reaches connections that `LISTEN`. */
 interface NotificationHub {
@@ -504,6 +511,8 @@ class Session {
               started: boolean;
               savepoints: { name: string; state: Database }[];
               aborted: boolean;
+              /** Channels before the first `LISTEN`/`UNLISTEN`, restored by `ROLLBACK`. */
+              channelsBefore: Set<string> | null;
           }
         | null = null;
     /** Row locks of the implicit transaction owned by the current message. */
@@ -562,6 +571,7 @@ class Session {
                 isScrollable: cursor.scroll,
                 creationTime: cursor.creationTime,
             }));
+        this.runtime.pgListeningChannels = () => [...this.channels];
         this.runtime.passwordEncryption = () =>
             this.state?.parameters.get('password_encryption') ?? GUC_DEFAULTS.get('password_encryption') ?? 'scram-sha-256';
         hub.sessions.add(this);
@@ -1002,6 +1012,10 @@ class Session {
                     const parsed = parseStatement(statement) as TransactionStatement;
                     if (parsed.command === 'begin' && implicit !== null) {
                         this.commitImplicit(implicit);
+                        // The implicit block ends here; emit its frames so its
+                        // notifications stay after their CommandComplete.
+                        for (const outcome of outcomes) this.emitOutcome(outcome);
+                        outcomes.length = 0;
                         this.flushNotifications();
                         implicit = null;
                     }
@@ -1054,10 +1068,7 @@ class Session {
                     throw error;
                 }
             }
-            if (implicit !== null) {
-                this.commitImplicit(implicit);
-                this.flushNotifications();
-            }
+            if (implicit !== null) this.commitImplicit(implicit);
         } catch (error) {
             for (const outcome of outcomes) this.emitOutcome(outcome);
             this.pending.length = 0;
@@ -1071,6 +1082,7 @@ class Session {
             return;
         }
         for (const outcome of outcomes) this.emitOutcome(outcome);
+        if (this.transaction === null) this.flushNotifications();
         this.socket.write(readyForQuery(this.transactionStatus()));
     }
 
@@ -1145,10 +1157,7 @@ class Session {
             let count = 0;
             if (success) {
                 count = copyIn(copy.database, copy.statement, Buffer.concat(copy.chunks).toString('utf8'));
-                if (this.transaction === null) {
-                    this.commitImplicit(copy.database);
-                    this.flushNotifications();
-                }
+                if (this.transaction === null) this.commitImplicit(copy.database);
             }
             else throw new ServerError('57014', `COPY from stdin failed: ${message}`);
             this.socket.write(commandComplete(`COPY ${count}`));
@@ -1192,7 +1201,7 @@ class Session {
     }
 
     /** Runs `BEGIN`/`COMMIT`/`ROLLBACK`/savepoint commands and returns their tag. */
-    private runTransaction(statement: TransactionStatement): Outcome {
+    private runTransaction(statement: TransactionStatement): ServerOutcome {
         switch (statement.command) {
             case 'begin':
                 if (this.transaction !== null) {
@@ -1219,6 +1228,7 @@ class Session {
                         started: false,
                         savepoints: [],
                         aborted: false,
+                        channelsBefore: null,
                     };
                 }
                 return { kind: 'command', tag: 'BEGIN' };
@@ -1228,10 +1238,12 @@ class Session {
                     return { kind: 'command', tag: 'COMMIT' };
                 }
                 if (this.transaction.aborted) {
+                    const channels = this.transaction.channelsBefore;
                     this.manager.rollback(this.transaction.handle);
                     this.transaction = null;
                     this.closeCursorsInTransaction(true);
                     this.pending.length = 0;
+                    this.restoreChannels(channels);
                     return { kind: 'command', tag: 'ROLLBACK' };
                 }
                 {
@@ -1248,17 +1260,20 @@ class Session {
                     this.transaction = null;
                 }
                 this.closeCursorsInTransaction(false);
-                this.flushNotifications();
-                return { kind: 'command', tag: 'COMMIT' };
+                return { kind: 'command', tag: 'COMMIT', flush: true };
             case 'rollback':
                 if (this.transaction === null) {
                     this.warn('25P01', 'there is no transaction in progress');
                     return { kind: 'command', tag: 'ROLLBACK' };
                 }
-                this.manager.rollback(this.transaction.handle);
-                this.transaction = null;
-                this.closeCursorsInTransaction(true);
-                this.pending.length = 0;
+                {
+                    const channels = this.transaction.channelsBefore;
+                    this.manager.rollback(this.transaction.handle);
+                    this.transaction = null;
+                    this.closeCursorsInTransaction(true);
+                    this.pending.length = 0;
+                    this.restoreChannels(channels);
+                }
                 return { kind: 'command', tag: 'ROLLBACK' };
 
             case 'savepoint': {
@@ -1508,9 +1523,11 @@ class Session {
                 return { kind: 'command', tag: 'DEALLOCATE' };
             }
             case 'listen':
+                this.rememberChannels();
                 this.channels.add(statement.channel);
                 return { kind: 'command', tag: 'LISTEN' };
             case 'unlisten':
+                this.rememberChannels();
                 if (statement.all) this.channels.clear();
                 else this.channels.delete(statement.channel);
                 return { kind: 'command', tag: 'UNLISTEN' };
@@ -1726,12 +1743,30 @@ class Session {
         return { kind: 'rows', fields: cursor.fields, rows: moved.rows, tag: `FETCH ${moved.rows.length}` };
     }
 
+    /** Snapshot the channel set once per transaction so `ROLLBACK` can undo `LISTEN`. */
+    private rememberChannels(): void {
+        if (this.transaction !== null && this.transaction.channelsBefore === null) {
+            this.transaction.channelsBefore = new Set(this.channels);
+        }
+    }
+
+    private restoreChannels(channels: Set<string> | null): void {
+        if (channels === null) return;
+        this.channels.clear();
+        for (const channel of channels) this.channels.add(channel);
+    }
+
     /** Sends every queued `NOTIFY` to the sessions listening at commit time. */
     private flushNotifications(): void {
         if (this.pending.length === 0) return;
         const items = this.pending;
         this.pending = [];
+        // PostgreSQL folds identical channel/payload pairs queued by one transaction.
+        const seen = new Set<string>();
         for (const item of items) {
+            const key = `${item.channel}\u0000${item.payload}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
             for (const session of this.hub.sessions) {
                 if (session.channels.has(item.channel)) session.socket.write(notificationResponse(this.pid, item.channel, item.payload));
             }
@@ -1767,7 +1802,9 @@ class Session {
         try {
             const outcome = this.runParsed(state, database, parseStatement(trimmed), parameters);
             this.commitImplicit(database);
-            this.flushNotifications();
+            // The implicit transaction ends here, so its notifications follow
+            // this statement's CommandComplete rather than preceding it.
+            if (outcome.kind === 'command') outcome.flush = true;
             return outcome;
         } catch (error) {
             database.restore(before);
@@ -2053,6 +2090,7 @@ class Session {
                 this.socket.write(noticeResponse({ severity: notice.severity ?? 'NOTICE', code: notice.code, message: notice.message }));
             }
             this.socket.write(commandComplete(outcome.tag));
+            if (outcome.flush === true) this.flushNotifications();
             return;
         }
         // 一条语句的协议消息合并成一次写入，减少往返中的小包与系统调用。

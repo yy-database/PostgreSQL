@@ -115,6 +115,8 @@ export interface SessionRuntime {
     lastBySequence: Map<number, number>;
     /** Live `pg_cursors` rows for the portals this session has open. */
     pgCursors?: () => CursorViewRow[];
+    /** Channels this session currently listens on, read by `pg_listening_channels()`. */
+    pgListeningChannels?: () => string[];
     /** Session value of `password_encryption`, read when a role password is stored. */
     passwordEncryption?: () => string;
 }
