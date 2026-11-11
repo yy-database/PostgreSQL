@@ -1,0 +1,7 @@
+CREATE TABLE
+COPY 1
+ id | v  | w  
+----+----+----
+  2 | ok | ok
+(1 row)
+

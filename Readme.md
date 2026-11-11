@@ -229,6 +229,20 @@ dependencies for `2BP01` and the cascade notices, and project `pg_views`.
 non-table warning. `ALTER` beyond constraint operations remains `0A000` +
 `DETAIL`.
 
+**COPY and notifications.** `COPY ... TO STDOUT` streams `CopyOutResponse`, one
+`CopyData`, `CopyDone` and the `COPY n` tag; text and CSV honor `HEADER`,
+`DELIMITER`, `NULL`, `QUOTE` and `ESCAPE`, and `COPY (SELECT ...) TO STDOUT`
+runs the embedded query. `COPY ... FROM STDIN` answers `CopyInResponse` and
+consumes `CopyData`/`CopyDone`/`CopyFail` through the simple-query protocol
+only; the extended protocol keeps an explicit `0A000` for it. The text parser
+matches PostgreSQL on `\N` versus `NULL`, on `\.` as the end marker, on escaped
+delimiters, and on `COPY t, line n: "row"` / `column c: "value"` contexts, while
+binary COPY stays `0A000`. `LISTEN`/`UNLISTEN`/`NOTIFY` deliver
+`NotificationResponse` after the committing `CommandComplete` and before
+`ReadyForQuery`, drop duplicate channel/payload pairs within one transaction,
+undo `LISTEN` on `ROLLBACK`, and expose the session's channels through
+`SELECT * FROM pg_listening_channels()`.
+
 Build cost of bringing `database-storage` (and `vos`) into the native graph,
 measured once on this machine with clean release target directories:
 

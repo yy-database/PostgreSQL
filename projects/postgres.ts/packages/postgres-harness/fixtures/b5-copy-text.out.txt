@@ -1,0 +1,30 @@
+CREATE TABLE
+COPY 3
+ id | isnull |  note  
+----+--------+--------
+  1 | t      | <null>
+  2 | f      | 
+  3 | f      | abc
+(3 rows)
+
+1	\N
+2	
+3	abc
+id|note
+1|\N
+2|
+3|abc
+CREATE TABLE
+COPY 4
+ id | isnull |   v    
+----+--------+--------
+  1 | f      | a|b
+  2 | f      | x\y
+  3 | t      | <null>
+  4 | f      | N
+(4 rows)
+
+1|a\|b
+2|x\\y
+3|\N
+4|N

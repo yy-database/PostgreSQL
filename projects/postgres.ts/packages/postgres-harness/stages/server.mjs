@@ -35,7 +35,7 @@ function passwordPacket(password) {
 }
 
 function errorFields(payload) {
-    const result = { severity: '', code: '', message: '', detail: '', schema: '', table: '', column: '', dataType: '', constraint: '', file: '', line: '', routine: '' };
+    const result = { severity: '', code: '', message: '', detail: '', where: '', schema: '', table: '', column: '', dataType: '', constraint: '', file: '', line: '', routine: '' };
     let offset = 0;
     while (offset < payload.length && payload[offset] !== 0) {
         const kind = String.fromCharCode(payload[offset]);
@@ -46,6 +46,7 @@ function errorFields(payload) {
         if (kind === 'C') result.code = value;
         if (kind === 'M') result.message = value;
         if (kind === 'D') result.detail = value;
+        if (kind === 'W') result.where = value;
         if (kind === 's') result.schema = value;
         if (kind === 't') result.table = value;
         if (kind === 'c') result.column = value;
@@ -2632,6 +2633,112 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         });
 
+        await check('b5/copy-wire', async () => {
+            const wire = await openTrustSession(batch5.host, batch5.port);
+            await wire.query('CREATE TABLE b5_wire (id int, note text)');
+            const beginCopyIn = async (sql) => {
+                wire.send(frame('Q', Buffer.concat([Buffer.from(sql), Buffer.from([0])])));
+                for (;;) {
+                    const message = await wire.next();
+                    if (message === null) throw new Error('connection closed before CopyInResponse');
+                    if (message.tag === 'G' || message.tag === 'E' || message.tag === 'Z') return message;
+                }
+            };
+            const g = await beginCopyIn('COPY b5_wire FROM STDIN');
+            assert(g.tag === 'G', `COPY FROM answered ${g.tag}`);
+            const inbound = g.payload;
+            assert(
+                inbound[0] === 0 && inbound.readInt16BE(1) === 2 && inbound.readInt16BE(3) === 0 && inbound.readInt16BE(5) === 0,
+                `CopyInResponse is ${inbound.toString('hex')}`,
+            );
+            wire.send(frame('d', Buffer.from('1\ta\n')));
+            wire.send(frame('d', Buffer.from('2\t\\N\n3\tx\\|y\n')));
+            wire.send(frame('c'));
+            const inserted = await wire.readUntilReady();
+            requireTags(inserted, 'CZ');
+            assert(commandTag(inserted) === 'COPY 3', `COPY tag is ${commandTag(inserted)}`);
+
+            const out = await wire.query('COPY b5_wire TO STDOUT');
+            requireTags(out, 'HdcCZ');
+            const outbound = out[0].payload;
+            assert(
+                outbound[0] === 0 && outbound.readInt16BE(1) === 2 && outbound.readInt16BE(3) === 0 && outbound.readInt16BE(5) === 0,
+                `CopyOutResponse is ${outbound.toString('hex')}`,
+            );
+            const payload = Buffer.concat(out.filter((message) => message.tag === 'd').map((message) => message.payload)).toString('utf8');
+            assert(payload === '1\ta\n2\t\\N\n3\tx|y\n', `COPY TO payload is ${JSON.stringify(payload)}`);
+            assert(commandTag(out) === 'COPY 3', `COPY TO tag is ${commandTag(out)}`);
+            const rows = await wire.query('SELECT id, note IS NULL AS isnull FROM b5_wire ORDER BY id');
+            const values = rows.filter((message) => message.tag === 'D').map((message) => dataRowValues(message.payload));
+            assert(JSON.stringify(values) === '[["1","f"],["2","t"],["3","f"]]', `stored rows are ${JSON.stringify(values)}`);
+            wire.close();
+        });
+
+        await check('b5/copy-wire-errors', async () => {
+            const wire = await openTrustSession(batch5.host, batch5.port);
+            await wire.query('CREATE TABLE b5_wire_err (id int, v text, w text)');
+            const copyInto = async (data) => {
+                wire.send(frame('Q', Buffer.concat([Buffer.from('COPY b5_wire_err FROM STDIN'), Buffer.from([0])])));
+                for (;;) {
+                    const message = await wire.next();
+                    if (message.tag === 'G') break;
+                    if (message.tag === 'E' || message.tag === 'Z') throw new Error(`COPY FROM answered ${message.tag}`);
+                }
+                if (data.length > 0) wire.send(frame('d', Buffer.from(data)));
+                wire.send(frame('c'));
+                return wire.readUntilReady();
+            };
+            const missing = await copyInto('1\ta\n');
+            requireTags(missing, 'EZ');
+            let error = onlyError(missing);
+            assert(error.code === '22P04' && error.message === 'missing data for column "w"', `missing is ${error.code} ${error.message}`);
+            assert(error.where === 'COPY b5_wire_err, line 1: "1\ta"', `missing context is ${error.where}`);
+            const extra = await copyInto('1\ta\tb\tc\n');
+            error = onlyError(extra);
+            assert(error.code === '22P04' && error.message === 'extra data after last expected column', `extra is ${error.code} ${error.message}`);
+            assert(error.where === 'COPY b5_wire_err, line 1: "1\ta\tb\tc"', `extra context is ${error.where}`);
+            const blank = await copyInto('\n');
+            error = onlyError(blank);
+            assert(error.code === '22P02' && error.message === 'invalid input syntax for type integer: ""', `blank is ${error.code} ${error.message}`);
+            assert(error.where === 'COPY b5_wire_err, line 1, column id: ""', `blank context is ${error.where}`);
+            wire.close();
+        });
+
+        await check('b5/notify-wire', async () => {
+            const listener = await openTrustSession(batch5.host, batch5.port);
+            const sender = await openTrustSession(batch5.host, batch5.port);
+            await listener.query('LISTEN wire_chan');
+            const self = await listener.query("NOTIFY wire_chan, 'self'");
+            requireTags(self, 'CAZ');
+            const note = self.find((message) => message.tag === 'A');
+            assert(note !== undefined, 'self NOTIFY produced no NotificationResponse');
+            assert(note.payload.readInt32BE(0) > 0, 'NotificationResponse has no sender pid');
+            assert(note.payload.subarray(4).toString('utf8') === 'wire_chan\0self\0', `NotificationResponse body is ${JSON.stringify(note.payload.subarray(4).toString('utf8'))}`);
+
+            await sender.query("NOTIFY wire_chan, 'cross'");
+            const cross = await listener.next();
+            assert(cross?.tag === 'A' && cross.payload.subarray(4).toString('utf8') === 'wire_chan\0cross\0', 'cross-session NOTIFY was not delivered');
+
+            const folded = await listener.query("BEGIN; NOTIFY wire_chan, 'dup'; NOTIFY wire_chan, 'dup'; NOTIFY wire_chan, 'other'; COMMIT");
+            requireTags(folded, 'CCCCCAAZ');
+            const payloads = folded.filter((message) => message.tag === 'A').map((message) => message.payload.subarray(4).toString('utf8'));
+            assert(JSON.stringify(payloads) === JSON.stringify(['wire_chan\0dup\0', 'wire_chan\0other\0']), `folded notifications are ${JSON.stringify(payloads)}`);
+
+            await listener.query('BEGIN; LISTEN wire_rollback; ROLLBACK');
+            await sender.query("NOTIFY wire_rollback, 'nope'");
+            const stray = await Promise.race([
+                listener.next(),
+                new Promise((resolve) => setTimeout(() => resolve(null), 300)),
+            ]);
+            assert(stray === null || stray.tag !== 'A', 'LISTEN survived ROLLBACK');
+
+            const channels = await listener.query('SELECT * FROM pg_listening_channels() ORDER BY 1');
+            const names = channels.filter((message) => message.tag === 'D').map((message) => dataRowValues(message.payload));
+            assert(JSON.stringify(names) === '[["wire_chan"]]', `pg_listening_channels is ${JSON.stringify(names)}`);
+            listener.close();
+            sender.close();
+        });
+
         await check('b5/cursors', async () => {
             await withClient(batch5, async (client) => {
                 await client.query('CREATE TABLE b5_pgcur (id int, v text)');
@@ -2864,6 +2971,8 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             await checkFixture('psql/b5-copy-from', 'b5-copy-from', 'b5-copy-from.sql');
             await checkFixture('psql/b5-copy-dup', 'b5-copy-dup', 'b5-copy-dup.sql');
             await checkFixture('psql/b5-copy-bad', 'b5-copy-bad', 'b5-copy-bad.sql');
+            await checkFixture('psql/b5-copy-text', 'b5-copy-text', 'b5-copy-text.sql');
+            await checkFixture('psql/b5-copy-errors', 'b5-copy-errors', 'b5-copy-errors.sql');
             await checkFixture('psql/b5-cursors', 'b5-cursors', 'b5-cursors.sql');
             await checkFixture('psql/b5-prepare', 'b5-prepare', 'b5-prepare.sql');
             await checkFixture('psql/b6-l', 'b6-l', 'b6-l.sql');

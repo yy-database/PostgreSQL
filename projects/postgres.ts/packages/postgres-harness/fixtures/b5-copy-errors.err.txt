@@ -1,0 +1,8 @@
+psql:b5-copy-errors.sql:4: ERROR:  missing data for column "w"
+CONTEXT:  COPY b5_err, line 1: "1	a"
+psql:b5-copy-errors.sql:7: ERROR:  extra data after last expected column
+CONTEXT:  COPY b5_err, line 1: "1	a	b	c"
+psql:b5-copy-errors.sql:10: ERROR:  invalid input syntax for type integer: ""
+CONTEXT:  COPY b5_err, line 1, column id: ""
+psql:b5-copy-errors.sql:13: ERROR:  invalid input syntax for type integer: "x"
+CONTEXT:  COPY b5_err, line 1, column id: "x"
