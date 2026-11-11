@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
 import { spawn, execFileSync } from 'node:child_process';
 
 import pg from 'pg';
@@ -9,6 +10,65 @@ import pg from 'pg';
 import { startPostgresServer } from '../../postgres/dist/server/server.js';
 
 const SERVER_BIN = '../postgres/bin/postgres-server.mjs';
+
+const requireNative = createRequire(import.meta.url);
+
+/** The platform binding, so a case can seed and probe raw `.yykv` stores. */
+function nativeBinding(repositoryRoot) {
+    const key = process.env.POSTGRES_NATIVE_PLATFORM?.trim() ?? `${process.platform}-${process.arch}`;
+    return requireNative(path.join(repositoryRoot, 'projects', 'postgres.ts', 'platforms', `postgres-${key}`));
+}
+
+/** Rows of one flat `scanFlat` payload: `u32le` count, then per row lengths and bytes. */
+function readShardRows(payload) {
+    const count = payload.readUInt32LE(0);
+    const rows = [];
+    let offset = 4;
+    for (let index = 0; index < count; index += 1) {
+        const keyLength = payload.readUInt32LE(offset);
+        const valueLength = payload.readUInt32LE(offset + 4);
+        offset += 8;
+        rows.push({ key: payload.subarray(offset, offset + keyLength), value: payload.subarray(offset + keyLength, offset + keyLength + valueLength) });
+        offset += keyLength + valueLength;
+    }
+    return rows;
+}
+
+/**
+ * Rewrites one sharded data directory into the pre-sharding layout: every
+ * namespace of the `postgres` database inside the primary `local-0.yykv`, no
+ * `shards/` directories. This is exactly what an old release left behind.
+ */
+function seedLegacyDirectory(binding, sourceDir, targetDir) {
+    const source = new binding.ServerStore(sourceDir);
+    const catalogRow = readShardRows(source.scanFlat('db:postgres:pg_catalog', Buffer.alloc(0), null, null, 1)).find((row) => row.key.toString() === 'catalog');
+    const catalog = JSON.parse(catalogRow.value.toString('utf8'));
+    const changes = [];
+    for (const namespace of ['pg_cluster', 'db:postgres:pg_catalog', 'db:postgres:pg_sequence_state']) {
+        for (const row of readShardRows(source.scanFlat(namespace, Buffer.alloc(0), null, null, 0))) {
+            changes.push({ kind: 'put', namespace, key: Buffer.from(row.key), value: Buffer.from(row.value) });
+        }
+    }
+    const hex = Buffer.from('postgres', 'utf8').toString('hex');
+    for (const relation of catalog.relations.filter((candidate) => candidate.relkind === 'r')) {
+        const shardId = `local-${relation.oid}-${hex}`;
+        const tails = [
+            `pg_data.${relation.oid}`,
+            ...catalog.indexes.filter((index) => index.relid === relation.oid).map((index) => `pg_index.${index.oid}`),
+        ];
+        for (const tail of tails) {
+            const namespace = `db:postgres:${tail}`;
+            for (const row of readShardRows(source.scanShardFlat(shardId, namespace, Buffer.alloc(0), null, null, 0))) {
+                changes.push({ kind: 'put', namespace, key: Buffer.from(row.key), value: Buffer.from(row.value) });
+            }
+        }
+    }
+    source.close();
+    const legacy = new binding.ServerStore(targetDir);
+    if (changes.length > 0) legacy.commitChanges(changes);
+    legacy.close();
+    return catalog;
+}
 
 function temporaryDirectory(prefix) {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -97,17 +157,32 @@ function abandon(client) {
 
 /** Makes the next commit fail and returns the undo step. */
 function denyCommit(directory) {
-    if (process.platform === 'win32') {
-        const shard = path.join(directory, 'local-0.yykv');
-        execFileSync('attrib', ['+R', shard]);
-        return () => execFileSync('attrib', ['-R', shard]);
+    // A plain DML commit lands in the table-group shard of the written table,
+    // not in the primary shard, so every shard file the commit could touch is
+    // denied: the primary one and one per existing group directory.
+    const shardFiles = [path.join(directory, 'local-0.yykv')];
+    const shardRoot = path.join(directory, 'shards');
+    if (fs.existsSync(shardRoot)) {
+        for (const entry of fs.readdirSync(shardRoot)) {
+            const shardFile = path.join(shardRoot, entry, 'local-0.yykv');
+            if (fs.existsSync(shardFile)) shardFiles.push(shardFile);
+        }
     }
-    const mode = fs.statSync(directory).mode & 0o777;
-    fs.chmodSync(directory, mode & ~0o222);
-    return () => fs.chmodSync(directory, mode);
+    if (process.platform === 'win32') {
+        for (const shard of shardFiles) execFileSync('attrib', ['+R', shard]);
+        return () => {
+            for (const shard of shardFiles) execFileSync('attrib', ['-R', shard]);
+        };
+    }
+    const directories = [directory, ...shardFiles.slice(1).map((shard) => path.dirname(shard))];
+    const modes = new Map(directories.map((target) => [target, fs.statSync(target).mode & 0o777]));
+    for (const [target, mode] of modes) fs.chmodSync(target, mode & ~0o222);
+    return () => {
+        for (const [target, mode] of modes) fs.chmodSync(target, mode);
+    };
 }
 
-export async function runDurabilityStage(_repositoryRoot, harnessDir) {
+export async function runDurabilityStage(repositoryRoot, harnessDir) {
     const lines = [];
     let executed = 0;
     let failed = 0;
@@ -272,19 +347,12 @@ export async function runDurabilityStage(_repositoryRoot, harnessDir) {
             client.connection.stream.destroy();
 
             const lockPath = path.join(directory, 'postmaster.pid');
-            assert(fs.existsSync(lockPath), 'a hard kill must leave postmaster.pid for the operator');
-            let refused = false;
-            try {
-                await start({ dataDir: directory });
-            } catch (error) {
-                refused = true;
-                const message = error instanceof Error ? error.message : String(error);
-                assert(/postmaster\.pid|locked|lock/.test(message), `unexpected lock refusal: ${message}`);
-            }
-            assert(refused, 'a second opener must not silently take a killed data directory');
+            assert(fs.existsSync(lockPath), 'a hard kill must leave postmaster.pid behind');
+            const holder = fs.readFileSync(lockPath, 'utf8').trim().split(/\s+/)[0];
+            assert(holder === String(child.pid), `postmaster.pid records ${holder}, child is ${child.pid}`);
 
-            // The operator removes the stale pid file once the old process is gone.
-            fs.unlinkSync(lockPath);
+            // The stale lock is reclaimed automatically: the recorded process is
+            // gone, so the restart takes the directory without operator help.
             const reopened = await start({ dataDir: directory });
             const reader = await connect(reopened.port);
             const all = await reader.query('SELECT id, note FROM crashy ORDER BY id');
@@ -322,6 +390,87 @@ export async function runDurabilityStage(_repositoryRoot, harnessDir) {
             assert((await reader.query('SELECT count(*) FROM locked')).rows[0].count === '0', 'data directory is not usable after a clean shutdown');
             await reader.end();
             await stop(second);
+        });
+
+        await check('lock/clean-exit', async () => {
+            const directory = temporary('postgres-durable-clean-');
+            const binary = path.resolve(harnessDir, SERVER_BIN);
+            const child = spawn(process.execPath, [binary, '--host', '127.0.0.1', '--port', '0', '--data-dir', directory, '--stop-on-stdin-close'], {
+                stdio: ['pipe', 'pipe', 'pipe'],
+            });
+            const address = await listening(child);
+            const client = await connect(address.port);
+            await client.query('CREATE TABLE clean_exit (id int PRIMARY KEY)');
+            await client.query('INSERT INTO clean_exit VALUES (1)');
+            await client.end();
+            const lockPath = path.join(directory, 'postmaster.pid');
+            assert(fs.existsSync(lockPath), 'the running child holds postmaster.pid');
+            const exited = new Promise((resolve) => child.once('exit', resolve));
+            child.stdin.end();
+            const code = await exited;
+            assert(code === 0, `clean shutdown exited with ${code}`);
+            assert(!fs.existsSync(lockPath), 'a clean process exit removes postmaster.pid');
+            const reopened = await start({ dataDir: directory });
+            const reader = await connect(reopened.port);
+            assert((await reader.query('SELECT count(*) AS total FROM clean_exit')).rows[0].total === '1', 'data did not survive the clean restart');
+            await reader.end();
+            await stop(reopened);
+        });
+
+        await check('timeout/statement', async () => {
+            const server = await start({ dataDir: temporary('postgres-durable-timeout-') });
+            const client = await connect(server.port);
+            await client.query('CREATE TABLE timeout_rows (id int PRIMARY KEY, note text)');
+            const rows = Array.from({ length: 700 }, (_, index) => `(${index}, 'x')`).join(',');
+            await client.query(`INSERT INTO timeout_rows VALUES ${rows}`);
+            await client.query("SET statement_timeout = '50ms'");
+            const shown = await client.query('SHOW statement_timeout');
+            assert(shown.rows[0].statement_timeout === '50ms', `SHOW reports ${JSON.stringify(shown.rows[0])}`);
+            const heavy = 'SELECT count(*) AS total FROM timeout_rows a, timeout_rows b';
+            const timeout = await client.query(heavy).then(() => null, (error) => error);
+            assert(timeout !== null && timeout.code === '57014', `heavy query returned ${timeout === null ? 'success' : timeout.code}`);
+            assert(/canceling statement due to statement timeout/.test(timeout.message), `timeout message is ${timeout.message}`);
+            const units = await client.query("SET statement_timeout = '1s'");
+            assert(units.command === 'SET', `SET with a unit returned ${units.command}`);
+            assert((await client.query('SHOW statement_timeout')).rows[0].statement_timeout === '1s', 'SET 1s did not round-trip');
+            await client.query('SET statement_timeout = 250');
+            assert((await client.query('SHOW statement_timeout')).rows[0].statement_timeout === '250', 'bare milliseconds did not round-trip');
+            const invalid = await client.query("SET statement_timeout = '5 fortnights'").then(() => null, (error) => error);
+            assert(invalid !== null && invalid.code === '22023', `bad unit returned ${invalid === null ? 'success' : invalid.code}`);
+            const garbage = await client.query("SET statement_timeout = 'abc'").then(() => null, (error) => error);
+            assert(garbage !== null && garbage.code === '22023', `garbage value returned ${garbage === null ? 'success' : garbage.code}`);
+            // An open transaction block enters the aborted state and stays there
+            // until ROLLBACK, exactly like PostgreSQL.
+            await client.query("SET statement_timeout = '50ms'");
+            await client.query('BEGIN');
+            const inTransaction = await client.query(heavy).then(() => null, (error) => error);
+            assert(inTransaction !== null && inTransaction.code === '57014', `in-transaction timeout is ${inTransaction === null ? 'success' : inTransaction.code}`);
+            const refused = await client.query('SELECT 1').then(() => null, (error) => error);
+            assert(refused !== null && refused.code === '25P02', `aborted block reports ${refused === null ? 'success' : refused.code}`);
+            await client.query('ROLLBACK');
+            const recovered = await client.query('SELECT 1 AS one');
+            assert(Number(recovered.rows[0].one) === 1, 'session did not recover after ROLLBACK');
+            await client.end();
+            await stop(server);
+        });
+
+        await check('timeout/disabled', async () => {
+            const server = await start({ dataDir: temporary('postgres-durable-notimeout-') });
+            const client = await connect(server.port);
+            await client.query('CREATE TABLE idle_rows (id int PRIMARY KEY)');
+            const rows = Array.from({ length: 500 }, (_, index) => `(${index})`).join(',');
+            await client.query(`INSERT INTO idle_rows VALUES ${rows}`);
+            const shown = await client.query('SHOW statement_timeout');
+            assert(shown.rows[0].statement_timeout === '0', `default statement_timeout is ${JSON.stringify(shown.rows[0])}`);
+            const heavy = 'SELECT count(*) AS total FROM idle_rows a, idle_rows b';
+            const result = await client.query(heavy);
+            assert(result.rows[0].total === '250000', `default timeout throttled the query: ${JSON.stringify(result.rows)}`);
+            await client.query("SET statement_timeout = '50ms'");
+            await client.query('SET statement_timeout = 0');
+            const again = await client.query(heavy);
+            assert(again.rows[0].total === '250000', 'reset to 0 did not remove the deadline');
+            await client.end();
+            await stop(server);
         });
 
         await check('leak/abandoned-connections', async () => {
@@ -412,6 +561,143 @@ export async function runDurabilityStage(_repositoryRoot, harnessDir) {
             assert(JSON.stringify(rows.rows) === '[{"id":1,"note":"kept"},{"id":3,"note":"after"}]', `durability after a failed commit is ${JSON.stringify(rows.rows)}`);
             await reader.end();
             await stop(reopened);
+        });
+
+        await check('shard/migrate-on-open', async () => {
+            const binding = nativeBinding(repositoryRoot);
+            const directory = temporary('postgres-durable-shard-');
+            const server = await start({ dataDir: directory });
+            const client = await connect(server.port);
+            await client.query('CREATE TABLE legacy (id serial PRIMARY KEY, name varchar(32) NOT NULL)');
+            await client.query('CREATE UNIQUE INDEX legacy_name ON legacy (name)');
+            await client.query("INSERT INTO legacy (name) VALUES ('one'), ('two'), ('three')");
+            await client.end();
+            await stop(server);
+
+            const legacyDir = temporary('postgres-durable-legacy-');
+            const catalog = seedLegacyDirectory(binding, directory, legacyDir);
+            const relOid = catalog.relations.find((candidate) => candidate.relkind === 'r').oid;
+            const hex = Buffer.from('postgres', 'utf8').toString('hex');
+            const shardFile = path.join(legacyDir, 'shards', `local-${relOid}-${hex}`, 'local-0.yykv');
+            assert(!fs.existsSync(shardFile), 'the seeded directory must be the pre-sharding layout');
+
+            const migrated = await start({ dataDir: legacyDir });
+            const reader = await connect(migrated.port);
+            const rows = await reader.query('SELECT id, name FROM legacy ORDER BY id');
+            assert(JSON.stringify(rows.rows) === JSON.stringify([{ id: 1, name: 'one' }, { id: 2, name: 'two' }, { id: 3, name: 'three' }]), `migrated rows are ${JSON.stringify(rows.rows)}`);
+            await reader.end();
+            await stop(migrated);
+            assert(fs.existsSync(shardFile), `migration did not create ${shardFile}`);
+
+            const probe = new binding.ServerStore(legacyDir);
+            const leftover = readShardRows(probe.scanFlat(`db:postgres:pg_data.${relOid}`, Buffer.alloc(0), null, null, 0));
+            probe.close();
+            assert(leftover.length === 0, `the primary shard still holds ${leftover.length} data rows`);
+
+            const again = await start({ dataDir: legacyDir });
+            const second = await connect(again.port);
+            assert((await second.query('SELECT count(*) AS total FROM legacy')).rows[0].total === '3', 'the second open re-migrated and lost rows');
+            await second.end();
+            await stop(again);
+        });
+
+        await check('shard/migrate-hard-kill', async () => {
+            const binding = nativeBinding(repositoryRoot);
+            const sourceDir = temporary('postgres-durable-kill-src-');
+            const server = await start({ dataDir: sourceDir });
+            const client = await connect(server.port);
+            for (let table = 0; table < 6; table += 1) {
+                await client.query(`CREATE TABLE mig_${table} (id int PRIMARY KEY, note text NOT NULL)`);
+                const base = Array.from({ length: 1500 }, (_, index) => `(${index}, 'base')`).join(',');
+                await client.query(`INSERT INTO mig_${table} VALUES ${base}`);
+            }
+            await client.end();
+            await stop(server);
+
+            const legacyDir = temporary('postgres-durable-kill-legacy-');
+            seedLegacyDirectory(binding, sourceDir, legacyDir);
+
+            const binary = path.resolve(harnessDir, SERVER_BIN);
+            const child = spawn(process.execPath, [binary, '--host', '127.0.0.1', '--port', '0', '--data-dir', legacyDir], {
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            // SIGKILL as soon as the first table-group shard appears: the kill
+            // lands inside the migration window, before every group is copied
+            // and before the primary flip. If migration finishes first, the
+            // kill lands in the running server instead — the assertions below
+            // hold for either interleaving.
+            const shardsRoot = path.join(legacyDir, 'shards');
+            const deadline = Date.now() + 30_000;
+            while (!fs.existsSync(shardsRoot) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 1));
+            const exited = new Promise((resolve) => child.once('exit', resolve));
+            child.kill('SIGKILL');
+            await exited;
+
+            const reopened = await start({ dataDir: legacyDir });
+            const reader = await connect(reopened.port);
+            for (let table = 0; table < 6; table += 1) {
+                const count = (await reader.query(`SELECT count(*) AS total FROM mig_${table}`)).rows[0].total;
+                assert(count === '1500', `mig_${table} holds ${count} rows after the killed migration`);
+                const sample = await reader.query(`SELECT note FROM mig_${table} WHERE id = 749`);
+                assert(sample.rows.length === 1 && sample.rows[0].note === 'base', `a mig_${table} row was damaged by the killed migration`);
+            }
+            await reader.query("INSERT INTO mig_0 VALUES (9999, 'after')");
+            assert((await reader.query('SELECT count(*) AS total FROM mig_0')).rows[0].total === '1501', 'the restarted server is not writable');
+            await reader.end();
+            await stop(reopened);
+        });
+
+        await check('shard/orphan-sweep', async () => {
+            const binding = nativeBinding(repositoryRoot);
+            const directory = temporary('postgres-durable-sweep-');
+            const server = await start({ dataDir: directory });
+            const client = await connect(server.port);
+            await client.query('CREATE TABLE survivor (id int PRIMARY KEY)');
+            await client.query('INSERT INTO survivor VALUES (1)');
+            await client.query('CREATE TABLE dropped (id int PRIMARY KEY, note text)');
+            await client.query("INSERT INTO dropped VALUES (1, 'gone'), (2, 'gone')");
+            const oids = await client.query("SELECT oid, relname FROM pg_catalog.pg_class WHERE relname IN ('survivor', 'dropped')");
+            const oidOf = (name) => Number(oids.rows.find((row) => row.relname === name).oid);
+            await client.query('DROP TABLE dropped');
+            await client.end();
+            await stop(server);
+
+            const hex = Buffer.from('postgres', 'utf8').toString('hex');
+            const droppedDir = path.join(directory, 'shards', `local-${oidOf('dropped')}-${hex}`);
+            assert(fs.existsSync(droppedDir), 'a dropped table keeps its shard directory until the next open');
+            const stray = new binding.Store(path.join(directory, 'shards', `local-99999-${hex}`));
+            assert(stray.dataDir().length > 0, 'the stray shard directory must be a standard store directory');
+
+            const reopened = await start({ dataDir: directory });
+            const reader = await connect(reopened.port);
+            assert((await reader.query('SELECT count(*) AS total FROM survivor')).rows[0].total === '1', 'the sweep damaged a survivor');
+            await reader.end();
+            await stop(reopened);
+            assert(!fs.existsSync(droppedDir), 'the sweep must remove the dropped table shard');
+            assert(!fs.existsSync(path.join(directory, 'shards', `local-99999-${hex}`)), 'the sweep must remove an orphan shard directory');
+            assert(fs.existsSync(path.join(directory, 'shards', `local-${oidOf('survivor')}-${hex}`)), 'the sweep must keep referenced shards');
+        });
+
+        await check('shard/commit-isolation', async () => {
+            const directory = temporary('postgres-durable-isolation-');
+            const server = await start({ dataDir: directory });
+            const client = await connect(server.port);
+            await client.query('CREATE TABLE small (id int PRIMARY KEY, note text)');
+            await client.query('CREATE TABLE big (id int PRIMARY KEY, note text)');
+            const bigRows = Array.from({ length: 10_000 }, (_, index) => `(${index}, 'x')`).join(',');
+            await client.query(`INSERT INTO big VALUES ${bigRows}`);
+            const smallRows = Array.from({ length: 10 }, (_, index) => `(${index}, 'y')`).join(',');
+            await client.query(`INSERT INTO small VALUES ${smallRows}`);
+            const before = snapshot(directory);
+            await client.query("INSERT INTO small VALUES (99, 'late')");
+            const after = snapshot(directory);
+            await client.end();
+            await stop(server);
+
+            const changed = Object.keys(after).filter((file) => before[file] !== after[file]);
+            assert(changed.length === 1, `a small-table commit rewrote ${JSON.stringify(changed)}`);
+            assert(changed[0].startsWith(`shards${path.sep}`) && changed[0].endsWith('local-0.yykv'), `the rewritten file is ${changed[0]}`);
+            assert(before['local-0.yykv'] === after['local-0.yykv'], 'plain DML must not touch the primary shard');
         });
 
         return {
