@@ -63,6 +63,33 @@ export async function runNative(repositoryRoot) {
             reopened.close();
         }
     });
+    check('store/table-group-shard', () => {
+        const handle = new binding.ServerStore(dataDir);
+        try {
+            const shardId = 'local-16384-706f737467726573';
+            if (handle.shardExists(shardId)) throw new Error('the shard directory must not exist yet');
+            // A missing shard reads empty instead of creating artifacts.
+            const empty = handle.scanShardFlat(shardId, namespace, Buffer.alloc(0), null, null, 0);
+            if (empty.readUInt32LE(0) !== 0) throw new Error('a missing shard read non-empty');
+            if (handle.shardExists(shardId)) throw new Error('reading a missing shard created it');
+            handle.commitShard(shardId, [
+                { kind: 'put', namespace, key: Buffer.from('0000000001'), value: Buffer.from('[1]') },
+                { kind: 'put', namespace: 'pg_index.16385', key: Buffer.from('one'), value: Buffer.from('0000000001') },
+            ]);
+            if (!handle.shardExists(shardId)) throw new Error('commitShard did not create the shard directory');
+            if (!handle.listShards().includes(shardId)) throw new Error(`listShards is ${JSON.stringify(handle.listShards())}`);
+            const payload = handle.scanShardFlat(shardId, namespace, Buffer.alloc(0), null, null, 0);
+            if (payload.readUInt32LE(0) !== 1) throw new Error(`shard scan returned ${payload.readUInt32LE(0)} rows`);
+            if (!handle.durableAtomicCommit()) throw new Error('durableAtomicCommit returned false with an open shard');
+            // The shard commit touched only the group: the primary shard keeps
+            // the rows committed before, not the group's.
+            if (handle.scan(namespace, Buffer.alloc(0), null, null, 0).length !== 2) throw new Error('the shard commit rewrote the primary');
+            handle.dropShard(shardId);
+            if (handle.shardExists(shardId)) throw new Error('dropShard left the directory behind');
+        } finally {
+            handle.close();
+        }
+    });
 
     return { name: 'native', output: lines.join('\n'), counts: { executed, skipped: 0, failed }, floor: 4 };
 }

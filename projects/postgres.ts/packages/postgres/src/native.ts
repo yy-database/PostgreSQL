@@ -244,6 +244,22 @@ export interface ServerStore {
      */
     scanFlat(namespace: string, prefix: Buffer, after: Buffer | null, before: Buffer | null, limit: number): Buffer;
     commitChanges(changes: ServerStoreChange[]): void;
+    /** Opens `shards/<shard-id>/` as a table-group shard, creating the directory. */
+    openShard(shardId: string): void;
+    /** Releases one shard's directory lock, keeping its files. */
+    closeShard(shardId: string): void;
+    /** Closes one shard and removes its directory, known file names only. */
+    dropShard(shardId: string): void;
+    /** Shard ids whose directory exists under `shards/`, sorted. */
+    listShards(): string[];
+    /** Whether `shards/<shard-id>/` exists. */
+    shardExists(shardId: string): boolean;
+    /** Absolute shard directory. */
+    shardDir(shardId: string): string;
+    /** Flat scan inside one table-group shard; a missing directory reads empty. */
+    scanShardFlat(shardId: string, namespace: string, prefix: Buffer, after: Buffer | null, before: Buffer | null, limit: number): Buffer;
+    /** One durable atomic commit inside one table-group shard, opening on demand. */
+    commitShard(shardId: string, changes: ServerStoreChange[]): void;
     close(): void;
     durableAtomicCommit(): boolean;
     dataDir(): string;

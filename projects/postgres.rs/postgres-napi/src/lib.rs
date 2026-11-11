@@ -6,7 +6,10 @@
 //! normalize one command line. No global state, no command loop and no server.
 //! Command lines and emulation compose these in TypeScript.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -16,7 +19,7 @@ use database::harness::{
     evaluate, per_op_ms, render_json, summarize,
 };
 use database_client::pgsql::{
-    ServerChange as CoreServerChange, ServerStore as CoreServerStore, Store as CoreStore,
+    ServerChange as CoreServerChange, ServerRow as CoreServerRow, ServerStore as CoreServerStore, Store as CoreStore,
     client::{ClientConfig, Column, Connection as CoreConnection, Param as PostgresParam, QueryResult},
     error::{MessageField, Notice, PostgresError},
     psql::{PsqlOptions, format_results, parse_arguments},
@@ -1081,18 +1084,90 @@ fn clear_stale_lock(data_dir: &str) {
 }
 
 /// One durable server data directory: `.yyds` catalog, `.yykv` shard and lock.
+///
+/// The primary handle owns the data directory itself: `local-0.yyds`, the shard
+/// its catalog registers and `postmaster.pid`. Table-group shards live under
+/// `shards/<shard-id>/`, each one a self-contained single-shard directory with
+/// its own catalog, shard and lock, so committing one group re-encodes only
+/// that group's bytes. Every lock a handle took is released by [`Self::close`].
 #[napi]
 pub struct ServerStore {
-    inner: Mutex<Option<CoreServerStore>>,
+    inner: Mutex<Option<StoreSet>>,
 }
 
-fn with_server_store<T>(
-    inner: &Mutex<Option<CoreServerStore>>,
-    run: impl FnOnce(&mut CoreServerStore) -> Result<T>,
-) -> Result<T> {
+/// The primary store plus every table-group shard handle opened so far.
+struct StoreSet {
+    primary: CoreServerStore,
+    shards: BTreeMap<String, CoreServerStore>,
+}
+
+fn with_server_store<T>(inner: &Mutex<Option<StoreSet>>, run: impl FnOnce(&mut CoreServerStore) -> Result<T>) -> Result<T> {
     let mut guard = inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-    let store = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-    run(store)
+    let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+    run(&mut set.primary)
+}
+
+/// A shard id becomes a directory name under `shards/`, so it stays inside the
+/// lowercase alphanumeric range a single path segment can hold: no separators,
+/// no `..`, no NUL, nothing that could escape the shard root.
+fn validate_shard_id(shard_id: &str) -> Result<()> {
+    let usable = shard_id.starts_with("local-")
+        && shard_id.len() <= 128
+        && shard_id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if usable { Ok(()) } else { Err(Error::from_reason(format!("shard id {shard_id:?} is unusable as a directory name"))) }
+}
+
+fn shard_directory(data_dir: &str, shard_id: &str) -> std::path::PathBuf {
+    std::path::Path::new(data_dir).join("shards").join(shard_id)
+}
+
+/// The file names one shard directory can ever hold, as written by
+/// `ServerStore::open` with the default catalog registration. Orphan cleanup
+/// deletes exactly these and nothing else, so an unexpected file keeps its
+/// directory in place instead of vanishing.
+const SHARD_DIRECTORY_FILES: [&str; 5] =
+    ["local-0.yyds", "local-0.yykv", "postmaster.pid", "local-0.yyds.tmp", "local-0.yykv.tmp"];
+
+/// Opens `shards/<shard-id>/` on demand and keeps the handle warm.
+fn ensure_shard<'a>(set: &'a mut StoreSet, shard_id: &str) -> Result<&'a mut CoreServerStore> {
+    if set.shards.contains_key(shard_id) {
+        return Ok(set.shards.get_mut(shard_id).expect("checked above"));
+    }
+    let directory = shard_directory(&set.primary.data_dir(), shard_id);
+    clear_stale_lock(&directory.display().to_string());
+    let store = CoreServerStore::open(&directory).map_err(native)?;
+    Ok(set.shards.entry(shard_id.to_owned()).or_insert(store))
+}
+
+/// Maps one batch of napi changes onto the core commit enum.
+fn to_core_changes(changes: Vec<ServerStoreChange>) -> Result<Vec<CoreServerChange>> {
+    let mut batch = Vec::with_capacity(changes.len());
+    for change in changes {
+        batch.push(match change.kind.as_str() {
+            "put" => CoreServerChange::Put {
+                namespace: change.namespace,
+                key: change.key.to_vec(),
+                value: change.value.ok_or_else(|| Error::from_reason("put change carries no value"))?.to_vec(),
+            },
+            "delete" => CoreServerChange::Delete { namespace: change.namespace, key: change.key.to_vec() },
+            other => return Err(Error::from_reason(format!("unknown server store change kind {other}"))),
+        });
+    }
+    Ok(batch)
+}
+
+/// Encodes rows into the flat `scanFlat` payload: `u32le` row count, then per
+/// row `u32le` key length, `u32le` value length, key bytes, value bytes.
+fn flat_rows(rows: Vec<CoreServerRow>) -> Buffer {
+    let mut bytes: Vec<u8> = Vec::with_capacity(4 + rows.iter().map(|row| 8 + row.key.len() + row.value.len()).sum::<usize>());
+    bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for row in &rows {
+        bytes.extend_from_slice(&(row.key.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(row.value.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&row.key);
+        bytes.extend_from_slice(&row.value);
+    }
+    Buffer::from(bytes)
 }
 
 #[napi]
@@ -1102,7 +1177,9 @@ impl ServerStore {
     #[napi(constructor)]
     pub fn new(data_dir: String) -> Result<Self> {
         clear_stale_lock(&data_dir);
-        CoreServerStore::open(&data_dir).map(|inner| Self { inner: Mutex::new(Some(inner)) }).map_err(native)
+        CoreServerStore::open(&data_dir)
+            .map(|primary| Self { inner: Mutex::new(Some(StoreSet { primary, shards: BTreeMap::new() })) })
+            .map_err(native)
     }
 
     /// Ordered prefix scan inside one namespace.
@@ -1142,50 +1219,178 @@ impl ServerStore {
         let rows = with_server_store(&self.inner, |store| {
             store.scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize).map_err(native)
         })?;
-        let mut bytes: Vec<u8> =
-            Vec::with_capacity(4 + rows.iter().map(|row| 8 + row.key.len() + row.value.len()).sum::<usize>());
-        bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-        for row in &rows {
-            bytes.extend_from_slice(&(row.key.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&(row.value.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&row.key);
-            bytes.extend_from_slice(&row.value);
-        }
-        Ok(Buffer::from(bytes))
+        Ok(flat_rows(rows))
     }
 
     /// Applies one batch as a single durable atomic commit.
     #[napi]
     pub fn commit_changes(&self, changes: Vec<ServerStoreChange>) -> Result<()> {
-        let mut batch = Vec::with_capacity(changes.len());
-        for change in changes {
-            batch.push(match change.kind.as_str() {
-                "put" => CoreServerChange::Put {
-                    namespace: change.namespace,
-                    key: change.key.to_vec(),
-                    value: change.value.ok_or_else(|| Error::from_reason("put change carries no value"))?.to_vec(),
-                },
-                "delete" => CoreServerChange::Delete { namespace: change.namespace, key: change.key.to_vec() },
-                other => return Err(Error::from_reason(format!("unknown server store change kind {other}"))),
-            });
-        }
+        let batch = to_core_changes(changes)?;
         with_server_store(&self.inner, |store| store.commit_changes(batch).map_err(native))
     }
 
-    /// Releases the directory lock.
+    /// Opens `shards/<shard-id>/` as a table-group shard and keeps it warm.
+    /// The directory is created when it does not exist yet.
     #[napi]
-    pub fn close(&self) -> Result<()> {
+    pub fn open_shard(&self, shard_id: String) -> Result<()> {
+        validate_shard_id(&shard_id)?;
         let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        if let Some(store) = guard.take() {
+        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+        ensure_shard(set, &shard_id).map(|_| ())
+    }
+
+    /// Releases one shard's directory lock, keeping its files.
+    #[napi]
+    pub fn close_shard(&self, shard_id: String) -> Result<()> {
+        validate_shard_id(&shard_id)?;
+        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+        if let Some(store) = set.shards.remove(&shard_id) {
             store.close().map_err(native)?;
         }
         Ok(())
     }
 
-    /// Whether every commit survives process exit.
+    /// Closes one shard and removes its directory.
+    ///
+    /// Only the known single-shard file names are deleted and the directory is
+    /// dropped when it is left empty; a directory holding anything else keeps
+    /// its contents in place. Used by the open-time orphan sweep.
+    #[napi]
+    pub fn drop_shard(&self, shard_id: String) -> Result<()> {
+        validate_shard_id(&shard_id)?;
+        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+        let directory = shard_directory(&set.primary.data_dir(), &shard_id);
+        if let Some(store) = set.shards.remove(&shard_id) {
+            store.close().map_err(native)?;
+        }
+        for name in SHARD_DIRECTORY_FILES {
+            let _ = std::fs::remove_file(directory.join(name));
+        }
+        match std::fs::remove_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => {}
+            Err(error) => return Err(Error::from_reason(format!("cannot remove {}: {error}", directory.display()))),
+        }
+        Ok(())
+    }
+
+    /// Shard ids whose directory exists under `shards/`, sorted.
+    #[napi]
+    pub fn list_shards(&self) -> Result<Vec<String>> {
+        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+        let root = std::path::Path::new(&set.primary.data_dir()).join("shards");
+        let mut ids = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned)
+                else {
+                    continue;
+                };
+                if validate_shard_id(&name).is_ok() {
+                    ids.push(name);
+                }
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Whether `shards/<shard-id>/` exists. A missing shard directory reads as
+    /// an empty group, so scans never create files on disk.
+    #[napi]
+    pub fn shard_exists(&self, shard_id: String) -> Result<bool> {
+        validate_shard_id(&shard_id)?;
+        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+        Ok(shard_directory(&set.primary.data_dir(), &shard_id).exists())
+    }
+
+    /// Absolute shard directory, the single source of truth for the layout.
+    #[napi]
+    pub fn shard_dir(&self, shard_id: String) -> Result<String> {
+        validate_shard_id(&shard_id)?;
+        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+        Ok(shard_directory(&set.primary.data_dir(), &shard_id).display().to_string())
+    }
+
+    /// Flat transfer form of a scan inside one table-group shard.
+    ///
+    /// Same payload as [`Self::scan_flat`]. A shard directory that does not
+    /// exist reads as zero rows instead of being created, so a read of a group
+    /// that was never written leaves no artifacts behind.
+    #[napi]
+    pub fn scan_shard_flat(
+        &self,
+        shard_id: String,
+        namespace: String,
+        prefix: Buffer,
+        after: Option<Buffer>,
+        before: Option<Buffer>,
+        limit: u32,
+    ) -> Result<Buffer> {
+        validate_shard_id(&shard_id)?;
+        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+        if !set.shards.contains_key(&shard_id) && !shard_directory(&set.primary.data_dir(), &shard_id).exists() {
+            return Ok(flat_rows(Vec::new()));
+        }
+        let rows = ensure_shard(set, &shard_id)?
+            .scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize)
+            .map_err(native)?;
+        Ok(flat_rows(rows))
+    }
+
+    /// Applies one batch as a single durable atomic commit inside one
+    /// table-group shard, opening the shard on demand.
+    #[napi]
+    pub fn commit_shard(&self, shard_id: String, changes: Vec<ServerStoreChange>) -> Result<()> {
+        validate_shard_id(&shard_id)?;
+        let batch = to_core_changes(changes)?;
+        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+        ensure_shard(set, &shard_id)?.commit_changes(batch).map_err(native)
+    }
+
+    /// Releases the directory lock, the shard locks included.
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
+        if let Some(mut set) = guard.take() {
+            let mut failure = None;
+            for (_, store) in std::mem::take(&mut set.shards) {
+                if let Err(error) = store.close() {
+                    failure.get_or_insert_with(|| native(error));
+                }
+            }
+            if let Err(error) = set.primary.close() {
+                failure.get_or_insert_with(|| native(error));
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every commit survives process exit, on every open handle.
     #[napi]
     pub fn durable_atomic_commit(&self) -> bool {
-        self.inner.lock().ok().and_then(|guard| guard.as_ref().map(CoreServerStore::durable_atomic_commit)).unwrap_or(false)
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|set| {
+                    set.primary.durable_atomic_commit() && set.shards.values().all(CoreServerStore::durable_atomic_commit)
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// Data directory.

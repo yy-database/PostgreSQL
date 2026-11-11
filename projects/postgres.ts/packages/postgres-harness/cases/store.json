@@ -352,6 +352,36 @@
                     { "namespace": "public.seq", "key": "c", "value": "3", "revision": 3 }
                 ] }
             ]
+        },
+        {
+            "name": "table-group-shard-colocates",
+            "ops": [
+                { "op": "open" },
+                { "op": "put", "namespace": "pg_data.16384", "key": "0000000001", "value": "[1,\"one\"]" },
+                { "op": "put", "namespace": "pg_index.16385", "key": "one", "value": "0000000001" },
+                { "op": "put", "namespace": "pg_data.16384", "key": "0000000002", "value": "[2,\"two\"]" },
+                { "op": "verifyShard", "nextRevision": 4, "records": [
+                    { "namespace": "pg_data.16384", "key": "0000000001", "value": "[1,\"one\"]", "revision": 1 },
+                    { "namespace": "pg_data.16384", "key": "0000000002", "value": "[2,\"two\"]", "revision": 3 },
+                    { "namespace": "pg_index.16385", "key": "one", "value": "0000000001", "revision": 2 }
+                ] },
+                { "op": "namespaces", "expectNamespaces": ["pg_data.16384", "pg_index.16385"] },
+                { "op": "reopen" },
+                { "op": "get", "namespace": "pg_index.16385", "key": "one", "expect": "0000000001" },
+                { "op": "verifyCatalog", "expect": { "magic": "5959445301", "version": 0, "schema": null, "routingEpoch": null, "shards": ["local-0"], "contract": null, "owners": [] } }
+            ]
+        },
+        {
+            "name": "primary-ignores-sibling-group-shards",
+            "ops": [
+                { "op": "open" },
+                { "op": "writeSibling", "name": "local-16384-706f737467726573.yykv", "hex": "59594b5603e42b42c2392d245f010000000000000000000000" },
+                { "op": "reopen" },
+                { "op": "expectFiles" },
+                { "op": "put", "namespace": "pg_catalog", "key": "catalog", "value": "{}" },
+                { "op": "get", "namespace": "pg_catalog", "key": "catalog", "expect": "{}" },
+                { "op": "namespaces", "expectNamespaces": ["pg_catalog"] }
+            ]
         }
     ]
 }
