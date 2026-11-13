@@ -1748,17 +1748,38 @@ function evaluate(database: Database, expr: Expr, context: Context, params: SqlV
 function lookup(database: Database, context: Context, qualifier: string | undefined, name: string, params: SqlValue[], start?: number): SqlValue {
     let current: Context | undefined = context;
     while (current) {
-        const binding = findBinding({ columns: current.columns, outer: undefined }, qualifier, name, start);
-        if (binding) {
-            const index = current.columns.indexOf(binding);
-            return current.row[index] ?? null;
-        }
+        const index = resolveColumnIndex(current.columns, qualifier, name, start);
+        if (index !== undefined) return current.row[index] ?? null;
         if (qualifier !== undefined && current.columns.some((column) => matchesAlias(column, qualifier))) {
             throw new ServerError('42703', `column ${qualifier}.${name} does not exist`, undefined, start);
         }
         current = current.outer;
     }
     throw new ServerError('42703', `column "${name}" does not exist`, undefined, start);
+}
+
+/**
+ * 列在一条 FROM 项里的下标，按绑定数组缓存。
+ *
+ * 同一语句的行共享同一个 `Binding[]`，而每行都要为 `WHERE`、分组键和聚合参数
+ * 反复解析列引用。`findBinding` 每次都会过滤整张列表，千行扫描里这部分开销
+ * 和真正的过滤相当。缓存只在绑定数组存活期间有效，语句结束即可回收。
+ */
+const columnIndexCache = new WeakMap<Binding[], Map<string, number>>();
+
+function resolveColumnIndex(columns: Binding[], qualifier: string | undefined, name: string, start?: number): number | undefined {
+    let cache = columnIndexCache.get(columns);
+    if (cache === undefined) {
+        cache = new Map();
+        columnIndexCache.set(columns, cache);
+    }
+    const key = `${(qualifier ?? '').toLowerCase()}\u0000${name}`;
+    const cached = cache.get(key);
+    if (cached !== undefined) return cached < 0 ? undefined : cached;
+    const binding = findBinding({ columns, outer: undefined }, qualifier, name, start);
+    const index = binding === undefined ? -1 : columns.indexOf(binding);
+    cache.set(key, index);
+    return index < 0 ? undefined : index;
 }
 
 function evaluateCast(database: Database, expr: CastExpr, context: Context, params: SqlValue[]): SqlValue {
@@ -2193,9 +2214,11 @@ function sortGroupRows(database: Database, rows: Context[], orderBy: OrderItem[]
 function aggregateValue(name: string, columns: SqlValue[][], distinct: boolean, displayName: string, argumentType: DataType | undefined): SqlValue {
     const raw = columns[0] ?? [];
     // `DISTINCT` aggregates sort their inputs before dropping duplicates, and
-    // that sort order is what `array_agg` and `string_agg` expose.
-    let order = raw.map((value, index) => ({ value, index }));
+    // that sort order is what `array_agg` and `string_agg` expose. Without
+    // `DISTINCT` the input order is already in place, so no copy is made.
+    let order: { value: SqlValue; index: number }[] | null = null;
     if (distinct) {
+        order = raw.map((value, index) => ({ value, index }));
         order.sort((left, right) => compareWithNulls(left.value, right.value, { direction: 'ASC' } as OrderItem));
         const seen = new Set<string>();
         order = order.filter((entry) => {
@@ -2205,11 +2228,28 @@ function aggregateValue(name: string, columns: SqlValue[][], distinct: boolean, 
             return true;
         });
     }
-    const values = order.map((entry) => entry.value);
+    const values = order === null ? raw : order.map((entry) => entry.value);
     switch (name) {
-        case 'count':
-            return values.filter((value) => value !== null).length;
+        case 'count': {
+            let counted = 0;
+            for (const value of values) if (value !== null) counted += 1;
+            return counted;
+        }
         case 'sum': {
+            // `sum(int2)` / `sum(int4)` 的结果是 `int8`：先把整数直接累加，
+            // 只在逼近安全整数上限时才退回十进制大数路径，避免每行都做一次
+            // 正则解析和 `BigInt` 运算。
+            if (argumentType?.key === 'int2' || argumentType?.key === 'int4') {
+                let total = 0;
+                let seen = false;
+                for (const value of values) {
+                    if (value === null) continue;
+                    seen = true;
+                    total += Number(value);
+                    if (!Number.isSafeInteger(total)) return decimalSum(values.filter((value): value is Exclude<SqlValue, null> => value !== null));
+                }
+                return seen ? String(total) : null;
+            }
             const numbers = values.filter((value): value is Exclude<SqlValue, null> => value !== null);
             if (numbers.length === 0) return null;
             if (argumentType?.key === 'float4') return numbers.reduce<number>((total, value) => Math.fround(total + Number(value)), 0);
@@ -2239,9 +2279,10 @@ function aggregateValue(name: string, columns: SqlValue[][], distinct: boolean, 
             return best;
         }
         case 'string_agg': {
+            const entries = order ?? raw.map((value, index) => ({ value, index }));
             let text = '';
             let appended = 0;
-            for (const entry of order) {
+            for (const entry of entries) {
                 if (entry.value === null) continue;
                 if (appended > 0) {
                     const delimiter = columns[1]?.[entry.index];
