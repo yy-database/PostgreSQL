@@ -74,15 +74,16 @@ Measured by `projects/postgres.ts/examples/vs-js-libraries/tests/benchmark-vs-po
 against a local PostgreSQL 16.15 on the same machine, same dataset, same statements,
 5 rounds median plus p95. Report: `examples/vs-js-libraries/reports/benchmark-vs-postgres16.md`.
 The SQL-diff corpus above does not cover these rows; they are recorded here so the next
-engine batch can pick them up without re-measuring.
+engine batch can pick them up without re-measuring. Numbers below are the medians of the
+2026-11-13 run on the 1000-row dataset.
 
 | # | gap | observed | real PostgreSQL | evidence | owner | status |
 |---|---|---|---|---|---|---|
-| 1 | read path never uses an index | `WHERE id = ?` 13.532ms/statement and `WHERE uk = ?` 13.915ms/statement, both about 13ms above the `SELECT 1` floor | primary key and unique index seek, about 0.25ms/statement | report `point-pk` / `point-uk` rows and phase table | `PostgreSQL` repository engine (query planner and read path) | open, not scheduled |
-| 2 | range, sort and group scan the whole table | `range-limit` 14.597ms, `order-limit` 18.05ms, `group-by` 16.26ms per statement for 1000 rows | index range scan and pushed-down aggregate, about 0.3-0.6ms/statement | report phase table | `PostgreSQL` repository engine (query planner and execution) | open, not scheduled |
-| 3 | every autocommit insert pays one commit flush | `insert-single` 12.496ms/statement against 0.374ms; `tx-commit` amortises to 2.138ms/row | 0.374ms/statement with default `synchronous_commit=on` on the same machine | report `insert-single` / `tx-commit` rows | `PostgreSQL` repository engine (write path and commit) | open, not scheduled |
-| 4 | conditional update and delete are scan plus per-row rewrite | `update-many` 0.485ms/row, `delete-many` 0.162ms/row | 0.015ms/row and 0.007ms/row | report `update-many` / `delete-many` rows | `PostgreSQL` repository engine (write path) | open, not scheduled |
-| 5 | `BETWEEN` is rejected | `WHERE id BETWEEN 6 AND 46` returns `42601: syntax error at or near "BETWEEN"` | returns 41 rows | report semantics table, probe fixed at ids 1..100 | `PostgreSQL` repository engine (parser) | open, not scheduled |
+| 1 | read path never uses an index | closed: `point-pk` 0.264ms and `point-uk` 0.278ms per statement against 0.100ms and 0.089ms, i.e. 2.6x and 3.1x instead of a full-table scan | primary key and unique index seek | report `point-pk` / `point-uk` rows and phase table | `PostgreSQL` repository engine (query planner and read path) | fixed |
+| 2 | range, sort and group scan the whole table | `range-limit` 0.558ms and `order-limit` 0.498ms now run as index range and ordered index scans; `group-by` 1.517ms still loads the relation once, and repeated reads reuse the committed row cache instead of re-decoding it | index range scan and pushed-down aggregate, about 0.3-0.6ms/statement | report phase table | `PostgreSQL` repository engine (query planner and execution) | partially fixed |
+| 3 | every autocommit insert pays one commit flush | `insert-single` 4.983ms/statement. A single-row `commitShard` measures 2.8-3.3ms and a primary `commitChanges` 4.5ms on this machine, so the `.yykv` snapshot replace plus fsync is the durable boundary and cannot be batched away without weakening per-statement durability | 0.309ms/statement with default `synchronous_commit=on` on the same machine | report `insert-single` / `tx-commit` rows, and a local `ServerStore` commit probe | upstream `database.storage::cluster_kv::FileShard` write path | blocked upstream, reported |
+| 4 | conditional update and delete are scan plus per-row rewrite | uniqueness is now probed through the materialized index instead of a full-table compare, so `update-many` fell from 0.254 to 0.137ms/row and `delete-many` from 0.113 to 0.095ms/row; the scan and the group rewrite stay | 0.009ms/row and 0.005ms/row | report `update-many` / `delete-many` rows | `PostgreSQL` repository engine (write path) | partially fixed |
+| 5 | `BETWEEN` is rejected | closed: both `WHERE id BETWEEN 6 AND 46` and `WHERE id > 6 AND id <= 46` return 41 rows | returns 41 rows | report semantics table | `PostgreSQL` repository engine (parser) | fixed |
 
 ## Gate
 

@@ -32,6 +32,15 @@ export interface Storage {
         limit?: number,
     ): StoredRow[];
     commitChanges(changes: StoredChange[]): void;
+    /**
+     * 已提交状态的整表行缓存，按命名空间寻址。
+     *
+     * 返回的 `Map` 和其中的行数组都视为只读：调用方要修改结构时必须先复制
+     * `Map`，行数组本身按不可变值替换。`undefined` 表示没有可复用缓存。
+     */
+    cachedRelation?(namespace: string): Map<string, SqlValue[]> | undefined;
+    /** 记下一次整表解码结果，供后续语句复用；实现负责在提交时失效。 */
+    rememberRelation?(namespace: string, rows: Map<string, SqlValue[]>): void;
 }
 
 export const CATALOG_NAMESPACE = 'pg_catalog';
@@ -264,11 +273,21 @@ export class Database {
     table(relOid: number): Map<string, SqlValue[]> {
         const cached = this.tables.get(relOid);
         if (cached) return cached;
+        const namespace = dataNamespace(relOid);
+        const shared = this.storage.cachedRelation?.(namespace);
+        if (shared !== undefined) {
+            // 跨语句复用的只是已提交状态；本语句的写入仍然落在自己的 `Map` 上。
+            const working = new Map(shared);
+            this.tables.set(relOid, working);
+            return working;
+        }
         const rows = new Map<string, SqlValue[]>();
-        for (const stored of this.storage.scan(dataNamespace(relOid))) {
+        for (const stored of this.storage.scan(namespace)) {
             rows.set(decode(stored.key), JSON.parse(decode(stored.value)) as SqlValue[]);
         }
         this.tables.set(relOid, rows);
+        // 缓存的是刚解码出的快照；`rows` 随后会被本语句就地改写，所以另存一份 Map。
+        this.storage.rememberRelation?.(namespace, new Map(rows));
         return rows;
     }
 
@@ -324,8 +343,9 @@ export class Database {
      * The high-water mark lives in `pg_rowid.<relOid>`, beside the relation's
      * rows, so a plain INSERT commits only that table group instead of
      * rewriting the catalog. A catalog written by an older release carries the
-     * counter in `nextRowId`; the largest visible row id is the third floor, so
-     * neither migration nor a deleted tail can hand out a key twice.
+     * counter in `nextRowId`. Only when neither durable counter exists does the
+     * scan fall back to the largest visible row id, which keeps a legacy
+     * directory from reusing a key without paying a full table load per INSERT.
      */
     nextRowId(relOid: number): string {
         let next = this.rowIdCounters.get(relOid);
@@ -338,9 +358,14 @@ export class Database {
                 const value = Number(decode(stored.value));
                 if (Number.isSafeInteger(value) && value > next) next = value;
             }
-            for (const rowId of this.table(relOid).keys()) {
-                const value = Number(rowId);
-                if (Number.isSafeInteger(value) && value + 1 > next) next = value + 1;
+            else {
+                // 计数与行数据在同一次提交里落盘，所以读到的持久计数就是权威高水位。
+                // 只有在从未写过计数的旧目录里才回退到「最大行号 + 1」；否则每条
+                // INSERT 都要整表加载一遍只为求最大值，退化成 O(N)。
+                for (const rowId of this.table(relOid).keys()) {
+                    const value = Number(rowId);
+                    if (Number.isSafeInteger(value) && value + 1 > next) next = value + 1;
+                }
             }
             this.rowIdCounters.set(relOid, next);
         }

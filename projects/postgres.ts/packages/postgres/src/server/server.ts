@@ -2307,6 +2307,8 @@ export function createPostgresAssembly(dataDir: string): PostgresAssembly {
     const storage: Storage = {
         // 索引访问路径依赖前缀与游标下推到原生层，这里必须原样透传。
         scan: (namespace, prefix, after, before, limit) => committed.scan(namespace, prefix, after, before, limit),
+        cachedRelation: (namespace) => committed.cachedRelation?.(namespace),
+        rememberRelation: (namespace, rows) => committed.rememberRelation?.(namespace, rows),
         commitChanges: (changes) => {
             committed.commitChanges(changes);
             if (!clusterReady || !changes.some((change) => touchesSchema(change.namespace))) return;

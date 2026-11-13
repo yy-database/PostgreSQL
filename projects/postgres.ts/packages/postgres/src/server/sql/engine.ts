@@ -3486,6 +3486,7 @@ interface TableShape {
         identity: string;
     }[];
     uniqueIndexes: {
+        oid: number;
         name: string;
         keys: { attnum: number; expression: Expr | null; pretty: string | null }[];
         predicate: Expr | null;
@@ -3525,6 +3526,7 @@ function shapeForRelation(database: Database, relation: { oid: number; name: str
         .map((index) => {
             const indexKeys: UserIndexKey[] = index.keys ?? index.indkey.map((attnum) => ({ attnum }));
             return {
+                oid: index.oid,
                 name: index.name,
                 keys: indexKeys.map((key) => ({
                     attnum: key.attnum,
@@ -4533,13 +4535,32 @@ function indexKeyValues(database: Database, shape: TableShape, keys: UserIndexKe
 }
 
 function checkUnique(database: Database, shape: TableShape, values: SqlValue[], skipKeys: Set<string>): void {
-    const rows = database.table(shape.oid);
     for (const index of shape.uniqueIndexes) {
         if (index.predicate && evaluate(database, index.predicate, rowContext(shape, database.catalog, values), []) !== true) continue;
         const candidate = index.keys.map((key) => key.expression === null
             ? values[key.attnum - 1] ?? null
             : evaluate(database, key.expression, rowContext(shape, database.catalog, values), []));
         if (candidate.some((value) => value === null)) continue;
+        const duplicate = (): never => {
+            const labels = index.keys.map((key2) => indexKeyLabel(shape, key2)).join(', ');
+            const rendered = candidate.map((value) => formatValue(value, TEXT)).join(', ');
+            throw new ServerError('23505', `duplicate key value violates unique constraint "${index.name}"`, `Key (${labels})=(${rendered}) already exists.`, undefined, undefined, undefined, index.name, {
+                schema: schemaNameOf(shape),
+                table: shape.name,
+            });
+        };
+        // 已物化的唯一索引直接按键字节探针判定，不再整表加载后逐行比较。
+        const materialized = shape.indexes.find((entry) => entry.oid === index.oid);
+        if (materialized !== undefined) {
+            const prefix = encodeIndexValues(candidate, materialized.keys);
+            // 条目键 = 键字节 + `0x00` + 行号，同值条目共享这个前缀。
+            for (const entry of database.scanIndex(materialized.oid, prefix, null, null, skipKeys.size + 1)) {
+                if (skipKeys.has(entry.key.slice(prefix.length + 1))) continue;
+                duplicate();
+            }
+            continue;
+        }
+        const rows = database.table(shape.oid);
         for (const [key, other] of rows) {
             if (skipKeys.has(key)) continue;
             const existing = index.keys.map((key2) => key2.expression === null
@@ -4548,12 +4569,7 @@ function checkUnique(database: Database, shape: TableShape, values: SqlValue[], 
             if (existing.some((value) => value === null)) continue;
             const same = candidate.every((value, position) => compareValues(value, existing[position] ?? null) === 0);
             if (!same) continue;
-            const labels = index.keys.map((key2) => indexKeyLabel(shape, key2)).join(', ');
-            const rendered = candidate.map((value) => formatValue(value, TEXT)).join(', ');
-            throw new ServerError('23505', `duplicate key value violates unique constraint "${index.name}"`, `Key (${labels})=(${rendered}) already exists.`, undefined, undefined, undefined, index.name, {
-                schema: schemaNameOf(shape),
-                table: shape.name,
-            });
+            duplicate();
         }
     }
 }

@@ -30,6 +30,7 @@
 
 import type { ServerStore, ServerStoreChange } from '../native.ts';
 import { CLUSTER_KEY, CLUSTER_NAMESPACE } from './sql/cluster.ts';
+import type { SqlValue } from './sql/types.ts';
 import {
     CATALOG_KEY,
     CATALOG_NAMESPACE,
@@ -135,6 +136,15 @@ export function storageFor(store: ServerStore): Storage {
     const indexOwners = new Map<string, Map<number, number>>();
     /** Shard ids are stable per group; the hex encoding stays cached. */
     const shardIds = new Map<string, string>();
+    /**
+     * 已提交的整表行缓存，最近使用的排最后。一次语句解析上千行 JSON 的开销
+     * 远高于复制一份 Map，而语句之间只要没有提交，解码结果就一直有效。
+     */
+    const relationCache = new Map<string, Map<string, SqlValue[]>>();
+    /** 缓存的关系数量上限，避免把整个数据目录都驻留在内存里。 */
+    const RELATION_CACHE_LIMIT = 8;
+    /** 超过这个行数的关系不做缓存，内存占用优先于读加速。 */
+    const RELATION_CACHE_ROWS = 50_000;
 
     function shardId(db: string, relOid: number): string {
         const key = `${db}\u0000${relOid}`;
@@ -252,7 +262,27 @@ export function storageFor(store: ServerStore): Storage {
                       );
             return readFlatRows(payload);
         },
+        cachedRelation(namespace: string): Map<string, SqlValue[]> | undefined {
+            const cached = relationCache.get(namespace);
+            if (cached === undefined) return undefined;
+            // 命中即刷新 LRU 顺序。
+            relationCache.delete(namespace);
+            relationCache.set(namespace, cached);
+            return cached;
+        },
+        rememberRelation(namespace: string, rows: Map<string, SqlValue[]>): void {
+            if (rows.size > RELATION_CACHE_ROWS) return;
+            relationCache.delete(namespace);
+            relationCache.set(namespace, rows);
+            while (relationCache.size > RELATION_CACHE_LIMIT) {
+                const oldest = relationCache.keys().next().value;
+                if (oldest === undefined) break;
+                relationCache.delete(oldest);
+            }
+        },
         commitChanges(changes: StoredChange[]): void {
+            // 提交会改变已提交状态，先失效缓存再接写入，避免中途失败留下旧值。
+            for (const change of changes) relationCache.delete(change.namespace);
             const native: ServerStoreChange[] = changes.map((change) => ({
                 kind: change.kind,
                 namespace: change.namespace,
@@ -357,6 +387,12 @@ export function scopedStorage(storage: Storage, prefix: string): Storage {
             storage.commitChanges(
                 changes.map((change) => ({ ...change, namespace: scopeNamespace(prefix, change.namespace) })),
             );
+        },
+        cachedRelation(namespace: string): Map<string, SqlValue[]> | undefined {
+            return storage.cachedRelation?.(scopeNamespace(prefix, namespace));
+        },
+        rememberRelation(namespace: string, rows: Map<string, SqlValue[]>): void {
+            storage.rememberRelation?.(scopeNamespace(prefix, namespace), rows);
         },
     };
 }
