@@ -41,8 +41,11 @@ catalog SQL `psql` sends for `\dt` and `\d`. Types are `int2`/`int4`/`int8`/
 `timestamptz`/`uuid`; constraints are `NOT NULL`, literal `DEFAULT`,
 `PRIMARY KEY` and `UNIQUE`.
 
-Still missing: `ALTER` beyond constraint operations, `EXPLAIN`, grouping by a
-primary key's functional dependency, and ordered-set aggregates.
+Still missing: `ALTER` beyond constraint operations, `EXPLAIN (ANALYZE)` for
+grouping and joins, grouping by a primary key's functional dependency, and
+ordered-set aggregates. `EXPLAIN` itself covers single-relation scans with
+`ANALYZE` counts plus grouping and join plans as plan text, and rejects set
+operations, `WITH`, subqueries and `DISTINCT` with `0A000`.
 `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL` joins with `ON` or `USING`, and
 `count`/`sum`/`avg`/`min`/`max`/`string_agg`/`array_agg`/`bool_and`/`bool_or`/
 `every` with `DISTINCT`, `FILTER` and aggregate `ORDER BY`, are gated against

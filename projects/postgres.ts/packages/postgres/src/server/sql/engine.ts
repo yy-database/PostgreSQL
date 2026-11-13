@@ -4016,28 +4016,146 @@ function indexColumnsOf(database: Database, relid: number): IndexColumn[] {
 function explainLines(database: Database, statement: SelectStatement, params: SqlValue[], analyze: boolean): string[] {
     if (statement.core.from.length === 0) return ['Result'];
     if (
-        statement.core.from.length !== 1
-        || statement.unions.length > 0
+        statement.unions.length > 0
         || statement.with !== undefined
         || statement.core.values !== undefined
-        || statement.core.groupBy.length > 0
-        || statement.core.having !== undefined
         || statement.core.distinct
     ) {
-        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for a single-relation SELECT without grouping or set operations');
+        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for SELECT plans without set operations, WITH or DISTINCT');
     }
-    const item = statement.core.from[0];
-    if (item === undefined || item.kind !== 'relation' || item.args !== undefined) {
-        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for a single-relation SELECT without grouping or set operations');
+    const single = statement.core.from.length === 1 ? statement.core.from[0] : undefined;
+    const grouped = statement.core.groupBy.length > 0
+        || statement.core.having !== undefined
+        || statement.core.targets.some((target) => containsAggregate(target.expr));
+    // 单表非分组查询沿用原有的计划文本（含 ANALYZE 的真实扫描计数）。
+    if (!grouped && single !== undefined && single.kind === 'relation' && single.args === undefined) {
+        return explainRelationPlan(database, single, statement, params, analyze);
     }
-    const ref = item;
+    if (analyze) {
+        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN ANALYZE is implemented for single-relation SELECT without grouping');
+    }
+    const body = single !== undefined
+        ? explainFromItem(database, single, statement.core.where, params, grouped ? 1 : 0)
+        : explainCrossFrom(database, statement.core.from, statement.core.where, params, grouped ? 1 : 0);
+    if (!grouped) return body;
+    const keys = statement.core.groupBy.map((expr) => deparseIndexExpression(expr, true) ?? '(expression)');
+    const head = statement.core.groupBy.length > 0 ? `HashAggregate  (Group Key: ${keys.join(', ')})` : 'Aggregate';
+    return [head, ...body];
+}
+
+/** 计划树的一行缩进：顶层无前缀，子节点按深度加 `->`。 */
+function explainDepthPrefix(depth: number): string {
+    return depth === 0 ? '' : `${'  '.repeat(depth)}->  `;
+}
+
+/** 一条 `FROM` 项的计划节点行。 */
+function explainFromItem(database: Database, item: FromItem, where: Expr | undefined, params: SqlValue[], depth: number): string[] {
+    const prefix = explainDepthPrefix(depth);
+    if (item.kind === 'relation') {
+        const line = explainRelationScanLine(database, item, where, params);
+        return [`${prefix}${line}`];
+    }
+    if (item.kind === 'subquery') {
+        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for base tables and joined base tables only');
+    }
+    const condition = item.on === undefined ? undefined : explainConditionText(item.on) ?? '(expression)';
+    const type = item.joinType === 'inner' || item.joinType === 'cross'
+        ? ''
+        : item.joinType === 'left'
+            ? ' Left'
+            : item.joinType === 'right'
+                ? ' Right'
+                : ' Full';
+    // 有连接条件时按哈希连接呈现，交叉连接与无条件连接退回嵌套循环。
+    const head = condition === undefined
+        ? `Nested Loop${type} Join`
+        : `Hash${type} Join  (Hash Cond: ${condition})`;
+    return [
+        `${prefix}${head}`,
+        ...explainFromItem(database, item.left, where, params, depth + 1),
+        ...explainFromItem(database, item.right, where, params, depth + 1),
+    ];
+}
+
+/** 逗号分隔的多表 `FROM` 等价于交叉连接链。 */
+function explainCrossFrom(database: Database, items: FromItem[], where: Expr | undefined, params: SqlValue[], depth: number): string[] {
+    const prefix = explainDepthPrefix(depth);
+    return [
+        `${prefix}Nested Loop`,
+        ...items.flatMap((item) => explainFromItem(database, item, where, params, depth + 1)),
+    ];
+}
+
+/** 计划里的连接条件文本，列引用保留表限定名。 */
+function explainConditionText(expr: Expr): string | undefined {
+    if (expr.kind === 'column') {
+        const column = expr as ColumnExpr;
+        return column.qualifier === undefined ? column.name : `${column.qualifier}.${column.name}`;
+    }
+    if (expr.kind === 'binary') {
+        const binary = expr as BinaryExpr;
+        const left = explainConditionText(binary.left);
+        const right = explainConditionText(binary.right);
+        if (left === undefined || right === undefined) return undefined;
+        return `(${left} ${binary.op} ${right})`;
+    }
+    return deparseIndexExpression(expr, true);
+}
+
+/** 只保留引用该表（及其别名）的 `WHERE` 合取项，用于单表访问路径选择。 */
+function explainPushdownFilter(where: Expr | undefined, aliases: Set<string>): Expr | undefined {
+    if (where === undefined) return undefined;
+    const parts = flattenConjuncts(where).filter((part) => {
+        let onlyThisRelation = true;
+        let sawColumn = false;
+        walkExpr(part, (node) => {
+            if (node.kind !== 'column') return;
+            const qualifier = (node as ColumnExpr).qualifier;
+            if (qualifier === undefined) {
+                onlyThisRelation = false;
+                return;
+            }
+            sawColumn = true;
+            if (!aliases.has(qualifier.toLowerCase())) onlyThisRelation = false;
+        });
+        return onlyThisRelation && sawColumn;
+    });
+    if (parts.length === 0) return undefined;
+    return parts.reduce((left, right) => ({ kind: 'binary', op: 'and', left, right }));
+}
+
+/** 多表计划里一张基表的访问方式行（索引命中时给出索引名）。 */
+function explainRelationScanLine(database: Database, ref: RelationRef, where: Expr | undefined, params: SqlValue[]): string {
+    const relation = explainUserRelation(database, ref);
+    const alias = ref.alias ?? ref.name;
+    const label = `on ${relation.name}${ref.alias === undefined || ref.alias === ref.name ? '' : ` ${alias}`}`;
+    const columns = indexColumnsOf(database, relation.oid);
+    const aliases = new Set([ref.name.toLowerCase(), relation.name.toLowerCase(), alias.toLowerCase()]);
+    const pushdown = explainPushdownFilter(where, aliases);
+    const plan = pushdown === undefined
+        ? null
+        : planRelationAccess(database, materializedIndexesOf(database.catalog, relation.oid), columns, aliases, pushdown, params);
+    return plan ? `Index Scan using ${plan.index.name} ${label}` : `Seq Scan ${label}`;
+}
+
+/** 解析 `EXPLAIN` 目标表，非用户表按边界拒绝。 */
+function explainUserRelation(database: Database, ref: RelationRef): { oid: number; name: string } {
     if (ref.schema !== undefined && ref.schema !== 'public') {
         throw new ServerError('3F000', `schema "${ref.schema}" does not exist`, undefined, ref.start);
+    }
+    if (ref.args !== undefined) {
+        throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for base tables and joined base tables only', ref.start);
     }
     const relation = relationByName(database.catalog, ref.name);
     if (!relation || relation.relkind !== 'r') {
         throw new ServerError('0A000', 'feature not supported', 'EXPLAIN is implemented for user tables only', ref.start);
     }
+    return relation;
+}
+
+/** 单表访问计划，保留真实的索引扫描计数。 */
+function explainRelationPlan(database: Database, ref: RelationRef, statement: SelectStatement, params: SqlValue[], analyze: boolean): string[] {
+    const relation = explainUserRelation(database, ref);
     const alias = ref.alias ?? ref.name;
     const columns = indexColumnsOf(database, relation.oid);
     const aliases = new Set([ref.name.toLowerCase(), relation.name.toLowerCase(), alias.toLowerCase()]);

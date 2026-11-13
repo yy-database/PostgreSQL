@@ -3205,6 +3205,50 @@ export async function runServerStage(repositoryRoot, harnessDir) {
             });
         });
 
+        // Batch 13: 分组与连接的计划也可见，`ANALYZE` 仍限定在单表扫描。
+        await check('b13/explain-group-join', async () => {
+            await withClient(batchIndex, async (client) => {
+                await client.query('CREATE TABLE plan_t (id int PRIMARY KEY, grp int, val int)');
+                await client.query('CREATE TABLE plan_o (id int PRIMARY KEY, note text)');
+                await client.query('INSERT INTO plan_t VALUES (1, 0, 10), (2, 0, 20), (3, 1, 30)');
+                await client.query("INSERT INTO plan_o VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+                const planOf = async (sql) => (await client.query(sql)).rows.map((row) => row['QUERY PLAN']);
+                const expectPlan = async (sql, expected, label) => {
+                    const actual = await planOf(sql);
+                    assert(JSON.stringify(actual) === JSON.stringify(expected), `${label} 的计划是 ${JSON.stringify(actual)}`);
+                };
+                await expectPlan('EXPLAIN SELECT grp, count(*), sum(val) FROM plan_t GROUP BY grp', [
+                    'HashAggregate  (Group Key: grp)',
+                    '  ->  Seq Scan on plan_t',
+                ], '分组');
+                await expectPlan('EXPLAIN SELECT count(*) FROM plan_t', [
+                    'Aggregate',
+                    '  ->  Seq Scan on plan_t',
+                ], '无分组聚合');
+                // 只属于一侧的等值谓词仍要下推成索引扫描。
+                await expectPlan('EXPLAIN SELECT t.id, o.note FROM plan_t t JOIN plan_o o ON o.id = t.id WHERE t.id = 2', [
+                    'Hash Join  (Hash Cond: (o.id = t.id))',
+                    '  ->  Index Scan using plan_t_pkey on plan_t t',
+                    '  ->  Seq Scan on plan_o o',
+                ], '连接下推主键');
+                await expectPlan('EXPLAIN SELECT t.id, o.note FROM plan_t t LEFT JOIN plan_o o ON o.id = t.id', [
+                    'Hash Left Join  (Hash Cond: (o.id = t.id))',
+                    '  ->  Seq Scan on plan_t t',
+                    '  ->  Seq Scan on plan_o o',
+                ], '左连接');
+                await expectPlan('EXPLAIN SELECT t.id, o.note FROM plan_t t, plan_o o WHERE t.grp = 0', [
+                    'Nested Loop',
+                    '  ->  Seq Scan on plan_t t',
+                    '  ->  Seq Scan on plan_o o',
+                ], '逗号连接');
+                const analyzeFailure = await client.query('EXPLAIN (ANALYZE) SELECT grp FROM plan_t GROUP BY grp').then(
+                    () => null,
+                    (error) => error,
+                );
+                assert(analyzeFailure && analyzeFailure.code === '0A000', `分组 ANALYZE 错误码是 ${analyzeFailure?.code}`);
+            });
+        });
+
         // Batch 13: 无 `WHERE` 的 `ORDER BY` 命中索引键序时走有序索引扫描，取够 `LIMIT` 即停。
         await check('b13/ordered-plan', async () => {
             await withClient(batchIndex, async (client) => {
