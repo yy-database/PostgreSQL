@@ -14,6 +14,7 @@ import {
   POINT_UK_TYPE_OIDS,
   SCAN_SQL,
   bench2BatchInsert,
+  bench2ParamBatchInsert,
 } from "./sql.mjs";
 
 function singleResult(results, context) {
@@ -95,6 +96,11 @@ export function openNativeClient(options) {
     },
     async batchInsert(start, count) {
       const result = singleResult(connection.execute(bench2BatchInsert(start, count)), `batch insert ${start}`);
+      return Number(result.tag.split(" ")[2]);
+    },
+    async batchInsertParams(start, count) {
+      const { sql, values, types } = bench2ParamBatchInsert(start, count);
+      const result = singleResult(connection.executeWithParams(sql, values, types), `param batch insert ${start}`);
       return Number(result.tag.split(" ")[2]);
     },
     async close() {

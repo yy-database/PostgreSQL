@@ -44,20 +44,30 @@ pnpm --dir projects/postgres.ts/examples/vs-js-libraries benchmark
 
 Defaults: `BENCH_ROWS=200`, `BENCH_POINT=500`, `BENCH_SCAN=1000`,
 `BENCH_PREPARED=500`, `BENCH_ROUNDS=3`, `BENCH2_ROWS=200`, `BENCH_ORDER=50`,
-`BENCH_GROUP=50`, `BENCH_JOIN=50`, `BENCH_BATCH=100`. Override any of them in
-the environment.
+`BENCH_GROUP=50`, `BENCH_JOIN=50`, `BENCH_BATCH=100`, `BENCH_RANGE=100`,
+`BENCH_MUTATE=200`, `BENCH_UPSERT=200`, `BENCH_SIMPLE=500`,
+`BENCH_TX_PREPARED=200`, `BENCH_RETURNING=100`, `BENCH_WIDE=100`,
+`BENCH_ERROR=100`. Override any of them in the environment.
 
 Workloads (scenario set aligned with the SQLite repository's `vs-js-libraries`):
 
 - `insert` — sequential parameterized inserts of `BENCH_ROWS` rows
-- `select-point` — `BENCH_POINT` parameterized point selects over `BENCH_ROWS` seeded rows
+- `select-point` — `BENCH_POINT` parameterized (extended-protocol) point selects
+- `simple-point` — `BENCH_SIMPLE` unparameterized point selects through the simple-query protocol
 - `select-scan` — one ordered scan over `BENCH_SCAN` seeded rows
 - `prepared-point` — one prepared point statement executed `BENCH_PREPARED` times
+- `tx-prepared` — the same prepared statement executed `BENCH_TX_PREPARED` times inside one transaction
 - `point-uk` — `BENCH_POINT` parameterized point selects on the `UNIQUE` column
 - `order-limit` — `BENCH_ORDER` ordered-index `ORDER BY val DESC, id LIMIT 20` statements
 - `group-by` — `BENCH_GROUP` `GROUP BY grp` aggregation statements over the unindexed `grp`
 - `join` — `BENCH_JOIN` `INNER JOIN bench_join ON id` statements filtered by `grp`
-- `batch-insert` — `BENCH_ROWS` rows through multi-row `INSERT ... VALUES (...), (...)` statements of `BENCH_BATCH` rows
+- `batch-insert` — `BENCH_ROWS` rows through literal multi-row `INSERT ... VALUES (...), (...)` statements of `BENCH_BATCH` rows
+- `batch-insert-params` — the same rows through `$n`-bound multi-row inserts
+- `distinct`, `aggregate`, `subquery`, `index-range`, `update`, `delete`, `rollback` — shared SQL-feature rows from `benchmark-vs-postgres16.mjs`
+- `upsert` — `BENCH_UPSERT` `INSERT ... ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val` statements
+- `update-returning` — `BENCH_RETURNING` `UPDATE ... RETURNING id, val` statements
+- `wide-row` — `BENCH_WIDE` point reads where `pad` is `NULL` on half the ids and 4 KiB on id 1
+- `error-constraint` — `BENCH_ERROR` duplicate-key inserts, timing the error round trip
 
 Every round starts a fresh child server with a fresh temporary data directory. Table
 creation and seeding are untimed. One warmup round runs before the measured rounds.

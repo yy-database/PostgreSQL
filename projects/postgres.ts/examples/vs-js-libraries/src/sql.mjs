@@ -46,3 +46,25 @@ export function bench2BatchInsert(start, count) {
   for (let id = start; id < start + count; id += 1) rows.push(bench2RowTuple(id));
   return `INSERT INTO bench VALUES ${rows.join(", ")}`;
 }
+
+/**
+ * Parameterised form of `bench2BatchInsert`: the same rows, but every cell is
+ * a `$n` placeholder so the statement exercises bind/parameter encoding instead
+ * of literal parsing. Types are `integer` for the four numeric columns and
+ * `text` for `pad`.
+ */
+export function bench2ParamBatchInsert(start, count) {
+  const tuples = [];
+  const values = [];
+  const types = [];
+  let parameter = 1;
+  for (let id = start; id < start + count; id += 1) {
+    const grp = Math.floor((id - 1) / 10);
+    const val = (id * 137) % 997;
+    tuples.push(`($${parameter}, $${parameter + 1}, $${parameter + 2}, $${parameter + 3}, $${parameter + 4})`);
+    values.push(String(id), String(id), String(grp), String(val), `row-${id}`);
+    types.push(23, 23, 23, 23, 25);
+    parameter += 5;
+  }
+  return { sql: `INSERT INTO bench VALUES ${tuples.join(", ")}`, values, types };
+}

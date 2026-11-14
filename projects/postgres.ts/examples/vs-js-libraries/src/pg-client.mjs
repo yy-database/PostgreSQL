@@ -11,6 +11,7 @@ import {
   PREPARED_NAME,
   SCAN_SQL,
   bench2BatchInsert,
+  bench2ParamBatchInsert,
 } from "./sql.mjs";
 
 const { Client } = pg;
@@ -81,6 +82,11 @@ export async function openPgClient(options) {
     },
     async batchInsert(start, count) {
       const result = await client.query(bench2BatchInsert(start, count));
+      return result.rowCount;
+    },
+    async batchInsertParams(start, count) {
+      const { sql, values } = bench2ParamBatchInsert(start, count);
+      const result = await client.query(sql, values);
       return result.rowCount;
     },
     async close() {
