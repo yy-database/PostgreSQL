@@ -30,6 +30,7 @@
 
 import type { ServerStore, ServerStoreChange } from '../native.ts';
 import { CLUSTER_KEY, CLUSTER_NAMESPACE } from './sql/cluster.ts';
+import type { CatalogDoc } from './sql/catalog.ts';
 import type { SqlValue } from './sql/types.ts';
 import {
     CATALOG_KEY,
@@ -145,6 +146,11 @@ export function storageFor(store: ServerStore): Storage {
     const RELATION_CACHE_LIMIT = 8;
     /** 超过这个行数的关系不做缓存，内存占用优先于读加速。 */
     const RELATION_CACHE_ROWS = 50_000;
+    /**
+     * 已解析的目录文档，按目录命名空间独占一份。目录只在目录提交后变化，
+     * 所以命中率接近 100%；`loadCatalog` 每次只复制一份可变快照。
+     */
+    const catalogCache = new Map<string, CatalogDoc>();
 
     function shardId(db: string, relOid: number): string {
         const key = `${db}\u0000${relOid}`;
@@ -280,9 +286,20 @@ export function storageFor(store: ServerStore): Storage {
                 relationCache.delete(oldest);
             }
         },
+        cachedCatalog(namespace: string): CatalogDoc | undefined {
+            return catalogCache.get(namespace);
+        },
+        rememberCatalog(namespace: string, doc: CatalogDoc): void {
+            catalogCache.set(namespace, doc);
+        },
         commitChanges(changes: StoredChange[]): void {
             // 提交会改变已提交状态，先失效缓存再接写入，避免中途失败留下旧值。
-            for (const change of changes) relationCache.delete(change.namespace);
+            for (const change of changes) {
+                relationCache.delete(change.namespace);
+                // 目录提交（DDL 与序列高水位）会让已解析的文档过期；事务回滚不
+                // 经过这里，缓存里的那份始终是最后一次提交的状态。
+                catalogCache.delete(change.namespace);
+            }
             const native: ServerStoreChange[] = changes.map((change) => ({
                 kind: change.kind,
                 namespace: change.namespace,
@@ -393,6 +410,12 @@ export function scopedStorage(storage: Storage, prefix: string): Storage {
         },
         rememberRelation(namespace: string, rows: Map<string, SqlValue[]>): void {
             storage.rememberRelation?.(scopeNamespace(prefix, namespace), rows);
+        },
+        cachedCatalog(namespace: string): CatalogDoc | undefined {
+            return storage.cachedCatalog?.(scopeNamespace(prefix, namespace));
+        },
+        rememberCatalog(namespace: string, doc: CatalogDoc): void {
+            storage.rememberCatalog?.(scopeNamespace(prefix, namespace), doc);
         },
     };
 }

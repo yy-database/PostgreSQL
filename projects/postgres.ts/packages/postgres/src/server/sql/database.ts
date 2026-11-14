@@ -41,6 +41,15 @@ export interface Storage {
     cachedRelation?(namespace: string): Map<string, SqlValue[]> | undefined;
     /** 记下一次整表解码结果，供后续语句复用；实现负责在提交时失效。 */
     rememberRelation?(namespace: string, rows: Map<string, SqlValue[]>): void;
+    /**
+     * 已解析的目录文档，按目录命名空间寻址。
+     *
+     * 返回的对象只读：`loadCatalog` 每次都会复制一份可变快照再交出去。实现
+     * 必须在提交写入目录行后丢弃它，否则下一次加载会看到旧的 schema。
+     */
+    cachedCatalog?(namespace: string): CatalogDoc | undefined;
+    /** 记下一次目录解码结果；同一版本的后续语句不再重扫、重解析。 */
+    rememberCatalog?(namespace: string, doc: CatalogDoc): void;
 }
 
 export const CATALOG_NAMESPACE = 'pg_catalog';
@@ -95,13 +104,50 @@ function decodeKeyBytes(text: string): Uint8Array {
     return Buffer.from(text, 'latin1');
 }
 
+/**
+ * Copies a decoded catalog document.
+ *
+ * The document is a fixed shape of primitive records, so a hand-written copy is
+ * several times cheaper than re-parsing the 2–3 KB JSON every statement, and it
+ * keeps the engine's in-place mutation model: each statement owns its snapshot.
+ */
+export function cloneCatalog(doc: CatalogDoc): CatalogDoc {
+    const copy: CatalogDoc = {
+        version: doc.version,
+        nextOid: doc.nextOid,
+        nextRowId: { ...doc.nextRowId },
+        relations: doc.relations.map((relation) => ({ ...relation })),
+        columns: doc.columns.map((column) => ({ ...column })),
+        indexes: doc.indexes.map((index) => ({
+            ...index,
+            indkey: [...index.indkey],
+            ...(index.keys === undefined ? {} : { keys: index.keys.map((key) => ({ ...key })) }),
+        })),
+        constraints: doc.constraints.map((constraint) => ({ ...constraint, conkey: [...constraint.conkey], confkey: [...constraint.confkey] })),
+        sequences: doc.sequences.map((sequence) => ({ ...sequence })),
+        views: doc.views.map((view) => ({ ...view })),
+    };
+    if (doc.namespaceAcls !== undefined) copy.namespaceAcls = { ...doc.namespaceAcls };
+    return copy;
+}
+
 /** Loads the catalog, or returns an empty one on a fresh data directory. */
 export function loadCatalog(storage: Storage): CatalogDoc {
+    // 目录只在一行里，解码结果只要没有目录提交就一直有效：命中缓存时省掉
+    // 一次原生扫描和一次 JSON 解析，只付一份浅层深拷贝。
+    const cached = storage.cachedCatalog?.(CATALOG_NAMESPACE);
+    if (cached !== undefined) return cloneCatalog(cached);
     // 目录命名空间只存 `CATALOG_KEY` 一行，取一行就够，不必让原生扫描走完整段。
     const rows = storage.scan(CATALOG_NAMESPACE, undefined, undefined, undefined, 1);
     const row = rows.find((candidate) => decode(candidate.key) === CATALOG_KEY);
-    if (!row) return emptyCatalog();
-    return assertCatalog(JSON.parse(decode(row.value)) as unknown);
+    if (!row) {
+        const empty = emptyCatalog();
+        storage.rememberCatalog?.(CATALOG_NAMESPACE, empty);
+        return cloneCatalog(empty);
+    }
+    const doc = assertCatalog(JSON.parse(decode(row.value)) as unknown);
+    storage.rememberCatalog?.(CATALOG_NAMESPACE, doc);
+    return cloneCatalog(doc);
 }
 
 /**
@@ -150,6 +196,8 @@ export class Database {
     private databaseAcls = new Map<string, string | null>();
     private readonly storage: Storage;
     private readonly tables = new Map<number, Map<string, SqlValue[]>>();
+    /** 仍与共享缓存共用同一个 `Map` 的关系；首次写入前必须先复制。 */
+    private readonly sharedTables = new Set<number>();
     private readonly writes = new Map<number, Map<string, SqlValue[] | null>>();
     /** Index entries written by this message, keyed by index oid then encoded key. */
     private readonly indexWrites = new Map<number, Map<string, SqlValue[] | null>>();
@@ -253,7 +301,9 @@ export class Database {
 
     /** Copies the working set for `SAVEPOINT`/`ROLLBACK TO`; shares row arrays. */
     clone(): Database {
-        const copy = new Database(this.storage, structuredClone(this.catalog), this.session, this.cluster);
+        // 目录是定形的原始记录集合，手写复制比 `structuredClone` 快一个数量级；
+        // 每条写入语句都要为回滚留一份快照，这里省下的是逐语句固定成本。
+        const copy = new Database(this.storage, cloneCatalog(this.catalog), this.session, this.cluster);
         copy.onWrite = this.onWrite;
         copy.readOnly = this.readOnly;
         copy.adoptRoles(this);
@@ -276,10 +326,11 @@ export class Database {
         const namespace = dataNamespace(relOid);
         const shared = this.storage.cachedRelation?.(namespace);
         if (shared !== undefined) {
-            // 跨语句复用的只是已提交状态；本语句的写入仍然落在自己的 `Map` 上。
-            const working = new Map(shared);
-            this.tables.set(relOid, working);
-            return working;
+            // 跨语句复用的只是已提交状态。只读语句直接读共享快照，第一次写入
+            // 才通过 `ownTable` 复制，省掉每条只读语句的一整表 Map 复制。
+            this.tables.set(relOid, shared);
+            this.sharedTables.add(relOid);
+            return shared;
         }
         const rows = new Map<string, SqlValue[]>();
         for (const stored of this.storage.scan(namespace)) {
@@ -289,6 +340,16 @@ export class Database {
         // 缓存的是刚解码出的快照；`rows` 随后会被本语句就地改写，所以另存一份 Map。
         this.storage.rememberRelation?.(namespace, new Map(rows));
         return rows;
+    }
+
+    /** 取一份可写的行表；共享缓存的那份在第一次写入前复制。 */
+    private ownTable(relOid: number): Map<string, SqlValue[]> {
+        const rows = this.table(relOid);
+        if (!this.sharedTables.has(relOid)) return rows;
+        const owned = new Map(rows);
+        this.tables.set(relOid, owned);
+        this.sharedTables.delete(relOid);
+        return owned;
     }
 
     /**
@@ -309,7 +370,9 @@ export class Database {
             for (const row of this.cluster.doc.databases) this.databaseAcls.set(row.datname, row.datacl);
         }
         for (const relOid of [...this.tables.keys()]) {
-            if (!this.writes.has(relOid)) this.tables.delete(relOid);
+            if (this.writes.has(relOid)) continue;
+            this.tables.delete(relOid);
+            this.sharedTables.delete(relOid);
         }
     }
 
@@ -376,21 +439,21 @@ export class Database {
 
     insertRow(relOid: number, values: SqlValue[]): string {
         const key = this.nextRowId(relOid);
-        this.table(relOid).set(key, values);
+        this.ownTable(relOid).set(key, values);
         this.changesFor(relOid).set(key, values);
         return key;
     }
 
     updateRow(relOid: number, key: string, values: SqlValue[]): void {
         this.onWrite?.(relOid, key, 'update');
-        this.table(relOid).set(key, values);
+        this.ownTable(relOid).set(key, values);
         this.changesFor(relOid).set(key, values);
     }
 
     deleteRow(relOid: number, key: string): void {
         if (!this.table(relOid).has(key)) return;
         this.onWrite?.(relOid, key, 'delete');
-        if (!this.table(relOid).delete(key)) return;
+        if (!this.ownTable(relOid).delete(key)) return;
         this.changesFor(relOid).set(key, null);
     }
 
@@ -487,6 +550,9 @@ export class Database {
         this.databaseAcls = new Map(other.databaseAcls);
         this.tables.clear();
         for (const [relOid, rows] of other.tables) this.tables.set(relOid, rows);
+        // 如果快照的某张表仍指向共享缓存，恢复后也必须按共享状态对待。
+        this.sharedTables.clear();
+        for (const relOid of other.sharedTables) this.sharedTables.add(relOid);
         this.writes.clear();
         for (const [relOid, rows] of other.writes) this.writes.set(relOid, rows);
         this.indexWrites.clear();
