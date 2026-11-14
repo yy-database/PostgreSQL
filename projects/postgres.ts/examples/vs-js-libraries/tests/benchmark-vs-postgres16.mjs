@@ -62,10 +62,19 @@ const DELETE_STATEMENTS = Number(process.env.BENCH_DELETE ?? 10);
 const ORDER_OPS = Number(process.env.BENCH_ORDER ?? 50);
 const GROUP_OPS = Number(process.env.BENCH_GROUP ?? 50);
 const JOIN_OPS = Number(process.env.BENCH_JOIN ?? 50);
+const FEATURE_OPS = Number(process.env.BENCH_FEATURE ?? 50);
 const TX_COUNT = Number(process.env.BENCH_TX ?? 30);
 const TX_ROWS = Number(process.env.BENCH_TX_ROWS ?? 10);
 const CONNECT_OPS = Number(process.env.BENCH_CONNECT ?? 20);
 const BASELINE_OPS = Number(process.env.BENCH_BASELINE ?? 300);
+const PORTAL_OPS = Number(process.env.BENCH_PORTAL ?? 10);
+const PAGE_ROWS = Number(process.env.BENCH_PAGE ?? 20);
+const TEMP_OPS = Number(process.env.BENCH_TEMP ?? 30);
+const MULTI_OPS = Number(process.env.BENCH_MULTI ?? 50);
+const MULTI_MSG_STATEMENTS = Number(process.env.BENCH_MULTI_STATEMENTS ?? 5);
+const CVR_OPS = Number(process.env.BENCH_CVR ?? 50);
+const RR_TX = Number(process.env.BENCH_RR ?? 20);
+const RR_ROWS = Number(process.env.BENCH_RR_ROWS ?? 10);
 
 const ID_BASE = 1_000;
 const GROUP_SIZE = Math.floor(DATASET / 10);
@@ -292,6 +301,137 @@ const WORKLOADS = [
     },
   },
   {
+    name: "count-scan",
+    unit: "statements",
+    ops: FEATURE_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      for (let index = 0; index < FEATURE_OPS; index += 1) {
+        const result = await connection.query("SELECT COUNT(*) AS n FROM bench");
+        if (Number(result.rows[0].n) !== DATASET) throw new Error(`count-scan n=${result.rows[0].n}`);
+      }
+      return FEATURE_OPS;
+    },
+  },
+  {
+    name: "distinct-groups",
+    unit: "statements",
+    ops: FEATURE_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      for (let index = 0; index < FEATURE_OPS; index += 1) {
+        const result = await connection.query("SELECT DISTINCT grp FROM bench ORDER BY grp");
+        if (result.rowCount !== 10) throw new Error(`distinct-groups groups=${result.rowCount}`);
+      }
+      return FEATURE_OPS;
+    },
+  },
+  {
+    name: "cte-filter",
+    unit: "statements",
+    ops: FEATURE_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      for (let index = 0; index < FEATURE_OPS; index += 1) {
+        const result = await connection.query(
+          `WITH picked AS (SELECT id, val FROM bench WHERE grp = ${index % 10}) SELECT COUNT(*) AS n FROM picked`,
+        );
+        if (Number(result.rows[0].n) !== GROUP_SIZE) throw new Error(`cte-filter n=${result.rows[0].n}`);
+      }
+      return FEATURE_OPS;
+    },
+  },
+  {
+    name: "window-rank",
+    unit: "statements",
+    ops: FEATURE_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      for (let index = 0; index < FEATURE_OPS; index += 1) {
+        const result = await connection.query("SELECT id, row_number() OVER (ORDER BY val DESC, id) AS rn FROM bench LIMIT 20");
+        if (result.rowCount !== 20) throw new Error(`window-rank rows=${result.rowCount}`);
+      }
+      return FEATURE_OPS;
+    },
+  },
+  {
+    name: "text-compare",
+    unit: "statements",
+    ops: FEATURE_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      const expected = Math.max(0, ID_BASE + DATASET - 1_990);
+      for (let index = 0; index < FEATURE_OPS; index += 1) {
+        const result = await connection.query("SELECT COUNT(*) AS n FROM bench WHERE pad >= 'row-1990'");
+        if (Number(result.rows[0].n) !== expected) throw new Error(`text-compare n=${result.rows[0].n}`);
+      }
+      return FEATURE_OPS;
+    },
+  },
+  {
+    name: "left-join-count",
+    unit: "statements",
+    ops: FEATURE_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+      await connection.query("DROP TABLE IF EXISTS bench_join");
+      await connection.query("CREATE TABLE bench_join (id INT NOT NULL PRIMARY KEY, note VARCHAR(40))");
+      const rows = [];
+      for (let id = ID_BASE; id < ID_BASE + DATASET; id += 1) rows.push(`(${id}, 'note-${id}')`);
+      for (let start = 0; start < rows.length; start += MULTI_BATCH) {
+        await connection.query(`INSERT INTO bench_join VALUES ${rows.slice(start, start + MULTI_BATCH).join(", ")}`);
+      }
+    },
+    async run(connection) {
+      for (let index = 0; index < FEATURE_OPS; index += 1) {
+        const result = await connection.query("SELECT COUNT(*) AS n FROM bench b LEFT JOIN bench_join o ON o.id = b.id");
+        if (Number(result.rows[0].n) !== DATASET) throw new Error(`left-join-count n=${result.rows[0].n}`);
+      }
+      return FEATURE_OPS;
+    },
+  },
+  {
+    name: "sort-limit",
+    unit: "statements",
+    ops: FEATURE_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      for (let index = 0; index < FEATURE_OPS; index += 1) {
+        const result = await connection.query("SELECT id, grp FROM bench ORDER BY grp DESC, id LIMIT 20");
+        if (result.rowCount !== 20) throw new Error(`sort-limit rows=${result.rowCount}`);
+      }
+      return FEATURE_OPS;
+    },
+  },
+  {
+    name: "in-list",
+    unit: "statements",
+    ops: FEATURE_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      const ids = [0, 50, 100, 150, 200].map((offset) => ID_BASE + offset);
+      for (let index = 0; index < FEATURE_OPS; index += 1) {
+        const result = await connection.query(`SELECT id FROM bench WHERE id IN (${ids.join(", ")})`);
+        if (result.rowCount !== ids.length) throw new Error(`in-list rows=${result.rowCount}`);
+      }
+      return FEATURE_OPS;
+    },
+  },
+  {
     name: "tx-commit",
     unit: "rows",
     ops: TX_COUNT * TX_ROWS,
@@ -310,6 +450,113 @@ const WORKLOADS = [
         await connection.query("COMMIT");
       }
       return TX_COUNT * TX_ROWS;
+    },
+  },
+  {
+    name: "cursor-fetch",
+    unit: "rows",
+    ops: PORTAL_OPS * DATASET,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      // 双方都走 `DECLARE`/`FETCH`，测的是一次只取一页的服务端游标，
+      // 与本仓 `Execute` 带 `max_rows` 的分页是同一条执行路径。
+      let rows = 0;
+      for (let index = 0; index < PORTAL_OPS; index += 1) {
+        await connection.query("BEGIN");
+        await connection.query("DECLARE bench_page CURSOR FOR SELECT id, val FROM bench ORDER BY id");
+        try {
+          for (;;) {
+            const result = await connection.query(`FETCH ${PAGE_ROWS} FROM bench_page`);
+            rows += result.rowCount;
+            if (result.rowCount < PAGE_ROWS) break;
+          }
+        } finally {
+          await connection.query("CLOSE bench_page");
+          await connection.query("COMMIT");
+        }
+      }
+      if (rows !== PORTAL_OPS * DATASET) throw new Error(`cursor-fetch rows=${rows}`);
+      return rows;
+    },
+  },
+  {
+    name: "temp-table",
+    unit: "cycles",
+    ops: TEMP_OPS,
+    async setup(connection) {
+      await connection.query("SELECT 1");
+    },
+    async run(connection) {
+      for (let index = 0; index < TEMP_OPS; index += 1) {
+        await connection.query("CREATE TEMP TABLE tmp_bench (id INT NOT NULL PRIMARY KEY, v INT)");
+        await connection.query(`INSERT INTO tmp_bench VALUES ${Array.from({ length: 20 }, (_, row) => `(${row + 1}, ${row * 3})`).join(", ")}`);
+        const result = await connection.query("SELECT id, v FROM tmp_bench");
+        if (result.rowCount !== 20) throw new Error(`temp-table rows=${result.rowCount}`);
+        await connection.query("DROP TABLE tmp_bench");
+      }
+      return TEMP_OPS;
+    },
+  },
+  {
+    name: "multi-statement",
+    unit: "statements",
+    ops: MULTI_OPS * MULTI_MSG_STATEMENTS,
+    async setup(connection) {
+      await connection.query("SELECT 1");
+    },
+    async run(connection) {
+      const sql = Array.from({ length: MULTI_MSG_STATEMENTS }, (_, index) => `SELECT ${index + 1} AS n`).join("; ");
+      for (let index = 0; index < MULTI_OPS; index += 1) {
+        const result = await connection.query(sql);
+        const results = Array.isArray(result) ? result : [result];
+        if (results.length !== MULTI_MSG_STATEMENTS) throw new Error(`multi-statement ran ${results.length}`);
+      }
+      return MULTI_OPS * MULTI_MSG_STATEMENTS;
+    },
+  },
+  {
+    name: "constraint-violation-rollback",
+    unit: "statements",
+    ops: CVR_OPS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      for (let index = 0; index < CVR_OPS; index += 1) {
+        await connection.query("BEGIN");
+        try {
+          await connection.query(`INSERT INTO bench VALUES ${rowTuple(ID_BASE)}`);
+          throw new Error("expected a unique violation");
+        } catch (error) {
+          // 真实库可能输出本地化的消息，唯一约束一律按 SQLSTATE 判定。
+          const duplicate = error !== null && typeof error === "object" && "code" in error && error.code === "23505";
+          if (!duplicate && !/23505|duplicate key/.test(String(error))) throw error;
+        }
+        await connection.query("ROLLBACK");
+      }
+      return CVR_OPS;
+    },
+  },
+  {
+    name: "repeatable-read-tx",
+    unit: "statements",
+    ops: RR_TX * RR_ROWS,
+    async setup(connection) {
+      await seed(connection, datasetStatements());
+    },
+    async run(connection) {
+      for (let index = 0; index < RR_TX; index += 1) {
+        await connection.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+        for (let row = 0; row < RR_ROWS; row += 1) {
+          const id = ID_BASE + ((index * RR_ROWS + row) % DATASET);
+          const result = await connection.query(`SELECT id, val FROM bench WHERE id = ${id}`);
+          if (result.rowCount !== 1) throw new Error(`repeatable-read-tx miss id=${id}`);
+        }
+        await connection.query("COMMIT");
+      }
+      return RR_TX * RR_ROWS;
     },
   },
   {
@@ -480,6 +727,11 @@ function markdownReport(samples, version, semantics) {
   lines.push("比值 = 本仓耗时 / 真实库耗时，小于 1 表示本仓更快。");
   lines.push("口径：`connect` 一项真实库每次都做认证与初始化握手，本仓连接是极简实现，两者不可比，该行不能当作性能结论。");
   lines.push("口径：`order-limit` 在双方都先建同一条 `(val DESC, id)` 索引，测的是有序索引扫描加 `LIMIT` 提前停止，不是无索引内存排序。");
+  lines.push(`口径：\`cursor-fetch\` 双方都走 \`BEGIN\` + \`DECLARE ... CURSOR\` + \`FETCH ${PAGE_ROWS}\` + \`CLOSE\`，测的是一次只取一页的服务端游标，与本仓 \`Execute\` 带 \`max_rows\` 的分页是同一条执行路径；每轮都要取满 ${DATASET} 行才算通过。`);
+  lines.push(`口径：\`temp-table\` 在同一个连接上循环 \`CREATE TEMP TABLE\` / 20 行 \`INSERT\` / \`SELECT\` / \`DROP TABLE\` ${TEMP_OPS} 次，测的是会话级临时关系的建删与目录变更成本。`);
+  lines.push(`口径：\`multi-statement\` 每条简单查询报文携带 ${MULTI_MSG_STATEMENTS} 条语句，共 ${MULTI_OPS} 条报文；\`pg\` 会回一个结果数组，两侧都按数组长度断言条数。`);
+  lines.push(`口径：\`constraint-violation-rollback\` 每条语句都是「开事务 → 重复主键插入被 23505 拒绝 → ROLLBACK」，测的是错误回包加事务撤销，不是成功写入。`);
+  lines.push(`口径：\`repeatable-read-tx\` 每事务 ${RR_ROWS} 条主键点查，全部在 \`BEGIN ISOLATION LEVEL REPEATABLE READ\` 内，快照级别不做逐语句重读。`);
   lines.push("");
   lines.push("## 按差距排序");
   lines.push("");
@@ -525,6 +777,14 @@ function markdownReport(samples, version, semantics) {
     "group-by": GROUP_OPS,
     "order-limit": ORDER_OPS,
     join: JOIN_OPS,
+    "count-scan": FEATURE_OPS,
+    "distinct-groups": FEATURE_OPS,
+    "cte-filter": FEATURE_OPS,
+    "window-rank": FEATURE_OPS,
+    "text-compare": FEATURE_OPS,
+    "left-join-count": FEATURE_OPS,
+    "sort-limit": FEATURE_OPS,
+    "in-list": FEATURE_OPS,
   };
   for (const [name, count] of Object.entries(statements)) {
     const real = median(samples.get(name).real) / count - floorReal;

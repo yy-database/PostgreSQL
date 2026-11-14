@@ -12,9 +12,15 @@ import {
   POINT_TYPE_OIDS,
   POINT_UK_SQL,
   POINT_UK_TYPE_OIDS,
+  PORTAL_CURSOR,
+  PORTAL_SQL,
   SCAN_SQL,
+  TEMP_CREATE_SQL,
+  TEMP_DROP_SQL,
+  TEMP_SELECT_SQL,
   bench2BatchInsert,
   bench2ParamBatchInsert,
+  tempTableRows,
 } from "./sql.mjs";
 
 function singleResult(results, context) {
@@ -67,6 +73,41 @@ export function openNativeClient(options) {
       const result = singleResult(connection.executePrepared(name, [String(id)]), `prepared point ${id}`);
       if (result.rows.length !== 1) throw new Error(`prepared point miss id=${id}`);
       return result.rows[0].values;
+    },
+    async prepareScan() {
+      return connection.prepare(PORTAL_SQL, []).name();
+    },
+    /**
+     * Drains one named portal in `Execute` batches of `batch` rows.
+     *
+     * The portal only survives a `Sync` inside an explicit transaction, which the
+     * benchmark opens around every drain.
+     */
+    async portalFetch(statement, batch) {
+      connection.bindPortal(statement, PORTAL_CURSOR, [], []);
+      let rows = 0;
+      try {
+        for (;;) {
+          const report = connection.executePortal(PORTAL_CURSOR, batch);
+          for (const result of report.results) rows += result.rows.length;
+          if (!report.suspended) break;
+        }
+      } finally {
+        connection.closePortal(PORTAL_CURSOR);
+      }
+      return rows;
+    },
+    async tempTableCycle() {
+      connection.execute(TEMP_CREATE_SQL);
+      connection.execute(`INSERT INTO tmp_bench VALUES ${tempTableRows()}`);
+      const rows = singleResult(connection.execute(TEMP_SELECT_SQL), "temp table select").rows.length;
+      connection.execute(TEMP_DROP_SQL);
+      return rows;
+    },
+    async multi(sql, expected) {
+      const results = connection.execute(sql);
+      if (results.length !== expected) throw new Error(`multi-statement ran ${results.length} of ${expected}`);
+      return results.length;
     },
     async createBench(seedRows, batch) {
       connection.execute(BENCH2_CREATE_SQL);

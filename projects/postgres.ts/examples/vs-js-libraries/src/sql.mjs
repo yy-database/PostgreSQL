@@ -68,3 +68,18 @@ export function bench2ParamBatchInsert(start, count) {
   }
   return { sql: `INSERT INTO bench VALUES ${tuples.join(", ")}`, values, types };
 }
+
+// 分页取数、临时表与多语句的工作负载。两侧客户端跑同一组语句文本，差别只在
+// 驱动暴露的能力：本仓走 `Bind`/`Execute` 的 `max_rows`，`pg` 走 `DECLARE`/`FETCH`。
+
+export const PORTAL_SQL = "SELECT id, val FROM bench ORDER BY id";
+export const PORTAL_CURSOR = "bench_page";
+
+export const TEMP_CREATE_SQL = "CREATE TEMP TABLE tmp_bench (id integer PRIMARY KEY, v integer)";
+export const TEMP_SELECT_SQL = "SELECT id, v FROM tmp_bench";
+export const TEMP_DROP_SQL = "DROP TABLE tmp_bench";
+
+/** Fixed 20-row body for `temp-table`, identical on both clients. */
+export function tempTableRows() {
+  return Array.from({ length: 20 }, (_, index) => `(${index + 1}, ${index * 3})`).join(", ");
+}

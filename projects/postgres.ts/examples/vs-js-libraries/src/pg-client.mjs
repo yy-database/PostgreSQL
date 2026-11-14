@@ -8,10 +8,15 @@ import {
   JOIN_SQL,
   POINT_SQL,
   POINT_UK_SQL,
+  PORTAL_SQL,
   PREPARED_NAME,
   SCAN_SQL,
+  TEMP_CREATE_SQL,
+  TEMP_DROP_SQL,
+  TEMP_SELECT_SQL,
   bench2BatchInsert,
   bench2ParamBatchInsert,
+  tempTableRows,
 } from "./sql.mjs";
 
 const { Client } = pg;
@@ -53,6 +58,41 @@ export async function openPgClient(options) {
       const result = await client.query({ name, text: POINT_SQL, values: [id] });
       if (result.rowCount !== 1) throw new Error(`prepared point miss id=${id}`);
       return [result.rows[0].label];
+    },
+    /**
+     * `pg` exposes no `Execute` row limit, so the driver-level equivalent of a
+     * suspended portal is a server-side cursor fetched a page at a time.
+     */
+    async prepareScan() {
+      return PORTAL_SQL;
+    },
+    async portalFetch(sql, batch) {
+      await client.query(`DECLARE bench_page CURSOR FOR ${sql}`);
+      let rows = 0;
+      try {
+        for (;;) {
+          const result = await client.query(`FETCH ${batch} FROM bench_page`);
+          rows += result.rowCount;
+          if (result.rowCount < batch) break;
+        }
+      } finally {
+        await client.query("CLOSE bench_page");
+      }
+      return rows;
+    },
+    async tempTableCycle() {
+      await client.query(TEMP_CREATE_SQL);
+      await client.query(`INSERT INTO tmp_bench VALUES ${tempTableRows()}`);
+      const result = await client.query(TEMP_SELECT_SQL);
+      await client.query(TEMP_DROP_SQL);
+      return result.rowCount;
+    },
+    async multi(sql, expected) {
+      const result = await client.query(sql);
+      // 一条简单查询报文里有多条语句时，`pg` 回一个结果数组。
+      const results = Array.isArray(result) ? result : [result];
+      if (results.length !== expected) throw new Error(`multi-statement ran ${results.length} of ${expected}`);
+      return results.length;
     },
     async createBench(seedRows, batch) {
       await client.query(BENCH2_CREATE_SQL);

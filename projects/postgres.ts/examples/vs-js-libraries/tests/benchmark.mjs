@@ -9,7 +9,9 @@
 // Env: BENCH_ROWS (200), BENCH_POINT (500), BENCH_SCAN (1000), BENCH_PREPARED (500),
 //      BENCH_ROUNDS (3), BENCH2_ROWS (200), BENCH_ORDER (50), BENCH_GROUP (50),
 //      BENCH_JOIN (50), BENCH_BATCH (100), BENCH_RANGE (100), BENCH_MUTATE (200), BENCH_UPSERT (200),
-//      BENCH_SIMPLE (500), BENCH_TX_PREPARED (200), BENCH_RETURNING (100), BENCH_WIDE (100), BENCH_ERROR (100)
+//      BENCH_SIMPLE (500), BENCH_TX_PREPARED (200), BENCH_RETURNING (100), BENCH_WIDE (100), BENCH_ERROR (100),
+//      BENCH_PORTAL (10), BENCH_PAGE (20), BENCH_TEMP (50), BENCH_MULTI (100),
+//      BENCH_MULTI_STATEMENTS (5), BENCH_CVR (100), BENCH_RR (30), BENCH_RR_ROWS (10)
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -57,6 +59,14 @@ const TX_PREPARED_OPS = readInt("BENCH_TX_PREPARED", 200, 1);
 const RETURNING_OPS = readInt("BENCH_RETURNING", 100, 1);
 const WIDE_OPS = readInt("BENCH_WIDE", 100, 1);
 const ERROR_OPS = readInt("BENCH_ERROR", 100, 1);
+const PORTAL_OPS = readInt("BENCH_PORTAL", 10, 1);
+const PAGE_ROWS = readInt("BENCH_PAGE", 20, 1);
+const TEMP_OPS = readInt("BENCH_TEMP", 50, 1);
+const MULTI_OPS = readInt("BENCH_MULTI", 100, 1);
+const MULTI_STATEMENTS = readInt("BENCH_MULTI_STATEMENTS", 5, 1);
+const CVR_OPS = readInt("BENCH_CVR", 100, 1);
+const RR_TX = readInt("BENCH_RR", 30, 1);
+const RR_ROWS = readInt("BENCH_RR_ROWS", 10, 1);
 
 const GROUP_SIZE = 10;
 const GROUP_COUNT = Math.ceil(BENCH2_ROWS / GROUP_SIZE);
@@ -85,6 +95,11 @@ const WORKLOADS = [
   "wide-row",
   "error-constraint",
   "rollback",
+  "portal-batch-fetch",
+  "temp-table",
+  "multi-statement",
+  "constraint-violation-rollback",
+  "repeatable-read-tx",
 ];
 const BENCH_SEEDED = new Set([
   "point-uk",
@@ -102,6 +117,9 @@ const BENCH_SEEDED = new Set([
   "wide-row",
   "error-constraint",
   "rollback",
+  "portal-batch-fetch",
+  "constraint-violation-rollback",
+  "repeatable-read-tx",
 ]);
 
 /** `bench` 的 `val` 由 `bench2RowTuple` 的 `(id * 137) % 997` 决定。 */
@@ -156,6 +174,8 @@ async function runRound(clientSpec, workload) {
 
       let preparedName = null;
       if (workload === "prepared-point" || workload === "tx-prepared") preparedName = await client.preparePoint();
+      let portalStatement = null;
+      if (workload === "portal-batch-fetch") portalStatement = await client.prepareScan();
 
       const start = process.hrtime.bigint();
       let ops;
@@ -293,6 +313,53 @@ async function runRound(clientSpec, workload) {
           await client.query(`DELETE FROM bench WHERE id = ${id}`);
         }
         ops = MUTATE_OPS;
+      } else if (workload === "portal-batch-fetch") {
+        // 分页只有在显式事务里才成立：`Sync` 会结束隐式事务并丢掉命名 portal。
+        let fetched = 0;
+        for (let index = 0; index < PORTAL_OPS; index += 1) {
+          await client.query("BEGIN");
+          fetched += await client.portalFetch(portalStatement, PAGE_ROWS);
+          await client.query("COMMIT");
+        }
+        const expected = PORTAL_OPS * BENCH2_ROWS;
+        if (fetched !== expected) throw new Error(`portal-batch-fetch rows=${fetched} expected=${expected}`);
+        ops = fetched;
+      } else if (workload === "temp-table") {
+        for (let index = 0; index < TEMP_OPS; index += 1) {
+          const rows = await client.tempTableCycle();
+          if (rows !== 20) throw new Error(`temp-table rows=${rows} expected=20`);
+        }
+        ops = TEMP_OPS;
+      } else if (workload === "multi-statement") {
+        const sql = Array.from({ length: MULTI_STATEMENTS }, (_, index) => `SELECT ${index + 1} AS n`).join("; ");
+        for (let index = 0; index < MULTI_OPS; index += 1) {
+          const executed = await client.multi(sql, MULTI_STATEMENTS);
+          if (executed !== MULTI_STATEMENTS) throw new Error(`multi-statement ran ${executed} of ${MULTI_STATEMENTS}`);
+        }
+        ops = MULTI_OPS * MULTI_STATEMENTS;
+      } else if (workload === "constraint-violation-rollback") {
+        for (let index = 0; index < CVR_OPS; index += 1) {
+          await client.query("BEGIN");
+          try {
+            await client.query("INSERT INTO bench VALUES (1, 1, 0, 0, 'duplicate')");
+            throw new Error("expected a unique violation");
+          } catch (error) {
+            if (!/23505|duplicate key/.test(String(error))) throw error;
+          }
+          await client.query("ROLLBACK");
+        }
+        ops = CVR_OPS;
+      } else if (workload === "repeatable-read-tx") {
+        for (let index = 0; index < RR_TX; index += 1) {
+          await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+          for (let row = 0; row < RR_ROWS; row += 1) {
+            const id = ((index * RR_ROWS + row) % BENCH2_ROWS) + 1;
+            const rows = await client.query(`SELECT id, val FROM bench WHERE id = ${id}`);
+            if (rows !== 1) throw new Error(`repeatable-read-tx miss id=${id}`);
+          }
+          await client.query("COMMIT");
+        }
+        ops = RR_TX * RR_ROWS;
       } else if (workload === "rollback") {
         await client.query("BEGIN");
         for (let index = 0; index < MUTATE_OPS; index += 1) {
@@ -367,12 +434,12 @@ function printTables(results, source) {
   const names = CLIENTS.map((client) => client.key);
   const relative = ratioTable(results);
   const widths = names.map((name) => Math.max(name.length, ...relative.map((row) => row.cells[name].length)));
-  const workloadWidth = 15;
+  const workloadWidth = Math.max(15, ...WORKLOADS.map((workload) => workload.length));
   const pad = (text, width) => String(text).padStart(width);
 
   console.log("vs-js-libraries — relative to `pg` baseline (time ratio; smaller is faster)");
   console.log(
-    `Defaults: BENCH_ROWS=${ROWS}, BENCH_POINT=${POINT_OPS}, BENCH_SCAN=${SCAN_ROWS}, BENCH_PREPARED=${PREPARED_OPS}, BENCH_ROUNDS=${ROUNDS}, BENCH2_ROWS=${BENCH2_ROWS}, BENCH_ORDER=${ORDER_OPS}, BENCH_GROUP=${GROUP_OPS}, BENCH_JOIN=${JOIN_OPS}, BENCH_BATCH=${BATCH}, BENCH_RANGE=${RANGE_OPS}, BENCH_MUTATE=${MUTATE_OPS}, BENCH_UPSERT=${UPSERT_OPS}, BENCH_SIMPLE=${SIMPLE_OPS}, BENCH_TX_PREPARED=${TX_PREPARED_OPS}, BENCH_RETURNING=${RETURNING_OPS}, BENCH_WIDE=${WIDE_OPS}, BENCH_ERROR=${ERROR_OPS}`,
+    `Defaults: BENCH_ROWS=${ROWS}, BENCH_POINT=${POINT_OPS}, BENCH_SCAN=${SCAN_ROWS}, BENCH_PREPARED=${PREPARED_OPS}, BENCH_ROUNDS=${ROUNDS}, BENCH2_ROWS=${BENCH2_ROWS}, BENCH_ORDER=${ORDER_OPS}, BENCH_GROUP=${GROUP_OPS}, BENCH_JOIN=${JOIN_OPS}, BENCH_BATCH=${BATCH}, BENCH_RANGE=${RANGE_OPS}, BENCH_MUTATE=${MUTATE_OPS}, BENCH_UPSERT=${UPSERT_OPS}, BENCH_SIMPLE=${SIMPLE_OPS}, BENCH_TX_PREPARED=${TX_PREPARED_OPS}, BENCH_RETURNING=${RETURNING_OPS}, BENCH_WIDE=${WIDE_OPS}, BENCH_ERROR=${ERROR_OPS}, BENCH_PORTAL=${PORTAL_OPS}, BENCH_PAGE=${PAGE_ROWS}, BENCH_TEMP=${TEMP_OPS}, BENCH_MULTI=${MULTI_OPS}, BENCH_MULTI_STATEMENTS=${MULTI_STATEMENTS}, BENCH_CVR=${CVR_OPS}, BENCH_RR=${RR_TX}, BENCH_RR_ROWS=${RR_ROWS}`,
   );
   console.log(["Workload".padEnd(workloadWidth), ...names.map((name, index) => pad(name, widths[index]))].join("  "));
   for (const row of relative) {
@@ -432,7 +499,7 @@ function markdownReport(results, source) {
   return `# Benchmark report
 
 Command: \`pnpm --dir projects/postgres.ts/examples/vs-js-libraries benchmark\`
-Defaults: \`BENCH_ROWS=${ROWS}\`, \`BENCH_POINT=${POINT_OPS}\`, \`BENCH_SCAN=${SCAN_ROWS}\`, \`BENCH_PREPARED=${PREPARED_OPS}\`, \`BENCH_ROUNDS=${ROUNDS}\`, \`BENCH2_ROWS=${BENCH2_ROWS}\`, \`BENCH_ORDER=${ORDER_OPS}\`, \`BENCH_GROUP=${GROUP_OPS}\`, \`BENCH_JOIN=${JOIN_OPS}\`, \`BENCH_BATCH=${BATCH}\`, \`BENCH_RANGE=${RANGE_OPS}\`, \`BENCH_MUTATE=${MUTATE_OPS}\`, \`BENCH_UPSERT=${UPSERT_OPS}\`, \`BENCH_SIMPLE=${SIMPLE_OPS}\`, \`BENCH_TX_PREPARED=${TX_PREPARED_OPS}\`, \`BENCH_RETURNING=${RETURNING_OPS}\`, \`BENCH_WIDE=${WIDE_OPS}\`, \`BENCH_ERROR=${ERROR_OPS}\`
+Defaults: \`BENCH_ROWS=${ROWS}\`, \`BENCH_POINT=${POINT_OPS}\`, \`BENCH_SCAN=${SCAN_ROWS}\`, \`BENCH_PREPARED=${PREPARED_OPS}\`, \`BENCH_ROUNDS=${ROUNDS}\`, \`BENCH2_ROWS=${BENCH2_ROWS}\`, \`BENCH_ORDER=${ORDER_OPS}\`, \`BENCH_GROUP=${GROUP_OPS}\`, \`BENCH_JOIN=${JOIN_OPS}\`, \`BENCH_BATCH=${BATCH}\`, \`BENCH_RANGE=${RANGE_OPS}\`, \`BENCH_MUTATE=${MUTATE_OPS}\`, \`BENCH_UPSERT=${UPSERT_OPS}\`, \`BENCH_SIMPLE=${SIMPLE_OPS}\`, \`BENCH_TX_PREPARED=${TX_PREPARED_OPS}\`, \`BENCH_RETURNING=${RETURNING_OPS}\`, \`BENCH_WIDE=${WIDE_OPS}\`, \`BENCH_ERROR=${ERROR_OPS}\`, \`BENCH_PORTAL=${PORTAL_OPS}\`, \`BENCH_PAGE=${PAGE_ROWS}\`, \`BENCH_TEMP=${TEMP_OPS}\`, \`BENCH_MULTI=${MULTI_OPS}\`, \`BENCH_MULTI_STATEMENTS=${MULTI_STATEMENTS}\`, \`BENCH_CVR=${CVR_OPS}\`, \`BENCH_RR=${RR_TX}\`, \`BENCH_RR_ROWS=${RR_ROWS}\`
 Baseline: \`pg\` (one \`pg.Client\` connection) = \`1.00x\`
 Ratio: subject_time / baseline_time (smaller is faster). Fastest cell in each row is bold.
 统计口径：median/p95 由 \`database.harness\` 的 nearest-rank 判定计算（经本仓 napi 直通 \`harnessBenchSummary\`），JS 侧不另写一份。
@@ -455,7 +522,7 @@ ${relativeLines}
 
 ${absoluteLines}
 
-An op is one inserted row, one point query, one simple-protocol point query, one scanned row, one prepared execution, one prepared execution inside a transaction, one ordered-limit statement, one grouping statement, one join statement, one batched row, one parameter-bound batched row, one distinct projection, one aggregate projection, one subquery, one indexed range statement, one upsert, one update, one update with \`RETURNING\`, one delete, one row with a \`NULL\` or 4 KiB cell, one rejected duplicate-key insert, or one rolled-back insert.
+An op is one inserted row, one point query, one simple-protocol point query, one scanned row, one prepared execution, one prepared execution inside a transaction, one ordered-limit statement, one grouping statement, one join statement, one batched row, one parameter-bound batched row, one distinct projection, one aggregate projection, one subquery, one indexed range statement, one upsert, one update, one update with \`RETURNING\`, one delete, one row with a \`NULL\` or 4 KiB cell, one rejected duplicate-key insert, one rolled-back insert, one row fetched through a suspended portal, one temporary-table cycle, one statement inside a multi-statement message, one rejected insert followed by \`ROLLBACK\`, or one repeatable-read point query.
 One warmup round runs before the measured rounds. The table reports median and p95 of ${ROUNDS} measured rounds.
 
 ## Intentional deltas
@@ -469,6 +536,11 @@ One warmup round runs before the measured rounds. The table reports median and p
 - \`simple-point\` runs an unparameterised statement through the simple-query protocol, while \`select-point\` binds \`$1\` through Parse/Bind/Describe/Execute. \`batch-insert-params\` is the parameterised twin of \`batch-insert\`, so the pair isolates literal parsing from bind encoding. \`tx-prepared\` runs the same prepared statement inside one \`BEGIN\`/\`COMMIT\`.
 - The SQL-feature rows (\`distinct\`, \`aggregate\`, \`subquery\`, \`index-range\`, \`upsert\`, \`update\`, \`update-returning\`, \`delete\`, \`wide-row\`, \`error-constraint\`, \`rollback\`) also run on the shared \`bench\` shape. Both clients send the same literal SQL; their \`query\` wrapper only exposes the returned row count, so aggregate and subquery values are asserted in the SQLite side's benchmark, while this side pins the row-count shape and the client/server ratio.
 - \`upsert\` uses the server's \`ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val\`, arbitrated through the primary-key index instead of a full table scan. \`wide-row\` reads rows whose \`pad\` is \`NULL\` on half the ids and 4 KiB on id 1. \`error-constraint\` sends a duplicate-key insert every iteration and times the \`ErrorResponse\` plus \`ReadyForQuery\` round trip.
+- \`portal-batch-fetch\` drains \`SELECT id, val FROM bench ORDER BY id\` \`BENCH_PAGE\` rows at a time inside one explicit transaction per drain, so the portal survives \`Sync\`. The native client sends \`Bind\` once and then \`Execute\` with a row limit, counting \`PortalSuspended\` as "more rows"; \`pg\` has no \`Execute\` row limit, so its side uses \`DECLARE ... CURSOR\` plus \`FETCH n\`. Both must return exactly \`BENCH2_ROWS\` rows per drain.
+- \`temp-table\` runs \`CREATE TEMP TABLE\` / 20-row \`INSERT\` / \`SELECT\` / \`DROP TABLE\` \`BENCH_TEMP\` times on one connection, so it measures catalog churn from a session-local relation surviving across statements.
+- \`multi-statement\` sends one simple-query message carrying \`BENCH_MULTI_STATEMENTS\` statements \`BENCH_MULTI\` times. \`pg\` answers a result array and the native client decodes one result per statement, so both assert the statement count.
+- \`constraint-violation-rollback\` opens a transaction, sends a duplicate-key insert, absorbs the \`23505\`, and rolls back, \`BENCH_CVR\` times. It times the error path plus transaction unwind rather than a successful write.
+- \`repeatable-read-tx\` runs \`BENCH_RR\` transactions of \`BENCH_RR_ROWS\` point selects each, all under \`BEGIN ISOLATION LEVEL REPEATABLE READ\`; the snapshot levels never re-read committed state per statement.
 
 Regenerate: \`pnpm --dir projects/postgres.ts/examples/vs-js-libraries benchmark\`
 `;

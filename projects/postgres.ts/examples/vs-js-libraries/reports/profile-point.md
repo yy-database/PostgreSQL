@@ -6,44 +6,44 @@
 
 ## Provenance
 
-- node `v24.18.0`，rustc `rustc 1.101.0-nightly (1c3a65069 2026-11-02)`，本仓 rev `3b9d08d`，database.rs 钉住 rev `0d688fe`
-- 采样 4713 帧，采样总时长 2018.7 ms，实测 0.134 ms/语句
+- node `v24.18.0`，rustc `rustc 1.101.0-nightly (1c3a65069 2026-11-02)`，本仓 rev `9abdc89`，database.rs 钉住 rev `70aee1e`
+- 采样 7662 帧，采样总时长 3828.8 ms，实测 0.254 ms/语句
 
 ## 阶段拆分
 
 | 阶段 | µs/语句 | 占比 |
 |-----:|--------:|-----:|
-| 原生扫描（catalog、索引、行数据） | 16.9 | 12.6% |
-| socket 写入（`writeBuffer`、写封装） | 17.7 | 13.2% |
-| 网络往返等待（`idle`） | 21.0 | 15.6% |
+| 原生扫描（catalog、索引、行数据） | 25.7 | 10.1% |
+| socket 写入（`writeBuffer`、写封装） | 36.0 | 14.1% |
+| 网络往返等待（`idle`） | 43.7 | 17.1% |
 | catalog 克隆（`clone`） | 0.0 | 0.0% |
 | catalog 深拷贝（`structuredClone`） | 0.0 | 0.0% |
-| 打开数据库（`open`） | 15.6 | 11.6% |
-| 语句切分（`scanStatements`） | 2.3 | 1.7% |
-| catalog 载入（`loadCatalog`） | 6.8 | 5.1% |
-| 解析（切词、`parsePrimary`、注释跳过） | 7.4 | 5.5% |
-| 计划与执行（索引选择、解码、过滤、聚合） | 12.3 | 9.1% |
-| 行文本编码与字段描述 | 2.9 | 2.2% |
-| GC | 2.9 | 2.1% |
-| 事件循环与其余杂项 | 28.7 | 21.3% |
-| **合计（采样）** | **134.6** | 100.0% |
+| 打开数据库（`open`） | 0.2 | 0.1% |
+| 语句切分（`scanStatements`） | 6.6 | 2.6% |
+| catalog 载入（`loadCatalog`） | 2.7 | 1.1% |
+| 解析（切词、`parsePrimary`、注释跳过） | 16.4 | 6.4% |
+| 计划与执行（索引选择、解码、过滤、聚合） | 33.9 | 13.3% |
+| 行文本编码与字段描述 | 5.6 | 2.2% |
+| GC | 6.3 | 2.5% |
+| 事件循环与其余杂项 | 78.2 | 30.6% |
+| **合计（采样）** | **255.3** | 100.0% |
 
 ## 事件循环与杂项的 top 帧
 
 | 帧 | µs/语句 |
 |----|--------:|
-| `(program)` @ node 内部 | 6.4 |
-| `nextTick` @ node:internal/process/task_queues | 1.3 |
-| `integerText` @ postgres/dist/server/sql/types.js | 0.8 |
-| `runSimpleBatch` @ postgres/dist/server/server.js | 0.8 |
-| `(anonymous)` @ postgres/dist/server/sql/database.js | 0.5 |
-| `handleSimpleQuery` @ postgres/dist/server/server.js | 0.5 |
-| `(anonymous)` @ postgres/dist/server/sql/database.js | 0.4 |
-| `(anonymous)` @ node 内部 | 0.3 |
-| `(anonymous)` @ postgres/dist/server/server.js | 0.3 |
-| `openImplicit` @ postgres/dist/server/server.js | 0.3 |
-| `nextTick` @ node:internal/process/task_queues | 0.3 |
-| `concat` @ node:buffer | 0.3 |
+| `(program)` @ node 内部 | 13.8 |
+| `cloneCatalog` @ postgres/dist/server/sql/database.js | 6.6 |
+| `nextTick` @ node:internal/process/task_queues | 4.3 |
+| `cloneCatalog` @ postgres/dist/server/sql/database.js | 3.7 |
+| `(anonymous)` @ postgres/dist/server/sql/database.js | 2.9 |
+| `handleSimpleQuery` @ postgres/dist/server/server.js | 1.8 |
+| `runSimpleBatch` @ postgres/dist/server/server.js | 1.5 |
+| `integerText` @ postgres/dist/server/sql/types.js | 1.3 |
+| `(anonymous)` @ postgres/dist/server/sql/database.js | 1.1 |
+| `(anonymous)` @ postgres/dist/server/sql/database.js | 1.0 |
+| `(anonymous)` @ postgres/dist/server/sql/database.js | 0.9 |
+| `(anonymous)` @ postgres/dist/server/sql/database.js | 0.8 |
 
 ## 归并规则
 

@@ -47,7 +47,9 @@ Defaults: `BENCH_ROWS=200`, `BENCH_POINT=500`, `BENCH_SCAN=1000`,
 `BENCH_GROUP=50`, `BENCH_JOIN=50`, `BENCH_BATCH=100`, `BENCH_RANGE=100`,
 `BENCH_MUTATE=200`, `BENCH_UPSERT=200`, `BENCH_SIMPLE=500`,
 `BENCH_TX_PREPARED=200`, `BENCH_RETURNING=100`, `BENCH_WIDE=100`,
-`BENCH_ERROR=100`. Override any of them in the environment.
+`BENCH_ERROR=100`, `BENCH_PORTAL=10`, `BENCH_PAGE=20`, `BENCH_TEMP=50`,
+`BENCH_MULTI=100`, `BENCH_MULTI_STATEMENTS=5`, `BENCH_CVR=100`, `BENCH_RR=30`,
+`BENCH_RR_ROWS=10`. Override any of them in the environment.
 
 Workloads (scenario set aligned with the SQLite repository's `vs-js-libraries`):
 
@@ -68,6 +70,17 @@ Workloads (scenario set aligned with the SQLite repository's `vs-js-libraries`):
 - `update-returning` — `BENCH_RETURNING` `UPDATE ... RETURNING id, val` statements
 - `wide-row` — `BENCH_WIDE` point reads where `pad` is `NULL` on half the ids and 4 KiB on id 1
 - `error-constraint` — `BENCH_ERROR` duplicate-key inserts, timing the error round trip
+- `portal-batch-fetch` — `BENCH_PORTAL` drains of the ordered `bench` scan in `BENCH_PAGE`-row
+  `Execute` batches inside one transaction; `pg` has no `Execute` row limit, so its side
+  runs `DECLARE`/`FETCH` over the same statement
+- `temp-table` — `BENCH_TEMP` cycles of `CREATE TEMP TABLE` / 20-row `INSERT` / `SELECT` /
+  `DROP TABLE` on one connection
+- `multi-statement` — `BENCH_MULTI` simple-query messages carrying `BENCH_MULTI_STATEMENTS`
+  statements each
+- `constraint-violation-rollback` — `BENCH_CVR` transactions that hit a duplicate-key
+  `23505` and then roll back
+- `repeatable-read-tx` — `BENCH_RR` `BEGIN ISOLATION LEVEL REPEATABLE READ` transactions
+  with `BENCH_RR_ROWS` point selects each
 
 Every round starts a fresh child server with a fresh temporary data directory. Table
 creation and seeding are untimed. One warmup round runs before the measured rounds.
