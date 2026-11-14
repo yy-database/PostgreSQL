@@ -300,6 +300,12 @@ export function inferParameterTypes(database: Database, statement: Statement, co
                 if (column) record(expr, column.type);
             });
         }
+        if (statement.conflict?.action.kind === 'update') {
+            for (const assignment of statement.conflict.action.assignments) {
+                const column = shape.columns.find((candidate) => candidate.name === assignment.column);
+                if (column) record(assignment.value, column.type);
+            }
+        }
     } else if (statement.kind === 'update') {
         const shape = tableShape(database, statement.table);
         for (const assignment of statement.assignments) {
@@ -4322,6 +4328,15 @@ function insertRows(database: Database, statement: InsertStatement, params: SqlV
                 return column;
             })
         : shape.columns;
+    const conflict = statement.conflict;
+    const conflictIndexes = conflict === undefined ? [] : conflictTargetIndexes(shape, conflict);
+    if (conflict?.action.kind === 'update') {
+        for (const assignment of conflict.action.assignments) {
+            if (!shape.columns.some((column) => column.name === assignment.column)) {
+                throw new ServerError('42703', `column "${assignment.column}" of relation "${shape.name}" does not exist`);
+            }
+        }
+    }
     const inserted: { key: string; values: SqlValue[] }[] = [];
     const rows = statement.defaultValues ? [[]] : statement.rows;
     for (const source of rows) {
@@ -4367,12 +4382,130 @@ function insertRows(database: Database, statement: InsertStatement, params: SqlV
         }
         enforceChecks(database, shape, values);
         enforceForeignKeys(database, shape, values);
+        if (conflict !== undefined) {
+            const existing = conflictingRow(database, shape, values, conflictIndexes);
+            if (existing !== undefined) {
+                if (conflict.action.kind === 'nothing') continue;
+                const next = applyConflictUpdate(database, shape, existing.key, existing.values, values, conflict.action.assignments, params);
+                inserted.push({ key: existing.key, values: next });
+                continue;
+            }
+        }
         const key = database.insertRow(shape.oid, values);
         maintainIndexInsert(database, shape, key, values);
         inserted.push({ key, values });
         checkUnique(database, shape, values, new Set([key]));
     }
     return returningOutcome(database, statement.returning, shape, inserted, params, `INSERT 0 ${inserted.length}`);
+}
+
+/**
+ * Unique indexes an `ON CONFLICT` clause can arbitrate on.
+ *
+ * A target column list must name exactly one unique index's key columns; with
+ * no list every unique index is a candidate, matching PostgreSQL's inference.
+ */
+function conflictTargetIndexes(shape: TableShape, conflict: { columns: string[] | undefined; action: { kind: string } }): TableShape['uniqueIndexes'] {
+    if (conflict.columns === undefined) {
+        if (conflict.action.kind === 'update') {
+            throw new ServerError('42601', 'ON CONFLICT DO UPDATE requires an inference specification or constraint name');
+        }
+        return shape.uniqueIndexes;
+    }
+    const attnums = conflict.columns.map((name) => {
+        const column = shape.columns.find((candidate) => candidate.name === name);
+        if (!column) throw new ServerError('42703', `column "${name}" of relation "${shape.name}" does not exist`);
+        return column.attnum;
+    });
+    const matches = shape.uniqueIndexes.filter((index) =>
+        index.keys.every((key) => key.expression === null)
+        && index.keys.length === attnums.length
+        && index.keys.every((key) => attnums.includes(key.attnum)),
+    );
+    if (matches.length === 0) {
+        throw new ServerError('42P10', 'there is no unique or exclusion constraint matching the ON CONFLICT specification');
+    }
+    return matches;
+}
+
+/** First row that already occupies one of the target unique keys, if any. */
+function conflictingRow(
+    database: Database,
+    shape: TableShape,
+    values: SqlValue[],
+    indexes: TableShape['uniqueIndexes'],
+): { key: string; values: SqlValue[] } | undefined {
+    const rows = database.table(shape.oid);
+    for (const index of indexes) {
+        if (index.predicate && evaluate(database, index.predicate, rowContext(shape, database.catalog, values), []) !== true) continue;
+        const candidate = index.keys.map((key) => key.expression === null
+            ? values[key.attnum - 1] ?? null
+            : evaluate(database, key.expression, rowContext(shape, database.catalog, values), []));
+        if (candidate.some((value) => value === null)) continue;
+        const materialized = shape.indexes.find((entry) => entry.oid === index.oid);
+        if (materialized !== undefined) {
+            const prefix = encodeIndexValues(candidate, materialized.keys);
+            for (const entry of database.scanIndex(materialized.oid, prefix, null, null, 1)) {
+                const rowKey = entry.key.slice(prefix.length + 1);
+                const row = rows.get(rowKey);
+                if (row !== undefined) return { key: rowKey, values: row };
+            }
+            continue;
+        }
+        for (const [rowKey, other] of rows) {
+            const existing = index.keys.map((key) => key.expression === null
+                ? other[key.attnum - 1] ?? null
+                : evaluate(database, key.expression, rowContext(shape, database.catalog, other), []));
+            if (existing.some((value) => value === null)) continue;
+            if (candidate.every((value, position) => compareValues(value, existing[position] ?? null) === 0)) {
+                return { key: rowKey, values: other };
+            }
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Runs the `DO UPDATE SET ...` arm of an upsert.
+ *
+ * `EXCLUDED` exposes the row the insert proposed, so assignments can read both
+ * the stored row and the incoming values while index entries and constraints
+ * are maintained exactly like an ordinary update.
+ */
+function applyConflictUpdate(
+    database: Database,
+    shape: TableShape,
+    existingKey: string,
+    existing: SqlValue[],
+    proposed: SqlValue[],
+    assignments: { column: string; value: Expr }[],
+    params: SqlValue[],
+): SqlValue[] {
+    const columns: Binding[] = [];
+    for (const column of shape.columns) columns.push({ alias: shape.name, name: column.name, type: column.type });
+    for (const column of shape.columns) columns.push({ alias: 'excluded', name: column.name, type: column.type });
+    const context: Context = { columns, row: [...existing, ...proposed], outer: undefined };
+    const next = [...existing];
+    for (const assignment of assignments) {
+        const column = shape.columns.find((candidate) => candidate.name === assignment.column)!;
+        if (column.identity === 'a' && assignment.value.kind !== 'default') {
+            throw new ServerError(
+                '428C9',
+                `column "${column.name}" can only be updated to DEFAULT`,
+                `Column "${column.name}" is an identity column defined as GENERATED ALWAYS.`,
+            );
+        }
+        const raw = assignment.value.kind === 'default'
+            ? columnDefault(database, column)
+            : evaluate(database, assignment.value, context, params);
+        next[column.attnum - 1] = coerce(raw, column.type);
+    }
+    validateRowShape(database, shape, next);
+    maintainIndexDelete(database, shape, existingKey, existing);
+    database.updateRow(shape.oid, existingKey, next);
+    maintainIndexInsert(database, shape, existingKey, next);
+    checkUnique(database, shape, next, new Set([existingKey]));
+    return next;
 }
 
 function validateRowShape(database: Database, shape: TableShape, values: SqlValue[]): void {

@@ -405,6 +405,7 @@ export function copyIn(database: Database, statement: CopyStatement, input: stri
             rows: [values],
             defaultValues: false,
             overriding: undefined,
+            conflict: undefined,
             returning: undefined,
         };
         try {

@@ -259,7 +259,16 @@ export interface InsertStatement {
     defaultValues: boolean;
     /** `OVERRIDING SYSTEM VALUE` or `OVERRIDING USER VALUE`, identity columns only. */
     overriding: 'system' | 'user' | undefined;
+    /** `ON CONFLICT [target] DO NOTHING | DO UPDATE SET ...`. */
+    conflict: ConflictClause | undefined;
     returning: Target[] | undefined;
+}
+
+/** `ON CONFLICT` clause carried by an `INSERT`. */
+export interface ConflictClause {
+    /** Conflict-target columns, or `undefined` when the clause names none. */
+    columns: string[] | undefined;
+    action: { kind: 'nothing' } | { kind: 'update'; assignments: { column: string; value: Expr }[] };
 }
 
 export interface UpdateStatement {
@@ -2165,8 +2174,9 @@ class Parser {
         if (this.at('DEFAULT')) {
             this.next();
             this.expect('VALUES');
+            const conflict = this.parseOnConflict();
             const returning = this.parseReturning();
-            return { kind: 'insert', table, columns, rows: [], defaultValues: true, overriding, returning };
+            return { kind: 'insert', table, columns, rows: [], defaultValues: true, overriding, conflict, returning };
         }
         this.expect('VALUES');
         const rows: Expr[][] = [];
@@ -2175,8 +2185,44 @@ class Parser {
             rows.push(this.parseExprList());
             this.expect(')');
         } while (this.accept(','));
+        const conflict = this.parseOnConflict();
         const returning = this.parseReturning();
-        return { kind: 'insert', table, columns, rows, defaultValues: false, overriding, returning };
+        return { kind: 'insert', table, columns, rows, defaultValues: false, overriding, conflict, returning };
+    }
+
+    /**
+     * `ON CONFLICT [( columns )] DO NOTHING | DO UPDATE SET col = expr`.
+     *
+     * Inference predicates and a `DO UPDATE ... WHERE` filter are rejected
+     * loudly rather than silently ignored, so callers never believe a row was
+     * conditionally skipped when it was not.
+     */
+    private parseOnConflict(): ConflictClause | undefined {
+        if (!this.at('ON')) return undefined;
+        this.next();
+        this.expect('CONFLICT');
+        let columns: string[] | undefined;
+        if (this.at('(')) {
+            this.next();
+            columns = [];
+            do {
+                columns.push(this.identifier());
+            } while (this.accept(','));
+            this.expect(')');
+        }
+        if (this.at('WHERE')) throw new ServerError('0A000', 'feature not supported', 'ON CONFLICT inference predicates are not implemented');
+        this.expect('DO');
+        if (this.accept('NOTHING')) return { columns, action: { kind: 'nothing' } };
+        this.expect('UPDATE');
+        this.expect('SET');
+        const assignments: { column: string; value: Expr }[] = [];
+        do {
+            const column = this.identifier();
+            if (!this.accept('=')) throw syntax('syntax error: expected "="', this.peek());
+            assignments.push({ column, value: this.parseExpr() });
+        } while (this.accept(','));
+        if (this.at('WHERE')) throw new ServerError('0A000', 'feature not supported', 'ON CONFLICT DO UPDATE filters are not implemented');
+        return { columns, action: { kind: 'update', assignments } };
     }
 
     private parseUpdate(): UpdateStatement {
