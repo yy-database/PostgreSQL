@@ -1797,8 +1797,9 @@ class Session {
                 throw error;
             }
         }
+        // 一个隐式事务就是这一条语句：失败时整份工作集被丢弃，等锁中断时
+        // 重放会重新 `openImplicit`，因此语句前快照没有任何消费者。
         const database = this.openImplicit();
-        const before = database.clone();
         try {
             const outcome = this.runParsed(state, database, parseStatement(trimmed), parameters);
             this.commitImplicit(database);
@@ -1807,7 +1808,6 @@ class Session {
             if (outcome.kind === 'command') outcome.flush = true;
             return outcome;
         } catch (error) {
-            database.restore(before);
             if (!(error instanceof LockWait) && this.implicitHandle !== null) {
                 this.manager.rollback(this.implicitHandle);
                 this.implicitHandle = null;
