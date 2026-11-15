@@ -2781,14 +2781,26 @@ const HASH_OID = 405;
 /** Index access methods this server stores in the catalog. */
 const INDEX_METHODS: Record<string, number> = { btree: BTREE_OID, hash: HASH_OID };
 
-function allocateOid(catalog: CatalogDoc): number {
-    const oid = catalog.nextOid;
-    catalog.nextOid += 1;
+/**
+ * Durable oid allocation: advances the catalog counter. Temporary relations
+ * must go through `database.allocateTempOid()` instead, so their oids never
+ * enter the durable counter.
+ */
+function allocateOid(database: Database, temp: boolean): number {
+    if (temp) return database.allocateTempOid();
+    const oid = database.catalog.nextOid;
+    database.catalog.nextOid += 1;
     return oid;
 }
 
-function addSequence(catalog: CatalogDoc, tableOid: number, name: string, ownerOid: number): number {
-    const oid = allocateOid(catalog);
+/** `true` when the relation owning a new catalog entry is session-local. */
+function isTempRelation(catalog: CatalogDoc, relid: number): boolean {
+    return catalog.relations.find((candidate) => candidate.oid === relid)?.persistence === 't';
+}
+
+function addSequence(database: Database, tableOid: number, name: string, ownerOid: number): number {
+    const catalog = database.catalog;
+    const oid = allocateOid(database, isTempRelation(catalog, tableOid));
     catalog.relations.push({
         oid,
         name,
@@ -2819,10 +2831,10 @@ function addIndexRecord(database: Database, relid: number, attnums: number[], op
     if (catalog.relations.some((relation) => relation.name === options.name)) {
         throw new ServerError('42P07', `relation "${options.name}" already exists`);
     }
-    const indexOid = allocateOid(catalog);
+    const indexOid = allocateOid(database, isTempRelation(catalog, relid));
     let constraintOid: number | null = null;
     if (options.constraintName !== undefined) {
-        constraintOid = allocateOid(catalog);
+        constraintOid = allocateOid(database, isTempRelation(catalog, relid));
         catalog.constraints.push({
             oid: constraintOid,
             name: options.constraintName,
@@ -2887,7 +2899,7 @@ function addCheckConstraint(
         throw new ServerError('42710', `constraint "${name}" for relation already exists`);
     }
     catalog.constraints.push({
-        oid: allocateOid(catalog),
+        oid: allocateOid(database, isTempRelation(catalog, relid)),
         name,
         relid,
         contype: 'c',
@@ -2941,7 +2953,7 @@ function addForeignKey(
         throw new ServerError('42710', `constraint "${name}" for relation already exists`);
     }
     catalog.constraints.push({
-        oid: allocateOid(catalog),
+        oid: allocateOid(database, isTempRelation(catalog, relid)),
         name,
         relid,
         contype: 'f',
@@ -2984,7 +2996,8 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         throw new ServerError('42P16', `multiple primary keys for table "${statement.table.name}" are not defined`);
     }
 
-    const tableOid = allocateOid(catalog);
+    const temporary = statement.persistence === 't';
+    const tableOid = allocateOid(database, temporary);
     const relation = {
         oid: tableOid,
         name: statement.table.name,
@@ -3012,14 +3025,14 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
         let sequenceOid: number | null = null;
         if (column.identity !== undefined) {
             const sequenceName = `${statement.table.name}_${column.name}_seq`.slice(0, 63);
-            sequenceOid = addSequence(catalog, tableOid, sequenceName, ownerOid);
+            sequenceOid = addSequence(database, tableOid, sequenceName, ownerOid);
             // Identity columns have no `pg_attrdef` entry, so `atthasdef` stays false.
             defaultKind = 'sequence';
             column.notNull = true;
         }
         else if (column.serial !== undefined) {
             const sequenceName = `${statement.table.name}_${column.name}_seq`.slice(0, 63);
-            sequenceOid = addSequence(catalog, tableOid, sequenceName, ownerOid);
+            sequenceOid = addSequence(database, tableOid, sequenceName, ownerOid);
             defaultText = `nextval('${sequenceName}'::regclass)`;
             defaultKind = 'sequence';
             column.notNull = true;
@@ -3042,7 +3055,7 @@ function createTable(database: Database, statement: CreateTableStatement): Outco
 
     catalog.relations.push(relation);
     prepared.forEach((entry, index) => {
-        const defaultOid = entry.defaultText === null ? null : allocateOid(catalog);
+        const defaultOid = entry.defaultText === null ? null : allocateOid(database, temporary);
         catalog.columns.push({
             relid: tableOid,
             attnum: index + 1,
@@ -3615,7 +3628,7 @@ function createView(database: Database, statement: CreateViewStatement): Outcome
         database.markCatalogDirty();
         return { kind: 'command', tag: 'CREATE VIEW' };
     }
-    const viewOid = allocateOid(catalog);
+    const viewOid = allocateOid(database, false);
     catalog.relations.push({
         oid: viewOid,
         name: statement.view.name,
