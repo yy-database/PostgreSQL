@@ -79,6 +79,8 @@ export interface BinaryExpr extends ExprBase {
     op: string;
     left: Expr;
     right: Expr;
+    /** `ESCAPE` operand of `LIKE`/`ILIKE`, absent when the default applies. */
+    escape?: Expr;
 }
 
 export interface AnyExpr extends ExprBase {
@@ -1843,7 +1845,15 @@ class Parser {
                 continue;
             }
             if (this.at('LIKE') || this.at('ILIKE') || (this.at('NOT') && ['LIKE', 'ILIKE'].includes(this.peek(1).upper))) {
-                throw new ServerError('0A000', 'feature not supported', 'LIKE is not implemented');
+                // `NOT LIKE` 与 `LIKE` 同层：右侧仍按 `b_expr` 解析，`ESCAPE`
+                // 只在模式之后出现，尾随的 `AND`/`OR` 不会被吞掉。
+                const negated = this.accept('NOT');
+                const keyword = this.next().value.toLowerCase();
+                const right = this.parseAdditive();
+                const escape = this.accept('ESCAPE') ? this.parseAdditive() : undefined;
+                const op = negated ? `not ${keyword}` : keyword;
+                left = { kind: 'binary', op, left, right, escape } satisfies BinaryExpr;
+                continue;
             }
             if (this.at('OPERATOR')) {
                 this.next();

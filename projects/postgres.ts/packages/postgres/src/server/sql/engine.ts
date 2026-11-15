@@ -718,6 +718,7 @@ function walkExpr(node: Expr, visit: (node: Expr) => void): void {
         case 'binary':
             walkExpr((node as BinaryExpr).left, visit);
             walkExpr((node as BinaryExpr).right, visit);
+            if ((node as BinaryExpr).escape !== undefined) walkExpr((node as BinaryExpr).escape!, visit);
             break;
         case 'any':
             walkExpr((node as AnyExpr).left, visit);
@@ -773,6 +774,7 @@ function collectWindows(roots: Expr[]): FunctionExpr[] {
                 break;
             case 'binary':
                 children = [(node as BinaryExpr).left, (node as BinaryExpr).right];
+                if ((node as BinaryExpr).escape !== undefined) children.push((node as BinaryExpr).escape!);
                 break;
             case 'any':
                 children = [(node as AnyExpr).left, (node as AnyExpr).array];
@@ -902,7 +904,7 @@ function expressionChildren(node: Expr): Expr[] {
         case 'subscript':
             return [(node as { expr: Expr }).expr];
         case 'binary':
-            return [(node as BinaryExpr).left, (node as BinaryExpr).right];
+            return [(node as BinaryExpr).left, (node as BinaryExpr).right, ...((node as BinaryExpr).escape === undefined ? [] : [(node as BinaryExpr).escape!])];
         case 'any':
             return [(node as AnyExpr).left, (node as AnyExpr).array];
         case 'case': {
@@ -1005,7 +1007,7 @@ function fieldType(database: Database, expr: Expr, scope: Scope | undefined, par
             return functionFieldType(database, expr as FunctionExpr, scope, params);
         case 'binary': {
             const binary = expr as BinaryExpr;
-            if (['and', 'or', '=', '<>', '<', '>', '<=', '>=', '~', '!~', '~*', '!~*'].includes(binary.op)) return BOOL;
+            if (['and', 'or', '=', '<>', '<', '>', '<=', '>=', '~', '!~', '~*', '!~*', 'like', 'not like', 'ilike', 'not ilike'].includes(binary.op)) return BOOL;
             if (binary.op === '||') return TEXT;
             const left = fieldType(database, binary.left, scope, params);
             const right = fieldType(database, binary.right, scope, params);
@@ -1804,6 +1806,169 @@ function evaluateCast(database: Database, expr: CastExpr, context: Context, para
     }
 }
 
+/**
+ * Tokenized `LIKE` pattern. `wildcard` is set for `%`/`_`; every other token
+ * carries an already case-folded character, so matching never re-folds the
+ * pattern.
+ */
+interface LikeToken {
+    wildcard: 'many' | 'one' | undefined;
+    character: string;
+}
+
+/**
+ * Compiled pattern plus the literal shapes the common cases reduce to.
+ * `%`-only wildcards may become an `exact` compare or a `startsWith` /
+ * `endsWith` / `includes` call, so a prefix filter never builds a per-row
+ * character array. `_` always takes the generic token scan.
+ */
+interface CompiledLike {
+    tokens: LikeToken[];
+    exact?: string;
+    prefix?: string;
+    suffix?: string;
+    contains?: string;
+}
+
+const LIKE_CACHE_LIMIT = 256;
+const likePatternCache = new Map<string, CompiledLike>();
+
+/** Case folding for `ILIKE`, applied to both the pattern and every subject. */
+function foldLikeText(text: string, insensitive: boolean): string {
+    return insensitive ? text.toLowerCase() : text;
+}
+
+/** Concatenates the literal characters in `tokens[start, end)`. */
+function likeLiteral(tokens: LikeToken[], start: number, end: number): string {
+    let text = '';
+    for (let index = start; index < end; index += 1) text += tokens[index]!.character;
+    return text;
+}
+
+/**
+ * Reduces a token list to one of the literal fast paths when every wildcard is
+ * `%`. Returns nothing when `_` is present or the `%` placement is not one of
+ * the exact, prefix, suffix or single-infix shapes.
+ */
+function classifyLike(tokens: LikeToken[]): Pick<CompiledLike, 'exact' | 'prefix' | 'suffix' | 'contains'> {
+    if (tokens.every((token) => token.wildcard === undefined)) {
+        return { exact: likeLiteral(tokens, 0, tokens.length) };
+    }
+    if (tokens.some((token) => token.wildcard === 'one')) return {};
+    const many = tokens.flatMap((token, index) => (token.wildcard === 'many' ? [index] : []));
+    if (many.length === 1 && many[0] === tokens.length - 1) {
+        return { prefix: likeLiteral(tokens, 0, many[0]!) };
+    }
+    if (many.length === 1 && many[0] === 0) {
+        return { suffix: likeLiteral(tokens, 1, tokens.length) };
+    }
+    if (many.length === 2 && many[0] === 0 && many[1] === tokens.length - 1) {
+        return { contains: likeLiteral(tokens, 1, tokens.length - 1) };
+    }
+    return {};
+}
+
+/**
+ * Compiles one `LIKE` pattern. Patterns are constant in practice, so the
+ * compiled form is cached under the pattern, escape character and case mode.
+ */
+function compileLikePattern(pattern: string, escape: string | undefined, insensitive: boolean): CompiledLike {
+    const key = `${insensitive ? 'i' : 's'}\u0000${escape ?? '\u0000'}\u0000${pattern}`;
+    const cached = likePatternCache.get(key);
+    if (cached !== undefined) return cached;
+    const characters = Array.from(pattern);
+    const tokens: LikeToken[] = [];
+    for (let index = 0; index < characters.length; index += 1) {
+        const character = characters[index]!;
+        if (escape !== undefined && escape !== '' && character === escape) {
+            index += 1;
+            if (index >= characters.length) {
+                throw new ServerError('22025', 'LIKE pattern must not end with escape character');
+            }
+            tokens.push({ wildcard: undefined, character: foldLikeText(characters[index]!, insensitive) });
+            continue;
+        }
+        if (character === '%') {
+            // 退化处理：连续 `%` 与单个 `%` 等价。
+            if (tokens.length === 0 || tokens[tokens.length - 1]!.wildcard !== 'many') {
+                tokens.push({ wildcard: 'many', character: '%' });
+            }
+            continue;
+        }
+        if (character === '_') {
+            tokens.push({ wildcard: 'one', character: '_' });
+            continue;
+        }
+        tokens.push({ wildcard: undefined, character: foldLikeText(character, insensitive) });
+    }
+    const compiled: CompiledLike = { tokens, ...classifyLike(tokens) };
+    if (likePatternCache.size >= LIKE_CACHE_LIMIT) likePatternCache.clear();
+    likePatternCache.set(key, compiled);
+    return compiled;
+}
+
+/**
+ * Matches a compiled pattern with the linear two-pointer scan: `%` remembers
+ * the last star position and the scan backtracks there one character at a
+ * time, so a mismatch never re-explores the pattern exponentially.
+ */
+function likeMatches(subject: string, compiled: CompiledLike, insensitive: boolean): boolean {
+    const folded = foldLikeText(subject, insensitive);
+    if (compiled.exact !== undefined) return folded === compiled.exact;
+    if (compiled.prefix !== undefined) return folded.startsWith(compiled.prefix);
+    if (compiled.suffix !== undefined) return folded.endsWith(compiled.suffix);
+    if (compiled.contains !== undefined) return folded.includes(compiled.contains);
+    const tokens = compiled.tokens;
+    const characters = Array.from(folded);
+    let rowIndex = 0;
+    let tokenIndex = 0;
+    let starToken = -1;
+    let starRow = 0;
+    while (rowIndex < characters.length) {
+        const token = tokens[tokenIndex];
+        if (token !== undefined && token.wildcard === 'many') {
+            starToken = tokenIndex;
+            starRow = rowIndex;
+            tokenIndex += 1;
+            continue;
+        }
+        if (token !== undefined && (token.wildcard === 'one' || token.character === characters[rowIndex])) {
+            rowIndex += 1;
+            tokenIndex += 1;
+            continue;
+        }
+        if (starToken < 0) return false;
+        starRow += 1;
+        rowIndex = starRow;
+        tokenIndex = starToken + 1;
+    }
+    while (tokenIndex < tokens.length && tokens[tokenIndex]!.wildcard === 'many') tokenIndex += 1;
+    return tokenIndex === tokens.length;
+}
+
+function evaluateLike(database: Database, expr: BinaryExpr, left: SqlValue, right: SqlValue, context: Context, params: SqlValue[]): SqlValue {
+    if (left === null || right === null) return null;
+    const subject = formatValue(left, TEXT);
+    const pattern = formatValue(right, TEXT);
+    if (subject === null || pattern === null) return null;
+    // PostgreSQL defaults the escape character to a backslash; `ESCAPE ''`
+    // disables escaping entirely.
+    let escape = '\\';
+    if (expr.escape !== undefined) {
+        const value = evaluate(database, expr.escape, context, params);
+        if (value === null) return null;
+        escape = formatValue(value, TEXT) ?? '';
+        // PostgreSQL accepts an empty escape string (no escape character) and
+        // rejects anything longer than one character.
+        if (Array.from(escape).length > 1) {
+            throw new ServerError('22025', 'invalid escape string', 'Escape string must be empty or one character.');
+        }
+    }
+    const insensitive = expr.op.includes('ilike');
+    const matched = likeMatches(subject, compileLikePattern(pattern, escape, insensitive), insensitive);
+    return expr.op.startsWith('not ') ? !matched : matched;
+}
+
 function evaluateBinary(database: Database, expr: BinaryExpr, context: Context, params: SqlValue[]): SqlValue {
     if (expr.op === 'and') {
         const left = evaluate(database, expr.left, context, params);
@@ -1840,6 +2005,9 @@ function evaluateBinary(database: Database, expr: BinaryExpr, context: Context, 
         const flags = expr.op.includes('*') ? 'i' : '';
         const matched = new RegExp(String(right ?? ''), flags).test(String(formatValue(left, TEXT)));
         return expr.op.startsWith('!') ? !matched : matched;
+    }
+    if (['like', 'not like', 'ilike', 'not ilike'].includes(expr.op)) {
+        return evaluateLike(database, expr, left, right, context, params);
     }
     if (left === null || right === null) return null;
     const a = numeric(left);
@@ -2945,7 +3113,10 @@ function deparseIndexExpression(expr: Expr, pretty: boolean): string | undefined
             const left = deparseIndexExpression(binary.left, pretty);
             const right = deparseIndexExpression(binary.right, pretty);
             if (left === undefined || right === undefined) return undefined;
-            return `(${left} ${binary.op} ${right})`;
+            if (binary.escape === undefined) return `(${left} ${binary.op} ${right})`;
+            const escape = deparseIndexExpression(binary.escape, pretty);
+            if (escape === undefined) return undefined;
+            return `(${left} ${binary.op} ${right} ESCAPE ${escape})`;
         }
         case 'unary': {
             const unary = expr as UnaryExpr;
