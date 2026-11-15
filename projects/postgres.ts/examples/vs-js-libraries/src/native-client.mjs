@@ -104,6 +104,52 @@ export function openNativeClient(options) {
       connection.execute(TEMP_DROP_SQL);
       return rows;
     },
+    /** Runs one statement and returns its affected-row count from the command tag. */
+    async mutate(sql) {
+      const result = singleResult(connection.execute(sql), `mutate ${sql.slice(0, 40)}`);
+      return Number(result.tag.split(" ").pop()) || 0;
+    },
+    /** One cell of the first row, or `null`. */
+    async scalar(sql) {
+      const result = singleResult(connection.execute(sql), `scalar ${sql.slice(0, 40)}`);
+      const row = result.rows[0];
+      return row === undefined ? null : (row.values[0] ?? null);
+    },
+    /** `COPY ... FROM STDIN` of the pre-built payload; returns the row count. */
+    async copyRows(table, columns, payload) {
+      const sql = `COPY ${table} (${columns.join(", ")}) FROM STDIN`;
+      const report = connection.copyIn(sql, [Buffer.from(payload, "utf8")]);
+      if (report.error) throw new Error(`copy-from: ${report.error.code}: ${report.error.message}`);
+      return Number(report.tag.split(" ")[1]);
+    },
+    async listen(channel) {
+      connection.execute(`LISTEN ${channel}`);
+    },
+    async notify(channel, payload) {
+      connection.execute(`NOTIFY ${channel}, '${payload}'`);
+    },
+    /** Number of `NOTIFY` messages drained since the previous call. */
+    takeNotifications() {
+      return connection.takeNotifications().length;
+    },
+    /**
+     * Drains a `DECLARE`/`FETCH` cursor over `sql`, one page at a time, and
+     * returns the number of rows fetched. Both clients run the same SQL.
+     */
+    async cursorDrain(sql, batch) {
+      connection.execute(`DECLARE bench_cursor CURSOR FOR ${sql}`);
+      let rows = 0;
+      try {
+        for (;;) {
+          const fetched = singleResult(connection.execute(`FETCH ${batch} FROM bench_cursor`), "fetch").rows.length;
+          rows += fetched;
+          if (fetched < batch) break;
+        }
+      } finally {
+        connection.execute("CLOSE bench_cursor");
+      }
+      return rows;
+    },
     async multi(sql, expected) {
       const results = connection.execute(sql);
       if (results.length !== expected) throw new Error(`multi-statement ran ${results.length} of ${expected}`);

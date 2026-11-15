@@ -79,6 +79,45 @@ export const TEMP_CREATE_SQL = "CREATE TEMP TABLE tmp_bench (id integer PRIMARY 
 export const TEMP_SELECT_SQL = "SELECT id, v FROM tmp_bench";
 export const TEMP_DROP_SQL = "DROP TABLE tmp_bench";
 
+// 多行 UPDATE/DELETE：一张按 bucket 分组的更新表，一张按 bucket 分组的删除表。
+export const BULK_UPDATE_CREATE_SQL =
+  "CREATE TABLE bench_bulk (id integer PRIMARY KEY, bucket integer NOT NULL, val integer NOT NULL)";
+export const BULK_DELETE_CREATE_SQL =
+  "CREATE TABLE bench_del (id integer PRIMARY KEY, bucket integer NOT NULL, val integer NOT NULL)";
+
+// COPY 批量导入：四列文本表，行内容与 `pg` 侧的 multi-row INSERT 一致。
+export const COPY_CREATE_SQL =
+  "CREATE TABLE bench_copy (id integer PRIMARY KEY, uk integer NOT NULL, grp integer NOT NULL, val integer NOT NULL)";
+
+// SAVEPOINT/ROLLBACK TO 往返：每轮插两行、回滚其中一次的更新。
+export const SAVEPOINT_CREATE_SQL = "CREATE TABLE bench_sp (id integer PRIMARY KEY, val integer NOT NULL)";
+
+/** One batched INSERT body for a seeded `bench_bulk`/`bench_del` row range. */
+export function bulkSeedRows(table, start, count, buckets) {
+  const rows = [];
+  for (let id = start; id < start + count; id += 1) {
+    const bucket = (id - 1) % buckets;
+    rows.push(`(${id}, ${bucket}, ${id})`);
+  }
+  return `INSERT INTO ${table} (id, bucket, val) VALUES ${rows.join(", ")}`;
+}
+
+/** Tab-separated `COPY ... FROM STDIN` payload for a contiguous id range. */
+export function copyPayload(start, count) {
+  const lines = [];
+  for (let id = start; id < start + count; id += 1) lines.push(`${id}\t${id}\t${Math.floor((id - 1) / 10)}\t${(id * 137) % 997}`);
+  return `${lines.join("\n")}\n`;
+}
+
+/** Multi-row `INSERT` carrying the same rows, for the `pg` import path. */
+export function copyInsertSql(start, count) {
+  const rows = [];
+  for (let id = start; id < start + count; id += 1) {
+    rows.push(`(${id}, ${id}, ${Math.floor((id - 1) / 10)}, ${(id * 137) % 997})`);
+  }
+  return `INSERT INTO bench_copy (id, uk, grp, val) VALUES ${rows.join(", ")}`;
+}
+
 /** Fixed 20-row body for `temp-table`, identical on both clients. */
 export function tempTableRows() {
   return Array.from({ length: 20 }, (_, index) => `(${index + 1}, ${index * 3})`).join(", ");

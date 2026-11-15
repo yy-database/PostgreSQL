@@ -30,6 +30,10 @@ export async function openPgClient(options) {
     database: options.database ?? "postgres",
   });
   await client.connect();
+  let notifications = 0;
+  client.on("notification", () => {
+    notifications += 1;
+  });
 
   return {
     name: "pg",
@@ -86,6 +90,64 @@ export async function openPgClient(options) {
       const result = await client.query(TEMP_SELECT_SQL);
       await client.query(TEMP_DROP_SQL);
       return result.rowCount;
+    },
+    /** Runs one statement and returns its affected-row count. */
+    async mutate(sql) {
+      const result = await client.query(sql);
+      return result.rowCount ?? 0;
+    },
+    /** One cell of the first row, or `null`. */
+    async scalar(sql) {
+      const result = await client.query(sql);
+      const row = result.rows[0];
+      return row === undefined ? null : (Object.values(row)[0] ?? null);
+    },
+    /**
+     * Import path. `pg` exposes no `COPY ... FROM STDIN`, so the driver-level
+     * equivalent is a multi-row `INSERT` of the same rows in bounded batches.
+     */
+    async copyRows(table, columns, payload) {
+      const rows = payload.split("\n").filter((line) => line.length > 0);
+      let inserted = 0;
+      for (let start = 0; start < rows.length; start += 500) {
+        const values = rows
+          .slice(start, start + 500)
+          .map((line) => `(${line.split("\t").map((cell) => `'${cell}'`).join(", ")})`)
+          .join(", ");
+        const result = await client.query(`INSERT INTO ${table} (${columns.join(", ")}) VALUES ${values}`);
+        inserted += result.rowCount ?? 0;
+      }
+      return inserted;
+    },
+    async listen(channel) {
+      await client.query(`LISTEN ${channel}`);
+    },
+    async notify(channel, payload) {
+      await client.query(`NOTIFY ${channel}, '${payload}'`);
+    },
+    /** Number of `NOTIFY` messages received since the previous call. */
+    takeNotifications() {
+      const received = notifications;
+      notifications = 0;
+      return received;
+    },
+    /**
+     * Drains a `DECLARE`/`FETCH` cursor over `sql`, one page at a time, and
+     * returns the number of rows fetched. Both clients run the same SQL.
+     */
+    async cursorDrain(sql, batch) {
+      await client.query(`DECLARE bench_cursor CURSOR FOR ${sql}`);
+      let rows = 0;
+      try {
+        for (;;) {
+          const result = await client.query(`FETCH ${batch} FROM bench_cursor`);
+          rows += result.rowCount ?? 0;
+          if ((result.rowCount ?? 0) < batch) break;
+        }
+      } finally {
+        await client.query("CLOSE bench_cursor");
+      }
+      return rows;
     },
     async multi(sql, expected) {
       const result = await client.query(sql);
