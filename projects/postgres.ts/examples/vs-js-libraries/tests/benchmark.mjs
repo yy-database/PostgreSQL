@@ -92,6 +92,7 @@ const ABORT_OPS = readInt("BENCH_ABORT", 50, 1);
 
 const GROUP_SIZE = 10;
 const GROUP_COUNT = Math.ceil(BENCH2_ROWS / GROUP_SIZE);
+const RECURSIVE_OPS = readInt("BENCH_RECURSIVE", 100, 1);
 
 const ALL_WORKLOADS = [
   "connect",
@@ -131,6 +132,7 @@ const ALL_WORKLOADS = [
   "listen-notify",
   "large-result-cursor",
   "cte",
+  "recursive-cte",
   "window",
   "union-all",
   "on-conflict-do-nothing",
@@ -563,6 +565,15 @@ async function runRound(clientSpec, workload) {
           if (rows !== 1) throw new Error(`cte rows=${rows} expected=1`);
         }
         ops = GROUP_OPS;
+      } else if (workload === "recursive-cte") {
+        // 递归 CTE 只用常量迭代，不依赖 bench 表：100 层展开后再外层计数。
+        for (let index = 0; index < RECURSIVE_OPS; index += 1) {
+          const rows = await client.query(
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 100) SELECT COUNT(*) FROM seq",
+          );
+          if (rows !== 1) throw new Error(`recursive-cte rows=${rows} expected=1`);
+        }
+        ops = RECURSIVE_OPS;
       } else if (workload === "window") {
         for (let index = 0; index < ORDER_OPS; index += 1) {
           const rows = await client.query("SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val DESC) AS rn FROM bench LIMIT 20");
@@ -732,7 +743,7 @@ function printTables(results, source) {
 
   console.log("vs-js-libraries — relative to `pg` baseline (time ratio; smaller is faster)");
   console.log(
-    `Defaults: BENCH_ROWS=${ROWS}, BENCH_POINT=${POINT_OPS}, BENCH_SCAN=${SCAN_ROWS}, BENCH_PREPARED=${PREPARED_OPS}, BENCH_ROUNDS=${ROUNDS}, BENCH2_ROWS=${BENCH2_ROWS}, BENCH_ORDER=${ORDER_OPS}, BENCH_GROUP=${GROUP_OPS}, BENCH_JOIN=${JOIN_OPS}, BENCH_BATCH=${BATCH}, BENCH_RANGE=${RANGE_OPS}, BENCH_MUTATE=${MUTATE_OPS}, BENCH_UPSERT=${UPSERT_OPS}, BENCH_SIMPLE=${SIMPLE_OPS}, BENCH_TX_PREPARED=${TX_PREPARED_OPS}, BENCH_RETURNING=${RETURNING_OPS}, BENCH_WIDE=${WIDE_OPS}, BENCH_ERROR=${ERROR_OPS}, BENCH_PORTAL=${PORTAL_OPS}, BENCH_PAGE=${PAGE_ROWS}, BENCH_TEMP=${TEMP_OPS}, BENCH_MULTI=${MULTI_OPS}, BENCH_MULTI_STATEMENTS=${MULTI_STATEMENTS}, BENCH_CVR=${CVR_OPS}, BENCH_RR=${RR_TX}, BENCH_RR_ROWS=${RR_ROWS}, BENCH_CONNECT=${CONNECT_OPS}, BENCH_MISSING=${SYNTAX_OPS}, BENCH_ABORT=${ABORT_OPS}`,
+    `Defaults: BENCH_ROWS=${ROWS}, BENCH_POINT=${POINT_OPS}, BENCH_SCAN=${SCAN_ROWS}, BENCH_PREPARED=${PREPARED_OPS}, BENCH_ROUNDS=${ROUNDS}, BENCH2_ROWS=${BENCH2_ROWS}, BENCH_ORDER=${ORDER_OPS}, BENCH_GROUP=${GROUP_OPS}, BENCH_RECURSIVE=${RECURSIVE_OPS}, BENCH_JOIN=${JOIN_OPS}, BENCH_BATCH=${BATCH}, BENCH_RANGE=${RANGE_OPS}, BENCH_MUTATE=${MUTATE_OPS}, BENCH_UPSERT=${UPSERT_OPS}, BENCH_SIMPLE=${SIMPLE_OPS}, BENCH_TX_PREPARED=${TX_PREPARED_OPS}, BENCH_RETURNING=${RETURNING_OPS}, BENCH_WIDE=${WIDE_OPS}, BENCH_ERROR=${ERROR_OPS}, BENCH_PORTAL=${PORTAL_OPS}, BENCH_PAGE=${PAGE_ROWS}, BENCH_TEMP=${TEMP_OPS}, BENCH_MULTI=${MULTI_OPS}, BENCH_MULTI_STATEMENTS=${MULTI_STATEMENTS}, BENCH_CVR=${CVR_OPS}, BENCH_RR=${RR_TX}, BENCH_RR_ROWS=${RR_ROWS}, BENCH_CONNECT=${CONNECT_OPS}, BENCH_MISSING=${SYNTAX_OPS}, BENCH_ABORT=${ABORT_OPS}`,
   );
   console.log(["Workload".padEnd(workloadWidth), ...names.map((name, index) => pad(name, widths[index]))].join("  "));
   for (const row of relative) {
@@ -792,7 +803,7 @@ function markdownReport(results, source) {
   return `# Benchmark report
 
 Command: \`pnpm --dir projects/postgres.ts/examples/vs-js-libraries benchmark\`
-Defaults: \`BENCH_ROWS=${ROWS}\`, \`BENCH_POINT=${POINT_OPS}\`, \`BENCH_SCAN=${SCAN_ROWS}\`, \`BENCH_PREPARED=${PREPARED_OPS}\`, \`BENCH_ROUNDS=${ROUNDS}\`, \`BENCH2_ROWS=${BENCH2_ROWS}\`, \`BENCH_ORDER=${ORDER_OPS}\`, \`BENCH_GROUP=${GROUP_OPS}\`, \`BENCH_JOIN=${JOIN_OPS}\`, \`BENCH_BATCH=${BATCH}\`, \`BENCH_RANGE=${RANGE_OPS}\`, \`BENCH_MUTATE=${MUTATE_OPS}\`, \`BENCH_UPSERT=${UPSERT_OPS}\`, \`BENCH_SIMPLE=${SIMPLE_OPS}\`, \`BENCH_TX_PREPARED=${TX_PREPARED_OPS}\`, \`BENCH_RETURNING=${RETURNING_OPS}\`, \`BENCH_WIDE=${WIDE_OPS}\`, \`BENCH_ERROR=${ERROR_OPS}\`, \`BENCH_PORTAL=${PORTAL_OPS}\`, \`BENCH_PAGE=${PAGE_ROWS}\`, \`BENCH_TEMP=${TEMP_OPS}\`, \`BENCH_MULTI=${MULTI_OPS}\`, \`BENCH_MULTI_STATEMENTS=${MULTI_STATEMENTS}\`, \`BENCH_CVR=${CVR_OPS}\`, \`BENCH_RR=${RR_TX}\`, \`BENCH_RR_ROWS=${RR_ROWS}\`, \`BENCH_BULK=${BULK_OPS}\`, \`BENCH_BULK_ROWS=${BULK_ROWS}\`, \`BENCH_COPY=${COPY_ROWS}\`, \`BENCH_SAVEPOINT=${SAVEPOINT_OPS}\`, \`BENCH_NOTIFY=${NOTIFY_OPS}\`, \`BENCH_CURSOR=${CURSOR_DRAINS}\`, \`BENCH_CURSOR_PAGE=${CURSOR_PAGE}\`, \`BENCH_CONNECT=${CONNECT_OPS}\`, \`BENCH_MISSING=${SYNTAX_OPS}\`, \`BENCH_ABORT=${ABORT_OPS}\`
+Defaults: \`BENCH_ROWS=${ROWS}\`, \`BENCH_POINT=${POINT_OPS}\`, \`BENCH_SCAN=${SCAN_ROWS}\`, \`BENCH_PREPARED=${PREPARED_OPS}\`, \`BENCH_ROUNDS=${ROUNDS}\`, \`BENCH2_ROWS=${BENCH2_ROWS}\`, \`BENCH_ORDER=${ORDER_OPS}\`, \`BENCH_GROUP=${GROUP_OPS}\`, \`BENCH_RECURSIVE=${RECURSIVE_OPS}\`, \`BENCH_JOIN=${JOIN_OPS}\`, \`BENCH_BATCH=${BATCH}\`, \`BENCH_RANGE=${RANGE_OPS}\`, \`BENCH_MUTATE=${MUTATE_OPS}\`, \`BENCH_UPSERT=${UPSERT_OPS}\`, \`BENCH_SIMPLE=${SIMPLE_OPS}\`, \`BENCH_TX_PREPARED=${TX_PREPARED_OPS}\`, \`BENCH_RETURNING=${RETURNING_OPS}\`, \`BENCH_WIDE=${WIDE_OPS}\`, \`BENCH_ERROR=${ERROR_OPS}\`, \`BENCH_PORTAL=${PORTAL_OPS}\`, \`BENCH_PAGE=${PAGE_ROWS}\`, \`BENCH_TEMP=${TEMP_OPS}\`, \`BENCH_MULTI=${MULTI_OPS}\`, \`BENCH_MULTI_STATEMENTS=${MULTI_STATEMENTS}\`, \`BENCH_CVR=${CVR_OPS}\`, \`BENCH_RR=${RR_TX}\`, \`BENCH_RR_ROWS=${RR_ROWS}\`, \`BENCH_BULK=${BULK_OPS}\`, \`BENCH_BULK_ROWS=${BULK_ROWS}\`, \`BENCH_COPY=${COPY_ROWS}\`, \`BENCH_SAVEPOINT=${SAVEPOINT_OPS}\`, \`BENCH_NOTIFY=${NOTIFY_OPS}\`, \`BENCH_CURSOR=${CURSOR_DRAINS}\`, \`BENCH_CURSOR_PAGE=${CURSOR_PAGE}\`, \`BENCH_CONNECT=${CONNECT_OPS}\`, \`BENCH_MISSING=${SYNTAX_OPS}\`, \`BENCH_ABORT=${ABORT_OPS}\`
 Baseline: \`pg\` (one \`pg.Client\` connection) = \`1.00x\`
 Ratio: subject_time / baseline_time (smaller is faster). Fastest cell in each row is bold.
 统计口径：median/p95 由 \`database.harness\` 的 nearest-rank 判定计算（经本仓 napi 直通 \`harnessBenchSummary\`），JS 侧不另写一份。

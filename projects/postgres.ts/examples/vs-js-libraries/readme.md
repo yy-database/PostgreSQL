@@ -99,6 +99,8 @@ Workloads (scenario set aligned with the SQLite repository's `vs-js-libraries`):
 - `large-result-cursor` — `BENCH_CURSOR` `DECLARE`/`FETCH`/`CLOSE` drains of
   `BENCH_CURSOR_PAGE` rows inside one transaction, with identical SQL on both clients
 - `cte` — `BENCH_GROUP` `WITH ... AS (SELECT ... GROUP BY ...) SELECT COUNT(*)` queries
+- `recursive-cte` — `BENCH_RECURSIVE` 100-level `WITH RECURSIVE` expansions followed by an
+  outer `COUNT(*)`
 - `window` — `BENCH_ORDER` `ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val DESC)`
   queries limited to 20 rows
 - `union-all` — `BENCH_GROUP` `UNION ALL` queries that must return every seeded row
