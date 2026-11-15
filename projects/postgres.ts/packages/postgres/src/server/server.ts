@@ -15,7 +15,15 @@ import {
     scramNonce,
     scramServerSignature,
 } from './scram.ts';
-import { cloneDatabase, databasePrefix, purgeDatabase, scopedStorage, storageFor } from './store.ts';
+import {
+    cloneDatabase,
+    databasePrefix,
+    purgeDatabase,
+    scopedStorage,
+    storageFor,
+    volatileStorage,
+    type VolatileRows,
+} from './store.ts';
 import { createSessionRuntime, Database, type SessionRuntime, type Storage } from './sql/database.ts';
 import { SCHEMA_FILE, touchesSchema, writeSchemaExport } from './sql/schema_export.ts';
 import { type ClusterDatabase, ClusterStore, hasDatabasePrivilege } from './sql/cluster.ts';
@@ -533,6 +541,14 @@ class Session {
     /** Temporary tables this session created, dropped when the session ends. */
     private readonly tempTables = new Set<string>();
     private tempPurged = false;
+    /**
+     * Relation, index and sequence oids whose rows live in `volatileRows`
+     * rather than the shard store. Recomputed from the catalog the statement
+     * runs against, so a rolled-back `CREATE TEMP TABLE` cannot leak an oid into
+     * a later persistent relation.
+     */
+    private readonly volatileOids = new Set<number>();
+    private readonly volatileRows: VolatileRows = { namespaces: new Map() };
     private readonly sqlPrepared = new Map<string, SqlPrepared>();
     private copyState:
         | {
@@ -558,7 +574,7 @@ class Session {
         this.database = options.database ?? 'postgres';
         this.auth = options.auth ?? 'trust';
         this.baseStorage = storage;
-        this.storage = scopedStorage(storage, databasePrefix(this.database));
+        this.storage = this.sessionStorageFor(this.database);
         this.cluster = cluster;
         this.manager = manager;
         this.hub = hub;
@@ -618,6 +634,43 @@ class Session {
         this.pendingExecute = null;
     }
 
+    /** One database slice of the base store, with temp-relation rows in memory. */
+    private sessionStorageFor(database: string): Storage {
+        return volatileStorage(
+            scopedStorage(this.baseStorage, databasePrefix(database)),
+            (namespace) => this.isVolatileNamespace(namespace),
+            this.volatileRows,
+        );
+    }
+
+    /**
+     * Refreshes the volatile oid set from the catalog a statement runs against.
+     *
+     * Only `relpersistence = 't'` relations and everything they own are
+     * session-local; a temporary table dropped and rolled back simply stops
+     * being listed, so its oid can never capture a later persistent table.
+     */
+    private syncVolatile(database: Database): void {
+        this.volatileOids.clear();
+        for (const relation of database.catalog.relations) {
+            if (relation.relkind === 'r' && relation.persistence === 't') this.volatileOids.add(relation.oid);
+        }
+        if (this.volatileOids.size === 0) return;
+        const relations = [...this.volatileOids];
+        for (const index of database.catalog.indexes) {
+            if (relations.includes(index.relid)) this.volatileOids.add(index.oid);
+        }
+        for (const sequence of database.catalog.sequences) {
+            if (relations.includes(sequence.relid)) this.volatileOids.add(sequence.oid);
+        }
+    }
+
+    /** `true` when a namespace belongs to a temporary relation of this session. */
+    private isVolatileNamespace(namespace: string): boolean {
+        const match = /(?:^|:)(?:pg_data|pg_rowid|pg_index)\.(\d+)$/.exec(namespace);
+        return match !== null && this.volatileOids.has(Number(match[1]));
+    }
+
     /** Drops the temporary tables this session leaves behind, like session exit. */
     private purgeTempTables(): void {
         if (this.tempPurged) return;
@@ -625,6 +678,7 @@ class Session {
         if (this.tempTables.size === 0) return;
         try {
             const database = Database.open(this.storage, this.cluster, this.runtime);
+            this.syncVolatile(database);
             for (const name of this.tempTables) {
                 try {
                     runStatement(
@@ -641,6 +695,7 @@ class Session {
             // Closing the socket must not fail because cleanup did.
         }
         this.tempTables.clear();
+        this.volatileRows.namespaces.clear();
     }
 
     destroy(): void {
@@ -764,7 +819,7 @@ class Session {
         this.runtime.user = user;
         this.runtime.database = database;
         this.database = database;
-        this.storage = scopedStorage(this.baseStorage, databasePrefix(database));
+        this.storage = this.sessionStorageFor(database);
         this.startupParameters = parameters;
         if (this.auth === 'trust') {
             this.completeAuthentication();
@@ -1156,6 +1211,7 @@ class Session {
         try {
             let count = 0;
             if (success) {
+                this.syncVolatile(copy.database);
                 count = copyIn(copy.database, copy.statement, Buffer.concat(copy.chunks).toString('utf8'));
                 if (this.transaction === null) this.commitImplicit(copy.database);
             }
@@ -1488,6 +1544,7 @@ class Session {
      * `topLevel` is false for every statement of a multi-statement simple query.
      */
     private runParsedArmed(state: SessionState, database: Database, statement: Statement, parameters: SqlValue[], topLevel = true): ServerOutcome {
+        this.syncVolatile(database);
         this.assertWritable(statement);
         switch (statement.kind) {
             case 'copy': {
@@ -1970,6 +2027,7 @@ class Session {
         if (parsed.kind !== 'select') return noData();
         const placeholders = Array.from({ length: parameterCount }, () => null);
         const database = this.transaction?.database ?? Database.open(this.storage, this.cluster, this.runtime);
+        this.syncVolatile(database);
         return rowDescription(applyResultFormats(wireFields(describeSelect(database, parsed, placeholders)), resultFormats));
     }
 

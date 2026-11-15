@@ -420,6 +420,77 @@ export function scopedStorage(storage: Storage, prefix: string): Storage {
     };
 }
 
+/**
+ * Session-local rows for relations whose durability is not required.
+ *
+ * Temporary tables are session-scoped, so their rows do not need to reach the
+ * shard store. Diverting `pg_data`/`pg_rowid`/`pg_index` namespaces of a temp
+ * relation into memory removes both the shard-directory churn on `CREATE TEMP
+ * TABLE` and every per-statement row commit, while the catalog still records
+ * the relation so ordinary statements can resolve it.
+ */
+export interface VolatileRows {
+    /** Raw bytes per namespace; keys are latin1 strings whose order is byte order. */
+    readonly namespaces: Map<string, Map<string, Uint8Array>>;
+}
+
+export function volatileStorage(storage: Storage, isVolatile: (namespace: string) => boolean, rows: VolatileRows): Storage {
+    // `latin1` is the only lossless one-byte-per-code-unit mapping, and its
+    // code-unit order is raw byte order, which is what index scans compare.
+    const toKey = (bytes: Uint8Array): string => Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1');
+    const toBytes = (key: string): Uint8Array => Buffer.from(key, 'latin1');
+    return {
+        scan(namespace, prefix, after, before, limit) {
+            if (!isVolatile(namespace)) return storage.scan(namespace, prefix, after, before, limit);
+            const entries = rows.namespaces.get(namespace);
+            if (entries === undefined) return [];
+            const lower = after === undefined || after === null ? null : toKey(after);
+            const upper = before === undefined || before === null ? null : toKey(before);
+            const start = prefix === undefined ? '' : toKey(prefix);
+            const found: StoredRow[] = [];
+            for (const [key, value] of [...entries].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {
+                if (!key.startsWith(start)) continue;
+                if (lower !== null && !(key > lower)) continue;
+                if (upper !== null && !(key < upper)) continue;
+                found.push({ key: toBytes(key), value: Uint8Array.from(value) });
+                if (limit !== undefined && limit > 0 && found.length === limit) break;
+            }
+            return found;
+        },
+        commitChanges(changes) {
+            const durable: StoredChange[] = [];
+            for (const change of changes) {
+                if (!isVolatile(change.namespace)) {
+                    durable.push(change);
+                    continue;
+                }
+                let entries = rows.namespaces.get(change.namespace);
+                if (entries === undefined) {
+                    entries = new Map();
+                    rows.namespaces.set(change.namespace, entries);
+                }
+                const key = toKey(change.key);
+                if (change.kind === 'delete') entries.delete(key);
+                else if (change.value !== undefined) entries.set(key, Uint8Array.from(change.value));
+            }
+            if (durable.length > 0) storage.commitChanges(durable);
+        },
+        cachedRelation(namespace) {
+            // 内存表只属于本会话，跨语句缓存没有意义，也不能让别的会话读到。
+            return isVolatile(namespace) ? undefined : storage.cachedRelation?.(namespace);
+        },
+        rememberRelation(namespace, table) {
+            if (!isVolatile(namespace)) storage.rememberRelation?.(namespace, table);
+        },
+        cachedCatalog(namespace) {
+            return storage.cachedCatalog?.(namespace);
+        },
+        rememberCatalog(namespace, doc) {
+            storage.rememberCatalog?.(namespace, doc);
+        },
+    };
+}
+
 /** Relation oids recorded in one database's catalog, in document order. */
 function relationOids(storage: Storage): number[] {
     const row = storage.scan(CATALOG_NAMESPACE).find((candidate) => decoder.decode(candidate.key) === CATALOG_KEY);

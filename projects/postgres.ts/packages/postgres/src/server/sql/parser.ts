@@ -268,6 +268,8 @@ export interface InsertStatement {
 export interface ConflictClause {
     /** Conflict-target columns, or `undefined` when the clause names none. */
     columns: string[] | undefined;
+    /** `ON CONFLICT ON CONSTRAINT <name>`; mutually exclusive with `columns`. */
+    constraint?: string;
     action: { kind: 'nothing' } | { kind: 'update'; assignments: { column: string; value: Expr }[] };
 }
 
@@ -2202,6 +2204,7 @@ class Parser {
         this.next();
         this.expect('CONFLICT');
         let columns: string[] | undefined;
+        let constraint: string | undefined;
         if (this.at('(')) {
             this.next();
             columns = [];
@@ -2210,9 +2213,13 @@ class Parser {
             } while (this.accept(','));
             this.expect(')');
         }
+        else if (this.accept('ON')) {
+            this.expect('CONSTRAINT');
+            constraint = this.identifier();
+        }
         if (this.at('WHERE')) throw new ServerError('0A000', 'feature not supported', 'ON CONFLICT inference predicates are not implemented');
         this.expect('DO');
-        if (this.accept('NOTHING')) return { columns, action: { kind: 'nothing' } };
+        if (this.accept('NOTHING')) return { columns, constraint, action: { kind: 'nothing' } };
         this.expect('UPDATE');
         this.expect('SET');
         const assignments: { column: string; value: Expr }[] = [];
@@ -2222,7 +2229,7 @@ class Parser {
             assignments.push({ column, value: this.parseExpr() });
         } while (this.accept(','));
         if (this.at('WHERE')) throw new ServerError('0A000', 'feature not supported', 'ON CONFLICT DO UPDATE filters are not implemented');
-        return { columns, action: { kind: 'update', assignments } };
+        return { columns, constraint, action: { kind: 'update', assignments } };
     }
 
     private parseUpdate(): UpdateStatement {

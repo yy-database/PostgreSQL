@@ -328,18 +328,36 @@ export class Database {
         if (shared !== undefined) {
             // 跨语句复用的只是已提交状态。只读语句直接读共享快照，第一次写入
             // 才通过 `ownTable` 复制，省掉每条只读语句的一整表 Map 复制。
-            this.tables.set(relOid, shared);
-            this.sharedTables.add(relOid);
-            return shared;
+            const pending = this.writes.get(relOid);
+            if (pending === undefined) {
+                this.tables.set(relOid, shared);
+                this.sharedTables.add(relOid);
+                return shared;
+            }
+            // 本事务有未提交写入：共享快照不能再被就地改写，先复制再叠加差异。
+            const rows = new Map(shared);
+            this.applyWrites(rows, pending);
+            this.tables.set(relOid, rows);
+            return rows;
         }
         const rows = new Map<string, SqlValue[]>();
         for (const stored of this.storage.scan(namespace)) {
             rows.set(decode(stored.key), JSON.parse(decode(stored.value)) as SqlValue[]);
         }
-        this.tables.set(relOid, rows);
-        // 缓存的是刚解码出的快照；`rows` 随后会被本语句就地改写，所以另存一份 Map。
+        // 缓存的是刚解码出的已提交快照；`rows` 随后还会叠加本事务的写入。
         this.storage.rememberRelation?.(namespace, new Map(rows));
+        const pending = this.writes.get(relOid);
+        if (pending !== undefined) this.applyWrites(rows, pending);
+        this.tables.set(relOid, rows);
         return rows;
+    }
+
+    /** 把本事务对一张表的未提交写入叠加到已解码的行集上。 */
+    private applyWrites(rows: Map<string, SqlValue[]>, writes: Map<string, SqlValue[] | null>): void {
+        for (const [key, values] of writes) {
+            if (values === null) rows.delete(key);
+            else rows.set(key, values);
+        }
     }
 
     /** 取一份可写的行表；共享缓存的那份在第一次写入前复制。 */
@@ -439,21 +457,28 @@ export class Database {
 
     insertRow(relOid: number, values: SqlValue[]): string {
         const key = this.nextRowId(relOid);
-        this.ownTable(relOid).set(key, values);
+        // 只更新已加载的工作副本；没有加载过就不必为一次写入解码整张表，
+        // 后续语句通过 `table()` 把未提交写入叠加到已提交快照上。
+        if (this.tables.has(relOid)) this.ownTable(relOid).set(key, values);
         this.changesFor(relOid).set(key, values);
         return key;
     }
 
     updateRow(relOid: number, key: string, values: SqlValue[]): void {
         this.onWrite?.(relOid, key, 'update');
-        this.ownTable(relOid).set(key, values);
+        if (this.tables.has(relOid)) this.ownTable(relOid).set(key, values);
         this.changesFor(relOid).set(key, values);
     }
 
+    /**
+     * Records the deletion of one row.
+     *
+     * Callers only pass keys they already saw, either from a scan or from a
+     * unique-index probe, so no existence check re-reads the relation here.
+     */
     deleteRow(relOid: number, key: string): void {
-        if (!this.table(relOid).has(key)) return;
         this.onWrite?.(relOid, key, 'delete');
-        if (!this.ownTable(relOid).delete(key)) return;
+        if (this.tables.has(relOid)) this.ownTable(relOid).delete(key);
         this.changesFor(relOid).set(key, null);
     }
 

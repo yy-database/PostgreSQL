@@ -4012,6 +4012,39 @@ function scanIndexRows(database: Database, relation: { oid: number; name: string
     return { columns: bindings, rows: entries.map((entry) => [...entry.values, relation.oid]), ordered };
 }
 
+/**
+ * Rows selected by a unique-key equality predicate, read through a materialized
+ * index instead of decoding the whole relation.
+ *
+ * `UPDATE`/`DELETE ... WHERE id = $1` used to load every row of the table just
+ * to find one. An index entry already carries the whole row, so a full-key
+ * equality on a unique index answers the predicate without touching the data
+ * namespace; the caller still re-evaluates the original `WHERE` on these rows.
+ * `null` means the predicate does not narrow to a single unique key.
+ */
+function indexPointRows(
+    database: Database,
+    shape: TableShape,
+    alias: string,
+    where: Expr | undefined,
+    params: SqlValue[],
+): { key: string; values: SqlValue[] }[] | null {
+    if (where === undefined) return null;
+    const columns: IndexColumn[] = shape.columns.map((column) => ({ attnum: column.attnum, name: column.name, type: column.type }));
+    const plan = planRelationAccess(database, shape.indexes, columns, new Set([alias.toLowerCase()]), where, params);
+    if (plan === null || !plan.index.unique) return null;
+    if (plan.lower !== null || plan.upper !== null || plan.equality.length !== plan.index.keys.length) return null;
+    const prefix = encodeIndexValues(plan.equality, plan.index.keys);
+    const separator = Buffer.from([0x00]).toString('latin1');
+    const text = Buffer.from(prefix.buffer, prefix.byteOffset, prefix.byteLength).toString('latin1');
+    const rows: { key: string; values: SqlValue[] }[] = [];
+    for (const entry of database.scanIndex(plan.index.oid, prefix, null, null, 0)) {
+        if (entry.key.slice(text.length, text.length + 1) !== separator) continue;
+        rows.push({ key: entry.key.slice(text.length + 1), values: entry.values });
+    }
+    return rows;
+}
+
 function indexColumnsOf(database: Database, relid: number): IndexColumn[] {
     return database.catalog.columns
         .filter((column) => column.relid === relid)
@@ -4329,7 +4362,7 @@ function insertRows(database: Database, statement: InsertStatement, params: SqlV
             })
         : shape.columns;
     const conflict = statement.conflict;
-    const conflictIndexes = conflict === undefined ? [] : conflictTargetIndexes(shape, conflict);
+    const conflictIndexes = conflict === undefined ? [] : conflictTargetIndexes(database, shape, conflict);
     if (conflict?.action.kind === 'update') {
         for (const assignment of conflict.action.assignments) {
             if (!shape.columns.some((column) => column.name === assignment.column)) {
@@ -4402,10 +4435,32 @@ function insertRows(database: Database, statement: InsertStatement, params: SqlV
 /**
  * Unique indexes an `ON CONFLICT` clause can arbitrate on.
  *
- * A target column list must name exactly one unique index's key columns; with
- * no list every unique index is a candidate, matching PostgreSQL's inference.
+ * `ON CONSTRAINT name` resolves the named unique/primary-key constraint to its
+ * index. A target column list must name exactly one unique index's key
+ * columns; with no list every unique index is a candidate, matching
+ * PostgreSQL's inference.
  */
-function conflictTargetIndexes(shape: TableShape, conflict: { columns: string[] | undefined; action: { kind: string } }): TableShape['uniqueIndexes'] {
+function conflictTargetIndexes(
+    database: Database,
+    shape: TableShape,
+    conflict: { columns: string[] | undefined; constraint?: string; action: { kind: string } },
+): TableShape['uniqueIndexes'] {
+    if (conflict.constraint !== undefined) {
+        const constraint = database.catalog.constraints.find(
+            (candidate) => candidate.relid === shape.oid && candidate.name === conflict.constraint,
+        );
+        if (constraint === undefined) {
+            throw new ServerError('42704', `constraint "${conflict.constraint}" for table "${shape.name}" does not exist`);
+        }
+        if (constraint.contype !== 'p' && constraint.contype !== 'u') {
+            throw new ServerError('42809', `constraint "${conflict.constraint}" is not a unique or exclusion constraint`);
+        }
+        const index = shape.uniqueIndexes.find((candidate) => candidate.oid === constraint.indexOid);
+        if (index === undefined) {
+            throw new ServerError('42P10', 'there is no unique or exclusion constraint matching the ON CONFLICT specification');
+        }
+        return [index];
+    }
     if (conflict.columns === undefined) {
         if (conflict.action.kind === 'update') {
             throw new ServerError('42601', 'ON CONFLICT DO UPDATE requires an inference specification or constraint name');
@@ -4435,7 +4490,9 @@ function conflictingRow(
     values: SqlValue[],
     indexes: TableShape['uniqueIndexes'],
 ): { key: string; values: SqlValue[] } | undefined {
-    const rows = database.table(shape.oid);
+    // 物化索引条目本身就带着整行，命中时不必先把整张表解码一遍。只有没有
+    // 物化索引的老目录才回退到逐行比较。
+    let rows: Map<string, SqlValue[]> | undefined;
     for (const index of indexes) {
         if (index.predicate && evaluate(database, index.predicate, rowContext(shape, database.catalog, values), []) !== true) continue;
         const candidate = index.keys.map((key) => key.expression === null
@@ -4446,12 +4503,11 @@ function conflictingRow(
         if (materialized !== undefined) {
             const prefix = encodeIndexValues(candidate, materialized.keys);
             for (const entry of database.scanIndex(materialized.oid, prefix, null, null, 1)) {
-                const rowKey = entry.key.slice(prefix.length + 1);
-                const row = rows.get(rowKey);
-                if (row !== undefined) return { key: rowKey, values: row };
+                return { key: entry.key.slice(prefix.length + 1), values: entry.values };
             }
             continue;
         }
+        rows ??= database.table(shape.oid);
         for (const [rowKey, other] of rows) {
             const existing = index.keys.map((key) => key.expression === null
                 ? other[key.attnum - 1] ?? null
@@ -4596,11 +4652,14 @@ function updateRows(database: Database, statement: UpdateStatement, params: SqlV
     }
     const alias = statement.table.name;
     const columns: Binding[] = shape.columns.map((column) => ({ alias, name: column.name, type: column.type }));
-    const rows = database.table(shape.oid);
+    // 唯一键等值谓词先从索引取行，避免为一行 UPDATE 解码整张表。
+    const narrowed = indexPointRows(database, shape, alias, statement.where, params);
+    const candidates = narrowed
+        ?? [...database.table(shape.oid).entries()].map(([key, values]) => ({ key, values }));
     // Snapshot the old arrays: `updateRow` replaces them before ON UPDATE runs.
-    const original = new Map(rows);
+    const original = new Map(candidates.map((row) => [row.key, row.values]));
     const updated: { key: string; values: SqlValue[] }[] = [];
-    for (const [key, values] of [...rows.entries()]) {
+    for (const { key, values } of candidates) {
         const context: Context = { columns, row: values, outer: undefined };
         if (statement.where && evaluate(database, statement.where, context, params) !== true) continue;
         const next = [...values];
@@ -4710,9 +4769,12 @@ function deleteRows(database: Database, statement: DeleteStatement, params: SqlV
     checkGrantOnOid(database, shape.oid, 'DELETE');
     const alias = statement.table.name;
     const columns: Binding[] = shape.columns.map((column) => ({ alias, name: column.name, type: column.type }));
-    const rows = database.table(shape.oid);
+    // 与 UPDATE 相同：唯一键等值谓词直接从索引取行，不加载整表。
+    const narrowed = indexPointRows(database, shape, alias, statement.where, params);
+    const candidates = narrowed
+        ?? [...database.table(shape.oid).entries()].map(([key, values]) => ({ key, values }));
     const removed: { key: string; values: SqlValue[] }[] = [];
-    for (const [key, values] of [...rows.entries()]) {
+    for (const { key, values } of candidates) {
         const context: Context = { columns, row: values, outer: undefined };
         if (statement.where && evaluate(database, statement.where, context, params) !== true) continue;
         removed.push({ key, values });

@@ -19,7 +19,7 @@ use database::harness::{
     evaluate, per_op_ms, render_json, summarize,
 };
 use database_client::pgsql::{
-    ServerChange as CoreServerChange, ServerRow as CoreServerRow, ServerStore as CoreServerStore, Store as CoreStore,
+    Notification, ServerChange as CoreServerChange, ServerRow as CoreServerRow, ServerStore as CoreServerStore, Store as CoreStore,
     client::{ClientConfig, Column, Connection as CoreConnection, Param as PostgresParam, QueryResult},
     error::{MessageField, Notice, PostgresError},
     psql::{PsqlOptions, format_results, parse_arguments},
@@ -92,6 +92,17 @@ pub struct ErrorInfo {
 #[napi(object)]
 pub struct NoticeInfo {
     pub fields: Vec<MessageFieldInfo>,
+}
+
+/// One `NotificationResponse` delivered to a session that ran `LISTEN`.
+#[napi(object)]
+pub struct NotificationInfo {
+    /// Backend pid that sent the `NOTIFY`.
+    pub process_id: i32,
+    /// Channel name.
+    pub channel: String,
+    /// Payload, empty when the `NOTIFY` carried none.
+    pub payload: String,
 }
 
 /// Outcome of one simple-query batch.
@@ -247,6 +258,14 @@ impl Connection {
         let mut guard = self.inner.lock().map_err(|_| lock_error())?;
         let connection = guard.as_mut().ok_or_else(closed_error)?;
         Ok(connection.take_notices().iter().map(notice_info).collect())
+    }
+
+    /// Drains every `NOTIFY` delivered to this session so far, in wire order.
+    #[napi]
+    pub fn take_notifications(&self) -> Result<Vec<NotificationInfo>> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        Ok(connection.take_notifications().into_iter().map(notification_info).collect())
     }
 
     /// The `BackendKeyData` from startup, or `null` when the server skipped it.
@@ -872,6 +891,10 @@ fn message_field_info(field: &MessageField) -> MessageFieldInfo {
 
 fn notice_info(notice: &Notice) -> NoticeInfo {
     NoticeInfo { fields: notice.fields.iter().map(message_field_info).collect() }
+}
+
+fn notification_info(notification: Notification) -> NotificationInfo {
+    NotificationInfo { process_id: notification.process_id, channel: notification.channel, payload: notification.payload }
 }
 
 fn error_info(error: &PostgresError) -> Option<ErrorInfo> {

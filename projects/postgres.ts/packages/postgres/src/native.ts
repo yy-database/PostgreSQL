@@ -69,6 +69,15 @@ export interface NoticeInfo {
     fields: MessageFieldInfo[];
 }
 
+/** One `NotificationResponse` delivered to a session that ran `LISTEN`. */
+export interface NotificationInfo {
+    /** Backend pid that sent the `NOTIFY`. */
+    processId: number;
+    channel: string;
+    /** Empty when the `NOTIFY` carried no payload. */
+    payload: string;
+}
+
 /** Outcome of one simple-query batch. */
 export interface ExecutionReport {
     /** Every statement that finished before the batch stopped. */
@@ -169,6 +178,8 @@ export interface Connection {
     executeReport(sql: string): ExecutionReport;
     /** Drains every notice received by `execute` calls so far, in wire order. */
     takeNotices(): NoticeInfo[];
+    /** Drains every `NOTIFY` delivered to this session so far, in wire order. */
+    takeNotifications(): NotificationInfo[];
     /** `BackendKeyData` from startup, or `null` when the server skipped it. */
     backendKeyData(): BackendKeyDataInfo | null;
     /** Sends a `CancelRequest` on a fresh socket; the main socket stays usable. */

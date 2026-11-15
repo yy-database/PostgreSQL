@@ -20,7 +20,7 @@ target/
 Cargo.lock
 
 # Local dependency overrides (CI resolves pinned git revisions only)
-.cargo/config.toml
+**/.cargo/config.toml
 
 # Native bindings built from Cargo (not committed)
 projects/postgres.ts/platforms/*/*.node
