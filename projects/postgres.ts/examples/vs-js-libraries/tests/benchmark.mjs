@@ -92,6 +92,8 @@ const ABORT_OPS = readInt("BENCH_ABORT", 50, 1);
 
 const GROUP_SIZE = 10;
 const GROUP_COUNT = Math.ceil(BENCH2_ROWS / GROUP_SIZE);
+/** `EXCEPT` / `INTERSECT` 的分界：`bench` 的前一半 id 与后一半 id。 */
+const SPLIT_ROWS = Math.floor(BENCH2_ROWS / 2);
 const RECURSIVE_OPS = readInt("BENCH_RECURSIVE", 100, 1);
 
 const ALL_WORKLOADS = [
@@ -146,6 +148,12 @@ const ALL_WORKLOADS = [
   "ilike-filter",
   "regex-filter",
   "group-having",
+  "full-outer-join",
+  "except",
+  "intersect",
+  "filter-aggregate",
+  "any-array",
+  "limit-offset",
 ];
 // `BENCH_ONLY=update,delete` narrows a run to the named workloads.
 const ONLY = (process.env.BENCH_ONLY ?? "").split(",").map((name) => name.trim()).filter((name) => name.length > 0);
@@ -179,6 +187,12 @@ const BENCH_SEEDED = new Set([
   "view-select",
   "vacuum-analyze",
   "group-having",
+  "full-outer-join",
+  "except",
+  "intersect",
+  "filter-aggregate",
+  "any-array",
+  "limit-offset",
 ]);
 
 /** `bench` 的 `val` 由 `bench2RowTuple` 的 `(id * 137) % 997` 决定。 */
@@ -191,6 +205,13 @@ function expectedSubqueryRows() {
 function expectedIndexRangeRows() {
   let count = 0;
   for (let id = 1; id <= BENCH2_ROWS; id += 1) if (id >= 100 && id <= 199) count += 1;
+  return count;
+}
+
+/** `count(*) FILTER (WHERE val > 500)` 只保留 `(id * 137) % 997 > 500` 的行。 */
+function expectedFilteredRows() {
+  let count = 0;
+  for (let id = 1; id <= BENCH2_ROWS; id += 1) if ((id * 137) % 997 > 500) count += 1;
   return count;
 }
 
@@ -235,6 +256,10 @@ async function runRound(clientSpec, workload) {
         await client.createBench(0, BATCH);
       } else if (BENCH_SEEDED.has(workload)) {
         await client.createBench(BENCH2_ROWS, BATCH);
+      }
+      if (workload === "full-outer-join") {
+        // `bench_join` 比 `bench` 多一行孤儿行，`FULL OUTER JOIN` 必须把它保留下来。
+        await client.mutate(`INSERT INTO bench_join VALUES (${BENCH2_ROWS + 1}, 'orphan')`);
       }
       if (workload === "wide-row") {
         // 一半行是 NULL 单元格，另有一行携带 4 KiB 文本，覆盖两类行解码。
@@ -655,6 +680,62 @@ async function runRound(clientSpec, workload) {
           if (groups !== GROUP_COUNT) throw new Error(`group-having groups=${groups} expected=${GROUP_COUNT}`);
         }
         ops = GROUP_OPS;
+      } else if (workload === "full-outer-join") {
+        // `bench_join` 多出的那一行只能由外连接保留下来，内连接会把它丢掉。
+        for (let index = 0; index < JOIN_OPS; index += 1) {
+          const unmatched = Number(
+            await client.scalar("SELECT count(*) FROM bench b FULL OUTER JOIN bench_join o ON o.id = b.id WHERE b.id IS NULL OR o.id IS NULL"),
+          );
+          if (unmatched !== 1) throw new Error(`full-outer-join unmatched=${unmatched} expected=1`);
+        }
+        ops = JOIN_OPS;
+        verify = async () => {
+          const total = Number(await client.scalar("SELECT count(*) FROM bench b FULL OUTER JOIN bench_join o ON o.id = b.id"));
+          if (total !== BENCH2_ROWS + 1) throw new Error(`full-outer-join total=${total} expected=${BENCH2_ROWS + 1}`);
+        };
+      } else if (workload === "except") {
+        // 前半段 id 被 `EXCEPT` 扣掉，其余行必须原样保留。
+        const expected = BENCH2_ROWS - SPLIT_ROWS;
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const rows = Number(
+            await client.scalar(`SELECT count(*) FROM (SELECT id FROM bench EXCEPT SELECT id FROM bench WHERE id <= ${SPLIT_ROWS}) s`),
+          );
+          if (rows !== expected) throw new Error(`except rows=${rows} expected=${expected}`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "intersect") {
+        // 同一分界换成 `INTERSECT`：只剩前半段 id。
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const rows = Number(
+            await client.scalar(`SELECT count(*) FROM (SELECT id FROM bench INTERSECT SELECT id FROM bench WHERE id <= ${SPLIT_ROWS}) s`),
+          );
+          if (rows !== SPLIT_ROWS) throw new Error(`intersect rows=${rows} expected=${SPLIT_ROWS}`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "filter-aggregate") {
+        // `FILTER` 只让 `val > 500` 的行进入聚合，其余行不进累加。
+        const expected = expectedFilteredRows();
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const kept = Number(await client.scalar("SELECT count(*) FILTER (WHERE val > 500) FROM bench"));
+          if (kept !== expected) throw new Error(`filter-aggregate kept=${kept} expected=${expected}`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "any-array") {
+        // `= ANY(ARRAY[...])` 与 `IN` 同一语义，但走数组操作符。
+        const expected = Math.min(5, BENCH2_ROWS);
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const rows = Number(await client.scalar("SELECT count(*) FROM bench WHERE id = ANY(ARRAY[1,2,3,4,5])"));
+          if (rows !== expected) throw new Error(`any-array rows=${rows} expected=${expected}`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "limit-offset") {
+        // 跳过前 10 行再取 20 行，`OFFSET` 不能改变页大小。
+        const expected = Math.max(0, Math.min(20, BENCH2_ROWS - 10));
+        for (let index = 0; index < ORDER_OPS; index += 1) {
+          const rows = await client.query("SELECT id FROM bench ORDER BY id LIMIT 20 OFFSET 10");
+          if (rows !== expected) throw new Error(`limit-offset rows=${rows} expected=${expected}`);
+        }
+        ops = ORDER_OPS;
       } else if (workload === "vacuum-analyze") {
         for (let index = 0; index < GROUP_OPS; index += 1) {
           await client.mutate("VACUUM bench");
@@ -826,7 +907,7 @@ ${relativeLines}
 
 ${absoluteLines}
 
-An op is one completed connection handshake, one inserted row, one point query, one simple-protocol point query, one scanned row, one prepared execution, one prepared execution inside a transaction, one ordered-limit statement, one grouping statement, one join statement, one batched row, one parameter-bound batched row, one distinct projection, one aggregate projection, one subquery, one indexed range statement, one upsert, one update, one update with \`RETURNING\`, one delete, one row with a \`NULL\` or 4 KiB cell, one rejected duplicate-key insert, one rejected undefined-table statement, one aborted-transaction round trip, one rolled-back insert, one row fetched through a suspended portal, one temporary-table cycle, one statement inside a multi-statement message, one rejected insert followed by \`ROLLBACK\`, one repeatable-read point query, one row touched by a bulk \`UPDATE\`/\`DELETE\`, one row imported, one savepoint round-trip statement, one notification delivered, or one row fetched from a \`DECLARE\`/\`FETCH\` cursor.
+An op is one completed connection handshake, one inserted row, one point query, one simple-protocol point query, one scanned row, one prepared execution, one prepared execution inside a transaction, one ordered-limit statement, one grouping statement, one join statement, one batched row, one parameter-bound batched row, one distinct projection, one aggregate projection, one subquery, one indexed range statement, one upsert, one update, one update with \`RETURNING\`, one delete, one row with a \`NULL\` or 4 KiB cell, one rejected duplicate-key insert, one rejected undefined-table statement, one aborted-transaction round trip, one rolled-back insert, one row fetched through a suspended portal, one temporary-table cycle, one statement inside a multi-statement message, one rejected insert followed by \`ROLLBACK\`, one repeatable-read point query, one row touched by a bulk \`UPDATE\`/\`DELETE\`, one row imported, one savepoint round-trip statement, one notification delivered, one row fetched from a \`DECLARE\`/\`FETCH\` cursor, one full outer join projection, one \`EXCEPT\` projection, one \`INTERSECT\` projection, one filtered aggregate, one \`ANY(ARRAY[...])\` point filter, or one offset-paged statement.
 One warmup round runs before the measured rounds. The table reports median and p95 of ${ROUNDS} measured rounds.
 
 ## Intentional deltas
@@ -853,6 +934,7 @@ One warmup round runs before the measured rounds. The table reports median and p
 - \`savepoint-rollback\` runs \`BENCH_SAVEPOINT\` transactions of \`BEGIN\` / \`INSERT\` / \`SAVEPOINT\` / \`UPDATE\` / \`ROLLBACK TO SAVEPOINT\` / \`INSERT\` / \`RELEASE\` / \`COMMIT\`, and asserts the rolled-back update did not survive.
 - \`listen-notify\` runs \`LISTEN bench_chan\` once and then \`BENCH_NOTIFY\` \`NOTIFY\` statements. The native client reads the \`NotificationResponse\` frames into its own buffer and drains them after the timed region; \`pg\` counts \`notification\` events. Both must receive every notification.
 - \`large-result-cursor\` declares \`SELECT id, val FROM bench ORDER BY id\` and fetches it \`BENCH_CURSOR_PAGE\` rows at a time, \`BENCH_CURSOR\` times inside one explicit transaction. Both clients run the same \`DECLARE\`/\`FETCH\`/\`CLOSE\` SQL, so the row isolates server-side cursor paging.
+- \`full-outer-join\`, \`except\`, \`intersect\`, \`filter-aggregate\`, \`any-array\` and \`limit-offset\` run the same literal SQL on both clients over the shared \`bench\`/\`bench_join\` shape. \`full-outer-join\` seeds one extra \`bench_join\` row so the unmatched side must reappear, \`except\`/\`intersect\` split \`bench\` at half of \`BENCH2_ROWS\`, \`filter-aggregate\` counts the \`(id * 137) % 997 > 500\` rows, \`any-array\` pins the five ids in \`ARRAY[1,2,3,4,5]\`, and \`limit-offset\` pages 20 rows past the first 10.
 
 Regenerate: \`pnpm --dir projects/postgres.ts/examples/vs-js-libraries benchmark\`
 `;

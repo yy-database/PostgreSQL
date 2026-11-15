@@ -121,6 +121,15 @@ Workloads (scenario set aligned with the SQLite repository's `vs-js-libraries`):
   the regex path separate from `LIKE`
 - `group-having` — `GROUP BY grp HAVING count(*) >= group size` over the seeded `bench`
   table, asserting every group survives
+- `full-outer-join` — `BENCH_JOIN` `FULL OUTER JOIN bench_join ON id` statements; one extra
+  `bench_join` row is seeded, so the unmatched side must reappear exactly once
+- `except` — `BENCH_GROUP` `EXCEPT` projections that drop the first half of the seeded ids
+- `intersect` — `BENCH_GROUP` `INTERSECT` projections that keep only the first half
+- `filter-aggregate` — `BENCH_GROUP` `count(*) FILTER (WHERE val > 500)` aggregations,
+  asserting the exact number of rows whose `val` exceeds the threshold
+- `any-array` — `BENCH_GROUP` `WHERE id = ANY(ARRAY[1,2,3,4,5])` filters, asserting five ids
+- `limit-offset` — `BENCH_ORDER` `ORDER BY id LIMIT 20 OFFSET 10` statements, asserting the
+  page stays 20 rows wide
 
 Every round starts a fresh child server with a fresh temporary data directory. Table
 creation and seeding are untimed. One warmup round runs before the measured rounds.
