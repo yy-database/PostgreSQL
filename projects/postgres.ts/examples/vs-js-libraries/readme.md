@@ -108,6 +108,12 @@ Workloads (scenario set aligned with the SQLite repository's `vs-js-libraries`):
 - `explain` — `BENCH_GROUP` `EXPLAIN` statements, timing the planner round trip
 - `view-select` — `BENCH_GROUP` reads of a view created once before the timed region
 - `vacuum-analyze` — `BENCH_GROUP` `VACUUM bench` plus `ANALYZE bench` maintenance cycles
+- `array-agg` — `BENCH_GROUP` `array_agg(id)` aggregations over the seeded `bench_items`
+- `unnest-array` — `BENCH_GROUP` `count(*)` queries over `unnest(ARRAY[...])`
+- `like-prefix` — `BENCH_GROUP` prefixed `LIKE` filters over the seeded `bench_items`,
+  asserting the number of `row-<id>` labels that start with `1`
+- `ilike-filter` — the same filter through `ILIKE` with an upper-case pattern, so the
+  assertion only holds when case folding is applied
 
 Every round starts a fresh child server with a fresh temporary data directory. Table
 creation and seeding are untimed. One warmup round runs before the measured rounds.

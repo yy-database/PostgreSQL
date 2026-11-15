@@ -138,6 +138,10 @@ const ALL_WORKLOADS = [
   "explain",
   "view-select",
   "vacuum-analyze",
+  "array-agg",
+  "unnest-array",
+  "like-prefix",
+  "ilike-filter",
 ];
 // `BENCH_ONLY=update,delete` narrows a run to the named workloads.
 const ONLY = (process.env.BENCH_ONLY ?? "").split(",").map((name) => name.trim()).filter((name) => name.length > 0);
@@ -184,6 +188,13 @@ function expectedIndexRangeRows() {
   for (let id = 1; id <= BENCH2_ROWS; id += 1) if (id >= 100 && id <= 199) count += 1;
   return count;
 }
+
+/** `bench_items.label` is `row-<id>`, so `'row-1%'` matches ids starting with `1`. */
+function expectedLikePrefixRows() {
+  let count = 0;
+  for (let id = 1; id <= ROWS; id += 1) if (String(id).startsWith("1")) count += 1;
+  return count;
+}
 const CLIENTS = [
   { key: "pg", open: openPgClient },
   { key: "@yydb/postgres", open: openNativeClient },
@@ -206,6 +217,9 @@ async function runRound(clientSpec, workload) {
         || workload === "select-scan"
         || workload === "prepared-point"
         || workload === "tx-prepared"
+        || workload === "array-agg"
+        || workload === "like-prefix"
+        || workload === "ilike-filter"
       ) {
         const seedRows = workload === "insert" ? 0 : workload === "select-scan" ? SCAN_ROWS : ROWS;
         for (let id = 1; id <= seedRows; id += 1) await client.insert(id, `row-${id}`, id);
@@ -582,6 +596,33 @@ async function runRound(clientSpec, workload) {
         for (let index = 0; index < GROUP_OPS; index += 1) {
           const rows = await client.query("SELECT grp, n, s FROM bench_grp ORDER BY grp");
           if (rows !== GROUP_COUNT) throw new Error(`view-select rows=${rows} expected=${GROUP_COUNT}`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "array-agg") {
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const rows = await client.query("SELECT count(*) FROM (SELECT array_agg(id) AS a FROM bench_items) s WHERE a IS NOT NULL");
+          if (rows !== 1) throw new Error(`array-agg rows=${rows} expected=1`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "unnest-array") {
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const produced = Number(await client.scalar("SELECT count(*) FROM unnest(ARRAY[1,2,3,4,5])"));
+          if (produced !== 5) throw new Error(`unnest-array produced=${produced} expected=5`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "like-prefix") {
+        const expected = expectedLikePrefixRows();
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const matched = Number(await client.scalar("SELECT count(*) FROM bench_items WHERE label LIKE 'row-1%'"));
+          if (matched !== expected) throw new Error(`like-prefix matched=${matched} expected=${expected}`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "ilike-filter") {
+        // 同一前缀换成大写模式：只有大小写不敏感匹配才会命中。
+        const expected = expectedLikePrefixRows();
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const matched = Number(await client.scalar("SELECT count(*) FROM bench_items WHERE label ILIKE 'ROW-1%'"));
+          if (matched !== expected) throw new Error(`ilike-filter matched=${matched} expected=${expected}`);
         }
         ops = GROUP_OPS;
       } else if (workload === "vacuum-analyze") {
