@@ -12,7 +12,7 @@ Ratio: subject_time / baseline_time (smaller is faster). Fastest cell in each ro
 |----|----|
 | node | `v24.18.0` |
 | rustc | `rustc 1.101.0-nightly (1c3a65069 2026-11-02)` |
-| 本仓 rev | `c1deb44` |
+| 本仓 rev | `044f90a` |
 | database.rs 钉住 rev | `70aee1e` |
 | 数据规模 | bench_items 200/1000 行，bench 200 行（uk 唯一、grp 每组 10 行、(val DESC, id) 索引），批量 100 行/语句 |
 
@@ -20,182 +20,182 @@ Ratio: subject_time / baseline_time (smaller is faster). Fastest cell in each ro
 
 | Workload | pg | @yydb/postgres |
 |---------:|-------:|-------:|
-| connect | 1.00x | **0.71x** |
-| insert | 1.00x | **0.93x** |
-| select-point | 1.00x | **0.77x** |
-| simple-point | 1.00x | **0.88x** |
-| select-scan | **1.00x** | 1.12x |
-| prepared-point | 1.00x | **0.73x** |
-| tx-prepared | 1.00x | **0.69x** |
-| point-uk | 1.00x | **0.99x** |
-| order-limit | 1.00x | **0.87x** |
-| group-by | **1.00x** | 1.00x |
-| join | **1.00x** | 1.03x |
-| batch-insert | **1.00x** | 1.06x |
-| batch-insert-params | 1.00x | **1.00x** |
-| distinct | 1.00x | **0.94x** |
-| aggregate | 1.00x | **0.91x** |
-| subquery | 1.00x | **0.93x** |
-| index-range | **1.00x** | 1.05x |
-| upsert | 1.00x | **1.00x** |
-| update | **1.00x** | 1.02x |
-| update-returning | **1.00x** | 1.04x |
-| delete | **1.00x** | 1.04x |
-| wide-row | 1.00x | **0.93x** |
-| error-constraint | 1.00x | **0.88x** |
-| error-undefined-table | 1.00x | **0.98x** |
-| aborted-transaction | 1.00x | **0.84x** |
-| rollback | 1.00x | **0.81x** |
+| connect | 1.00x | **0.74x** |
+| insert | 1.00x | **0.80x** |
+| select-point | 1.00x | **0.82x** |
+| simple-point | 1.00x | **0.81x** |
+| select-scan | **1.00x** | 1.01x |
+| prepared-point | 1.00x | **0.78x** |
+| tx-prepared | 1.00x | **0.70x** |
+| point-uk | 1.00x | **0.93x** |
+| order-limit | **1.00x** | 1.02x |
+| group-by | **1.00x** | 1.05x |
+| join | **1.00x** | 1.02x |
+| batch-insert | 1.00x | **0.99x** |
+| batch-insert-params | **1.00x** | 1.05x |
+| distinct | 1.00x | **1.00x** |
+| aggregate | 1.00x | **0.90x** |
+| subquery | 1.00x | **0.99x** |
+| index-range | **1.00x** | 1.02x |
+| upsert | **1.00x** | 1.44x |
+| update | 1.00x | **0.97x** |
+| update-returning | **1.00x** | 1.01x |
+| delete | **1.00x** | 1.06x |
+| wide-row | 1.00x | **0.94x** |
+| error-constraint | 1.00x | **0.92x** |
+| error-undefined-table | 1.00x | **0.91x** |
+| aborted-transaction | 1.00x | **0.86x** |
+| rollback | **1.00x** | 1.02x |
 | portal-batch-fetch | 1.00x | **0.81x** |
 | temp-table | 1.00x | **0.96x** |
-| multi-statement | 1.00x | **1.00x** |
-| constraint-violation-rollback | 1.00x | **0.94x** |
-| repeatable-read-tx | 1.00x | **0.83x** |
-| update-delete-bulk | **1.00x** | 1.76x |
-| copy-from | 1.00x | **0.86x** |
-| savepoint-rollback | 1.00x | **0.94x** |
-| listen-notify | **1.00x** | 1.58x |
-| large-result-cursor | 1.00x | **0.83x** |
-| cte | 1.00x | **0.89x** |
-| recursive-cte | 1.00x | **0.94x** |
-| window | 1.00x | **0.89x** |
-| union-all | **1.00x** | 1.11x |
-| on-conflict-do-nothing | 1.00x | **0.87x** |
-| insert-returning | 1.00x | **0.98x** |
-| explain | 1.00x | **0.86x** |
-| view-select | **1.00x** | 1.03x |
-| vacuum-analyze | 1.00x | **0.80x** |
-| array-agg | **1.00x** | 1.02x |
-| unnest-array | 1.00x | **0.81x** |
+| multi-statement | 1.00x | **0.94x** |
+| constraint-violation-rollback | 1.00x | **0.93x** |
+| repeatable-read-tx | 1.00x | **0.93x** |
+| update-delete-bulk | 1.00x | **0.85x** |
+| copy-from | **1.00x** | 1.05x |
+| savepoint-rollback | **1.00x** | 1.32x |
+| listen-notify | 1.00x | **0.79x** |
+| large-result-cursor | 1.00x | **0.98x** |
+| cte | 1.00x | **0.99x** |
+| recursive-cte | 1.00x | **0.98x** |
+| window | 1.00x | **0.94x** |
+| union-all | **1.00x** | 1.10x |
+| on-conflict-do-nothing | 1.00x | **0.86x** |
+| insert-returning | **1.00x** | 1.13x |
+| explain | **1.00x** | 1.07x |
+| view-select | 1.00x | **0.96x** |
+| vacuum-analyze | 1.00x | **0.93x** |
+| array-agg | 1.00x | **0.88x** |
+| unnest-array | 1.00x | **0.74x** |
 | like-prefix | 1.00x | **0.92x** |
-| ilike-filter | 1.00x | **0.92x** |
-| regex-filter | 1.00x | **0.90x** |
-| group-having | **1.00x** | 1.06x |
-| full-outer-join | 1.00x | **0.87x** |
-| except | 1.00x | **0.99x** |
-| intersect | **1.00x** | 2.08x |
-| filter-aggregate | 1.00x | **0.86x** |
-| any-array | 1.00x | **0.97x** |
-| limit-offset | **1.00x** | 1.04x |
+| ilike-filter | 1.00x | **0.94x** |
+| regex-filter | **1.00x** | 1.03x |
+| group-having | 1.00x | **0.99x** |
+| full-outer-join | **1.00x** | 1.05x |
+| except | 1.00x | **0.92x** |
+| intersect | 1.00x | **0.98x** |
+| filter-aggregate | 1.00x | **0.93x** |
+| any-array | 1.00x | **0.89x** |
+| limit-offset | **1.00x** | 1.03x |
 
 ## Absolute
 
 | Workload | Client | Median round ms | p95 round ms | ms/op | ops/s |
 |---------:|-------:|-------:|-------:|-------:|-------:|
-| connect | pg | 32.84 | 33.39 | 0.657 | 1,523/s |
-| connect | @yydb/postgres | 23.40 | 23.43 | 0.468 | 2,137/s |
-| insert | pg | 703.58 | 1039.90 | 3.518 | 284/s |
-| insert | @yydb/postgres | 655.18 | 714.38 | 3.276 | 305/s |
-| select-point | pg | 144.01 | 148.05 | 0.288 | 3,472/s |
-| select-point | @yydb/postgres | 110.61 | 118.60 | 0.221 | 4,520/s |
-| simple-point | pg | 115.31 | 123.79 | 0.231 | 4,336/s |
-| simple-point | @yydb/postgres | 101.13 | 103.00 | 0.202 | 4,944/s |
-| select-scan | pg | 9.59 | 10.49 | 0.010 | 104,301/s |
-| select-scan | @yydb/postgres | 10.73 | 11.61 | 0.011 | 93,156/s |
-| prepared-point | pg | 123.39 | 127.14 | 0.247 | 4,052/s |
-| prepared-point | @yydb/postgres | 90.50 | 91.27 | 0.181 | 5,525/s |
-| tx-prepared | pg | 55.46 | 58.16 | 0.277 | 3,606/s |
-| tx-prepared | @yydb/postgres | 38.15 | 41.62 | 0.191 | 5,242/s |
-| point-uk | pg | 133.43 | 135.19 | 0.267 | 3,747/s |
-| point-uk | @yydb/postgres | 131.78 | 135.90 | 0.264 | 3,794/s |
-| order-limit | pg | 22.25 | 34.50 | 0.445 | 2,248/s |
-| order-limit | @yydb/postgres | 19.41 | 20.82 | 0.388 | 2,575/s |
-| group-by | pg | 24.93 | 26.40 | 0.499 | 2,005/s |
-| group-by | @yydb/postgres | 24.97 | 27.28 | 0.499 | 2,002/s |
-| join | pg | 46.00 | 46.46 | 0.920 | 1,087/s |
-| join | @yydb/postgres | 47.15 | 48.68 | 0.943 | 1,060/s |
-| batch-insert | pg | 47.74 | 52.64 | 0.239 | 4,190/s |
-| batch-insert | @yydb/postgres | 50.69 | 52.34 | 0.253 | 3,945/s |
-| batch-insert-params | pg | 46.38 | 46.78 | 0.232 | 4,312/s |
-| batch-insert-params | @yydb/postgres | 46.34 | 48.78 | 0.232 | 4,316/s |
-| distinct | pg | 20.10 | 20.81 | 0.402 | 2,488/s |
-| distinct | @yydb/postgres | 18.98 | 18.99 | 0.380 | 2,634/s |
-| aggregate | pg | 20.40 | 25.14 | 0.408 | 2,451/s |
-| aggregate | @yydb/postgres | 18.53 | 18.88 | 0.371 | 2,699/s |
-| subquery | pg | 56.46 | 59.65 | 1.129 | 886/s |
-| subquery | @yydb/postgres | 52.26 | 55.24 | 1.045 | 957/s |
-| index-range | pg | 65.44 | 69.09 | 0.654 | 1,528/s |
-| index-range | @yydb/postgres | 68.65 | 70.35 | 0.687 | 1,457/s |
-| upsert | pg | 777.93 | 786.29 | 3.890 | 257/s |
-| upsert | @yydb/postgres | 777.72 | 867.28 | 3.889 | 257/s |
-| update | pg | 767.79 | 779.89 | 3.839 | 260/s |
-| update | @yydb/postgres | 779.92 | 843.70 | 3.900 | 256/s |
-| update-returning | pg | 389.87 | 400.33 | 3.899 | 256/s |
-| update-returning | @yydb/postgres | 404.13 | 515.58 | 4.041 | 247/s |
-| delete | pg | 665.07 | 667.68 | 3.325 | 301/s |
-| delete | @yydb/postgres | 689.51 | 701.09 | 3.448 | 290/s |
-| wide-row | pg | 25.84 | 29.17 | 0.258 | 3,870/s |
-| wide-row | @yydb/postgres | 24.03 | 25.84 | 0.240 | 4,161/s |
-| error-constraint | pg | 42.45 | 45.14 | 0.424 | 2,356/s |
-| error-constraint | @yydb/postgres | 37.38 | 41.24 | 0.374 | 2,675/s |
-| error-undefined-table | pg | 31.82 | 38.64 | 0.318 | 3,143/s |
-| error-undefined-table | @yydb/postgres | 31.26 | 32.45 | 0.313 | 3,198/s |
-| aborted-transaction | pg | 47.93 | 49.55 | 0.959 | 1,043/s |
-| aborted-transaction | @yydb/postgres | 40.16 | 46.72 | 0.803 | 1,245/s |
-| rollback | pg | 52.14 | 56.48 | 0.261 | 3,836/s |
-| rollback | @yydb/postgres | 42.10 | 44.76 | 0.211 | 4,750/s |
-| portal-batch-fetch | pg | 35.10 | 38.90 | 0.018 | 56,973/s |
-| portal-batch-fetch | @yydb/postgres | 28.40 | 28.63 | 0.014 | 70,417/s |
-| temp-table | pg | 87.21 | 101.04 | 1.744 | 573/s |
-| temp-table | @yydb/postgres | 84.10 | 84.47 | 1.682 | 594/s |
-| multi-statement | pg | 27.71 | 31.11 | 0.055 | 18,042/s |
-| multi-statement | @yydb/postgres | 27.66 | 29.55 | 0.055 | 18,079/s |
-| constraint-violation-rollback | pg | 64.15 | 75.30 | 0.642 | 1,559/s |
-| constraint-violation-rollback | @yydb/postgres | 60.22 | 64.55 | 0.602 | 1,661/s |
-| repeatable-read-tx | pg | 72.82 | 72.96 | 0.243 | 4,120/s |
-| repeatable-read-tx | @yydb/postgres | 60.45 | 64.41 | 0.201 | 4,963/s |
-| update-delete-bulk | pg | 36.97 | 38.48 | 0.092 | 10,821/s |
-| update-delete-bulk | @yydb/postgres | 65.20 | 69.72 | 0.163 | 6,135/s |
-| copy-from | pg | 219.15 | 220.66 | 0.110 | 9,126/s |
-| copy-from | @yydb/postgres | 188.01 | 214.04 | 0.094 | 10,637/s |
-| savepoint-rollback | pg | 110.05 | 110.14 | 0.688 | 1,454/s |
-| savepoint-rollback | @yydb/postgres | 103.97 | 107.81 | 0.650 | 1,539/s |
-| listen-notify | pg | 13.65 | 22.17 | 0.137 | 7,326/s |
-| listen-notify | @yydb/postgres | 21.58 | 22.48 | 0.216 | 4,635/s |
-| large-result-cursor | pg | 32.15 | 37.32 | 0.016 | 62,217/s |
-| large-result-cursor | @yydb/postgres | 26.68 | 27.19 | 0.013 | 74,963/s |
-| cte | pg | 24.28 | 24.48 | 0.486 | 2,059/s |
-| cte | @yydb/postgres | 21.49 | 21.99 | 0.430 | 2,327/s |
-| recursive-cte | pg | 252.25 | 258.17 | 2.523 | 396/s |
-| recursive-cte | @yydb/postgres | 237.26 | 245.49 | 2.373 | 421/s |
-| window | pg | 31.23 | 31.49 | 0.625 | 1,601/s |
-| window | @yydb/postgres | 27.81 | 28.49 | 0.556 | 1,798/s |
-| union-all | pg | 55.74 | 59.41 | 1.115 | 897/s |
-| union-all | @yydb/postgres | 61.96 | 66.89 | 1.239 | 807/s |
-| on-conflict-do-nothing | pg | 39.39 | 40.79 | 0.197 | 5,077/s |
-| on-conflict-do-nothing | @yydb/postgres | 34.13 | 34.38 | 0.171 | 5,859/s |
-| insert-returning | pg | 397.75 | 422.32 | 3.977 | 251/s |
-| insert-returning | @yydb/postgres | 389.59 | 393.76 | 3.896 | 257/s |
-| explain | pg | 12.46 | 12.72 | 0.249 | 4,013/s |
-| explain | @yydb/postgres | 10.66 | 11.29 | 0.213 | 4,692/s |
-| view-select | pg | 25.37 | 32.14 | 0.507 | 1,971/s |
-| view-select | @yydb/postgres | 26.25 | 26.65 | 0.525 | 1,904/s |
-| vacuum-analyze | pg | 12.35 | 13.10 | 0.123 | 8,100/s |
-| vacuum-analyze | @yydb/postgres | 9.90 | 10.14 | 0.099 | 10,104/s |
-| array-agg | pg | 16.86 | 16.92 | 0.337 | 2,966/s |
-| array-agg | @yydb/postgres | 17.15 | 20.29 | 0.343 | 2,916/s |
-| unnest-array | pg | 16.12 | 16.43 | 0.322 | 3,102/s |
-| unnest-array | @yydb/postgres | 13.03 | 13.30 | 0.261 | 3,836/s |
-| like-prefix | pg | 20.11 | 21.70 | 0.402 | 2,486/s |
-| like-prefix | @yydb/postgres | 18.51 | 18.72 | 0.370 | 2,702/s |
-| ilike-filter | pg | 19.21 | 20.10 | 0.384 | 2,603/s |
-| ilike-filter | @yydb/postgres | 17.73 | 18.46 | 0.355 | 2,821/s |
-| regex-filter | pg | 19.11 | 20.65 | 0.382 | 2,616/s |
-| regex-filter | @yydb/postgres | 17.13 | 20.70 | 0.343 | 2,919/s |
-| group-having | pg | 19.58 | 20.59 | 0.392 | 2,553/s |
-| group-having | @yydb/postgres | 20.70 | 40.79 | 0.414 | 2,415/s |
-| full-outer-join | pg | 27.12 | 28.47 | 0.542 | 1,844/s |
-| full-outer-join | @yydb/postgres | 23.69 | 25.15 | 0.474 | 2,110/s |
-| except | pg | 35.07 | 38.01 | 0.701 | 1,426/s |
-| except | @yydb/postgres | 34.72 | 36.18 | 0.694 | 1,440/s |
-| intersect | pg | 34.81 | 36.01 | 0.696 | 1,436/s |
-| intersect | @yydb/postgres | 72.40 | 74.16 | 1.448 | 691/s |
-| filter-aggregate | pg | 23.37 | 25.74 | 0.467 | 2,139/s |
-| filter-aggregate | @yydb/postgres | 20.07 | 20.92 | 0.401 | 2,492/s |
-| any-array | pg | 56.11 | 56.38 | 1.122 | 891/s |
-| any-array | @yydb/postgres | 54.22 | 56.85 | 1.084 | 922/s |
-| limit-offset | pg | 19.59 | 21.01 | 0.392 | 2,552/s |
-| limit-offset | @yydb/postgres | 20.29 | 20.78 | 0.406 | 2,464/s |
+| connect | pg | 33.52 | 35.65 | 0.670 | 1,491/s |
+| connect | @yydb/postgres | 24.82 | 25.18 | 0.496 | 2,014/s |
+| insert | pg | 909.99 | 1133.58 | 4.550 | 220/s |
+| insert | @yydb/postgres | 724.00 | 825.76 | 3.620 | 276/s |
+| select-point | pg | 149.46 | 150.16 | 0.299 | 3,345/s |
+| select-point | @yydb/postgres | 122.40 | 124.62 | 0.245 | 4,085/s |
+| simple-point | pg | 109.80 | 134.28 | 0.220 | 4,554/s |
+| simple-point | @yydb/postgres | 88.70 | 122.03 | 0.177 | 5,637/s |
+| select-scan | pg | 10.41 | 10.82 | 0.010 | 96,105/s |
+| select-scan | @yydb/postgres | 10.51 | 13.20 | 0.011 | 95,186/s |
+| prepared-point | pg | 124.28 | 139.58 | 0.249 | 4,023/s |
+| prepared-point | @yydb/postgres | 97.25 | 105.50 | 0.194 | 5,142/s |
+| tx-prepared | pg | 61.02 | 61.46 | 0.305 | 3,278/s |
+| tx-prepared | @yydb/postgres | 42.67 | 42.79 | 0.213 | 4,687/s |
+| point-uk | pg | 142.61 | 143.97 | 0.285 | 3,506/s |
+| point-uk | @yydb/postgres | 132.86 | 136.20 | 0.266 | 3,763/s |
+| order-limit | pg | 20.12 | 21.07 | 0.402 | 2,485/s |
+| order-limit | @yydb/postgres | 20.44 | 21.85 | 0.409 | 2,446/s |
+| group-by | pg | 26.47 | 26.68 | 0.529 | 1,889/s |
+| group-by | @yydb/postgres | 27.69 | 28.46 | 0.554 | 1,805/s |
+| join | pg | 47.11 | 49.06 | 0.942 | 1,061/s |
+| join | @yydb/postgres | 48.10 | 48.42 | 0.962 | 1,039/s |
+| batch-insert | pg | 48.40 | 51.38 | 0.242 | 4,132/s |
+| batch-insert | @yydb/postgres | 47.99 | 54.28 | 0.240 | 4,168/s |
+| batch-insert-params | pg | 48.43 | 50.78 | 0.242 | 4,129/s |
+| batch-insert-params | @yydb/postgres | 50.73 | 51.05 | 0.254 | 3,943/s |
+| distinct | pg | 18.34 | 19.32 | 0.367 | 2,727/s |
+| distinct | @yydb/postgres | 18.26 | 18.57 | 0.365 | 2,739/s |
+| aggregate | pg | 22.43 | 23.00 | 0.449 | 2,229/s |
+| aggregate | @yydb/postgres | 20.24 | 21.79 | 0.405 | 2,470/s |
+| subquery | pg | 57.45 | 59.58 | 1.149 | 870/s |
+| subquery | @yydb/postgres | 56.60 | 58.88 | 1.132 | 883/s |
+| index-range | pg | 66.59 | 67.45 | 0.666 | 1,502/s |
+| index-range | @yydb/postgres | 67.68 | 70.54 | 0.677 | 1,478/s |
+| upsert | pg | 761.70 | 1187.11 | 3.808 | 263/s |
+| upsert | @yydb/postgres | 1097.87 | 1947.75 | 5.489 | 182/s |
+| update | pg | 777.64 | 1165.82 | 3.888 | 257/s |
+| update | @yydb/postgres | 757.87 | 767.54 | 3.789 | 264/s |
+| update-returning | pg | 391.06 | 401.73 | 3.911 | 256/s |
+| update-returning | @yydb/postgres | 393.66 | 786.11 | 3.937 | 254/s |
+| delete | pg | 667.73 | 685.70 | 3.339 | 300/s |
+| delete | @yydb/postgres | 707.90 | 731.85 | 3.540 | 283/s |
+| wide-row | pg | 26.59 | 30.73 | 0.266 | 3,760/s |
+| wide-row | @yydb/postgres | 25.13 | 25.43 | 0.251 | 3,980/s |
+| error-constraint | pg | 39.90 | 41.19 | 0.399 | 2,506/s |
+| error-constraint | @yydb/postgres | 36.60 | 37.08 | 0.366 | 2,732/s |
+| error-undefined-table | pg | 32.96 | 34.52 | 0.330 | 3,034/s |
+| error-undefined-table | @yydb/postgres | 29.88 | 31.06 | 0.299 | 3,346/s |
+| aborted-transaction | pg | 42.38 | 43.63 | 0.848 | 1,180/s |
+| aborted-transaction | @yydb/postgres | 36.44 | 38.91 | 0.729 | 1,372/s |
+| rollback | pg | 45.08 | 51.57 | 0.225 | 4,437/s |
+| rollback | @yydb/postgres | 45.77 | 47.02 | 0.229 | 4,370/s |
+| portal-batch-fetch | pg | 33.50 | 35.31 | 0.017 | 59,709/s |
+| portal-batch-fetch | @yydb/postgres | 27.24 | 28.77 | 0.014 | 73,430/s |
+| temp-table | pg | 82.16 | 84.34 | 1.643 | 609/s |
+| temp-table | @yydb/postgres | 79.24 | 79.34 | 1.585 | 631/s |
+| multi-statement | pg | 27.65 | 28.11 | 0.055 | 18,082/s |
+| multi-statement | @yydb/postgres | 26.12 | 28.19 | 0.052 | 19,144/s |
+| constraint-violation-rollback | pg | 59.05 | 69.68 | 0.590 | 1,694/s |
+| constraint-violation-rollback | @yydb/postgres | 54.98 | 55.14 | 0.550 | 1,819/s |
+| repeatable-read-tx | pg | 71.24 | 72.61 | 0.237 | 4,211/s |
+| repeatable-read-tx | @yydb/postgres | 66.04 | 66.31 | 0.220 | 4,542/s |
+| update-delete-bulk | pg | 43.29 | 43.61 | 0.108 | 9,239/s |
+| update-delete-bulk | @yydb/postgres | 36.80 | 40.29 | 0.092 | 10,870/s |
+| copy-from | pg | 190.77 | 192.44 | 0.095 | 10,484/s |
+| copy-from | @yydb/postgres | 199.52 | 205.78 | 0.100 | 10,024/s |
+| savepoint-rollback | pg | 106.21 | 110.46 | 0.664 | 1,506/s |
+| savepoint-rollback | @yydb/postgres | 140.71 | 145.21 | 0.879 | 1,137/s |
+| listen-notify | pg | 14.52 | 14.64 | 0.145 | 6,888/s |
+| listen-notify | @yydb/postgres | 11.41 | 11.70 | 0.114 | 8,767/s |
+| large-result-cursor | pg | 28.14 | 28.38 | 0.014 | 71,061/s |
+| large-result-cursor | @yydb/postgres | 27.50 | 29.00 | 0.014 | 72,718/s |
+| cte | pg | 20.74 | 26.73 | 0.415 | 2,411/s |
+| cte | @yydb/postgres | 20.53 | 23.28 | 0.411 | 2,436/s |
+| recursive-cte | pg | 246.74 | 255.06 | 2.467 | 405/s |
+| recursive-cte | @yydb/postgres | 242.31 | 262.88 | 2.423 | 413/s |
+| window | pg | 29.26 | 29.52 | 0.585 | 1,709/s |
+| window | @yydb/postgres | 27.64 | 27.97 | 0.553 | 1,809/s |
+| union-all | pg | 55.20 | 58.80 | 1.104 | 906/s |
+| union-all | @yydb/postgres | 60.65 | 61.86 | 1.213 | 824/s |
+| on-conflict-do-nothing | pg | 39.58 | 40.11 | 0.198 | 5,053/s |
+| on-conflict-do-nothing | @yydb/postgres | 33.84 | 34.61 | 0.169 | 5,910/s |
+| insert-returning | pg | 401.98 | 404.31 | 4.020 | 249/s |
+| insert-returning | @yydb/postgres | 454.03 | 456.33 | 4.540 | 220/s |
+| explain | pg | 9.82 | 9.99 | 0.196 | 5,093/s |
+| explain | @yydb/postgres | 10.53 | 10.58 | 0.211 | 4,747/s |
+| view-select | pg | 25.35 | 26.93 | 0.507 | 1,973/s |
+| view-select | @yydb/postgres | 24.28 | 26.22 | 0.486 | 2,060/s |
+| vacuum-analyze | pg | 10.48 | 11.95 | 0.105 | 9,545/s |
+| vacuum-analyze | @yydb/postgres | 9.77 | 9.98 | 0.098 | 10,234/s |
+| array-agg | pg | 18.86 | 21.91 | 0.377 | 2,651/s |
+| array-agg | @yydb/postgres | 16.68 | 18.67 | 0.334 | 2,998/s |
+| unnest-array | pg | 18.26 | 19.36 | 0.365 | 2,738/s |
+| unnest-array | @yydb/postgres | 13.46 | 13.70 | 0.269 | 3,715/s |
+| like-prefix | pg | 19.79 | 21.89 | 0.396 | 2,527/s |
+| like-prefix | @yydb/postgres | 18.30 | 18.87 | 0.366 | 2,732/s |
+| ilike-filter | pg | 18.30 | 20.46 | 0.366 | 2,733/s |
+| ilike-filter | @yydb/postgres | 17.27 | 21.14 | 0.345 | 2,896/s |
+| regex-filter | pg | 17.61 | 18.86 | 0.352 | 2,839/s |
+| regex-filter | @yydb/postgres | 18.06 | 18.26 | 0.361 | 2,769/s |
+| group-having | pg | 21.18 | 25.72 | 0.424 | 2,360/s |
+| group-having | @yydb/postgres | 21.03 | 22.07 | 0.421 | 2,377/s |
+| full-outer-join | pg | 21.72 | 23.82 | 0.434 | 2,302/s |
+| full-outer-join | @yydb/postgres | 22.84 | 24.22 | 0.457 | 2,189/s |
+| except | pg | 35.67 | 36.04 | 0.713 | 1,402/s |
+| except | @yydb/postgres | 32.88 | 33.73 | 0.658 | 1,521/s |
+| intersect | pg | 35.63 | 36.75 | 0.713 | 1,403/s |
+| intersect | @yydb/postgres | 34.92 | 39.52 | 0.698 | 1,432/s |
+| filter-aggregate | pg | 19.31 | 19.90 | 0.386 | 2,590/s |
+| filter-aggregate | @yydb/postgres | 17.88 | 18.50 | 0.358 | 2,796/s |
+| any-array | pg | 58.36 | 59.27 | 1.167 | 857/s |
+| any-array | @yydb/postgres | 52.11 | 54.55 | 1.042 | 960/s |
+| limit-offset | pg | 19.32 | 20.73 | 0.386 | 2,588/s |
+| limit-offset | @yydb/postgres | 19.87 | 20.36 | 0.397 | 2,517/s |
 
 An op is one completed connection handshake, one inserted row, one point query, one simple-protocol point query, one scanned row, one prepared execution, one prepared execution inside a transaction, one ordered-limit statement, one grouping statement, one join statement, one batched row, one parameter-bound batched row, one distinct projection, one aggregate projection, one subquery, one indexed range statement, one upsert, one update, one update with `RETURNING`, one delete, one row with a `NULL` or 4 KiB cell, one rejected duplicate-key insert, one rejected undefined-table statement, one aborted-transaction round trip, one rolled-back insert, one row fetched through a suspended portal, one temporary-table cycle, one statement inside a multi-statement message, one rejected insert followed by `ROLLBACK`, one repeatable-read point query, one row touched by a bulk `UPDATE`/`DELETE`, one row imported, one savepoint round-trip statement, one notification delivered, one row fetched from a `DECLARE`/`FETCH` cursor, one full outer join projection, one `EXCEPT` projection, one `INTERSECT` projection, one filtered aggregate, one `ANY(ARRAY[...])` point filter, or one offset-paged statement.
 One warmup round runs before the measured rounds. The table reports median and p95 of 3 measured rounds.
