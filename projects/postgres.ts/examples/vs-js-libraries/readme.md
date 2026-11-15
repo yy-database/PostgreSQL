@@ -114,6 +114,10 @@ Workloads (scenario set aligned with the SQLite repository's `vs-js-libraries`):
   asserting the number of `row-<id>` labels that start with `1`
 - `ilike-filter` — the same filter through `ILIKE` with an upper-case pattern, so the
   assertion only holds when case folding is applied
+- `regex-filter` — the same prefix through the `~` regular-expression operator, keeping
+  the regex path separate from `LIKE`
+- `group-having` — `GROUP BY grp HAVING count(*) >= group size` over the seeded `bench`
+  table, asserting every group survives
 
 Every round starts a fresh child server with a fresh temporary data directory. Table
 creation and seeding are untimed. One warmup round runs before the measured rounds.

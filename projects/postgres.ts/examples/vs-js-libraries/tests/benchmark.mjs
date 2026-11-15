@@ -142,6 +142,8 @@ const ALL_WORKLOADS = [
   "unnest-array",
   "like-prefix",
   "ilike-filter",
+  "regex-filter",
+  "group-having",
 ];
 // `BENCH_ONLY=update,delete` narrows a run to the named workloads.
 const ONLY = (process.env.BENCH_ONLY ?? "").split(",").map((name) => name.trim()).filter((name) => name.length > 0);
@@ -174,6 +176,7 @@ const BENCH_SEEDED = new Set([
   "explain",
   "view-select",
   "vacuum-analyze",
+  "group-having",
 ]);
 
 /** `bench` 的 `val` 由 `bench2RowTuple` 的 `(id * 137) % 997` 决定。 */
@@ -220,6 +223,7 @@ async function runRound(clientSpec, workload) {
         || workload === "array-agg"
         || workload === "like-prefix"
         || workload === "ilike-filter"
+        || workload === "regex-filter"
       ) {
         const seedRows = workload === "insert" ? 0 : workload === "select-scan" ? SCAN_ROWS : ROWS;
         for (let id = 1; id <= seedRows; id += 1) await client.insert(id, `row-${id}`, id);
@@ -623,6 +627,21 @@ async function runRound(clientSpec, workload) {
         for (let index = 0; index < GROUP_OPS; index += 1) {
           const matched = Number(await client.scalar("SELECT count(*) FROM bench_items WHERE label ILIKE 'ROW-1%'"));
           if (matched !== expected) throw new Error(`ilike-filter matched=${matched} expected=${expected}`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "regex-filter") {
+        // `~` 走正则引擎，与 `LIKE` 的前缀快路径分开计量。
+        const expected = expectedLikePrefixRows();
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const matched = Number(await client.scalar("SELECT count(*) FROM bench_items WHERE label ~ '^row-1'"));
+          if (matched !== expected) throw new Error(`regex-filter matched=${matched} expected=${expected}`);
+        }
+        ops = GROUP_OPS;
+      } else if (workload === "group-having") {
+        // `bench` 的 `grp` 每组 `GROUP_SIZE` 行，`HAVING` 恰好保留全部组。
+        for (let index = 0; index < GROUP_OPS; index += 1) {
+          const groups = Number(await client.scalar(`SELECT count(*) FROM (SELECT grp FROM bench GROUP BY grp HAVING count(*) >= ${GROUP_SIZE}) s`));
+          if (groups !== GROUP_COUNT) throw new Error(`group-having groups=${groups} expected=${GROUP_COUNT}`);
         }
         ops = GROUP_OPS;
       } else if (workload === "vacuum-analyze") {
