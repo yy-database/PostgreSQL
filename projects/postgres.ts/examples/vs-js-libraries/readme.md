@@ -77,7 +77,8 @@ Workloads (scenario set aligned with the SQLite repository's `vs-js-libraries`):
   `Execute` batches inside one transaction; `pg` has no `Execute` row limit, so its side
   runs `DECLARE`/`FETCH` over the same statement
 - `temp-table` — `BENCH_TEMP` cycles of `CREATE TEMP TABLE` / 20-row `INSERT` / `SELECT` /
-  `DROP TABLE` on one connection
+  `DROP TABLE` on one connection; temp rows and catalog entries stay session-local, so a
+  temp-only commit writes nothing to the data directory
 - `multi-statement` — `BENCH_MULTI` simple-query messages carrying `BENCH_MULTI_STATEMENTS`
   statements each
 - `constraint-violation-rollback` — `BENCH_CVR` transactions that hit a duplicate-key

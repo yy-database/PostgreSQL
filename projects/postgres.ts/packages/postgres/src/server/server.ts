@@ -2368,7 +2368,8 @@ export function createPostgresAssembly(dataDir: string): PostgresAssembly {
         cachedRelation: (namespace) => committed.cachedRelation?.(namespace),
         rememberRelation: (namespace, rows) => committed.rememberRelation?.(namespace, rows),
         cachedCatalog: (namespace) => committed.cachedCatalog?.(namespace),
-        rememberCatalog: (namespace, doc) => committed.rememberCatalog?.(namespace, doc),
+        cachedCatalogJson: (namespace) => committed.cachedCatalogJson?.(namespace),
+        rememberCatalog: (namespace, doc, json) => committed.rememberCatalog?.(namespace, doc, json),
         commitChanges: (changes) => {
             committed.commitChanges(changes);
             if (!clusterReady || !changes.some((change) => touchesSchema(change.namespace))) return;

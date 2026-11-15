@@ -48,8 +48,15 @@ export interface Storage {
      * 必须在提交写入目录行后丢弃它，否则下一次加载会看到旧的 schema。
      */
     cachedCatalog?(namespace: string): CatalogDoc | undefined;
+    /**
+     * 已提交目录行的原始 JSON。
+     *
+     * 提交时把「去掉会话临时关系后的目录」重新序列化，与这份原文对比：完全一致
+     * 就说明这次 DDL 只碰了临时关系，可以整条跳过目录写入与落盘。
+     */
+    cachedCatalogJson?(namespace: string): string | undefined;
     /** 记下一次目录解码结果；同一版本的后续语句不再重扫、重解析。 */
-    rememberCatalog?(namespace: string, doc: CatalogDoc): void;
+    rememberCatalog?(namespace: string, doc: CatalogDoc, json?: string): void;
 }
 
 export const CATALOG_NAMESPACE = 'pg_catalog';
@@ -145,8 +152,9 @@ export function loadCatalog(storage: Storage): CatalogDoc {
         storage.rememberCatalog?.(CATALOG_NAMESPACE, empty);
         return cloneCatalog(empty);
     }
-    const doc = assertCatalog(JSON.parse(decode(row.value)) as unknown);
-    storage.rememberCatalog?.(CATALOG_NAMESPACE, doc);
+    const json = decode(row.value);
+    const doc = assertCatalog(JSON.parse(json) as unknown);
+    storage.rememberCatalog?.(CATALOG_NAMESPACE, doc, json);
     return cloneCatalog(doc);
 }
 
@@ -174,6 +182,118 @@ export interface SessionRuntime {
     pgListeningChannels?: () => string[];
     /** Session value of `password_encryption`, read when a role password is stored. */
     passwordEncryption?: () => string;
+    /**
+     * Catalog entries of this session's temporary relations.
+     *
+     * 临时关系只属于本会话，落盘没有任何意义：目录提交时把它们剥掉，跨语句再
+     * 合并回来，`CREATE TEMP TABLE` 就只改内存，不重写目录行、不落盘。
+     */
+    tempCatalog?: TempCatalogState;
+}
+
+/** The session-local slice of a catalog document. */
+export interface TempCatalogState {
+    relations: CatalogDoc['relations'];
+    columns: CatalogDoc['columns'];
+    indexes: CatalogDoc['indexes'];
+    constraints: CatalogDoc['constraints'];
+    sequences: CatalogDoc['sequences'];
+    /** Row-id counters of the temporary relations, keyed by relation oid. */
+    nextRowId: Record<string, number>;
+    /** Highest oid counter this session has reached, so temp oids never repeat. */
+    nextOid: number;
+}
+
+/**
+ * Oids of the relations a session must not persist.
+ *
+ * 临时表的内联主键/唯一索引在目录里是独立的 `relkind = 'i'` 关系，它们自己不带
+ * `relpersistence`，只能跟着所属表一起判定；序列同理。
+ */
+function temporaryRelationOids(catalog: CatalogDoc): Set<number> {
+    const oids = new Set<number>();
+    for (const relation of catalog.relations) {
+        if (relation.persistence === 't') oids.add(relation.oid);
+    }
+    if (oids.size === 0) return oids;
+    for (const index of catalog.indexes) {
+        if (oids.has(index.relid)) oids.add(index.oid);
+    }
+    for (const sequence of catalog.sequences) {
+        if (oids.has(sequence.relid)) oids.add(sequence.oid);
+    }
+    return oids;
+}
+
+/** Extracts the session-local slice of a catalog document. */
+function temporaryCatalogState(catalog: CatalogDoc): TempCatalogState | undefined {
+    const temps = temporaryRelationOids(catalog);
+    if (temps.size === 0) return undefined;
+    const nextRowId: Record<string, number> = {};
+    for (const [oid, next] of Object.entries(catalog.nextRowId)) {
+        if (temps.has(Number(oid))) nextRowId[oid] = next;
+    }
+    return {
+        relations: catalog.relations.filter((relation) => temps.has(relation.oid)),
+        columns: catalog.columns.filter((column) => temps.has(column.relid)),
+        indexes: catalog.indexes.filter((index) => temps.has(index.relid)),
+        constraints: catalog.constraints.filter((constraint) => temps.has(constraint.relid)),
+        sequences: catalog.sequences.filter((sequence) => temps.has(sequence.relid)),
+        nextRowId,
+        nextOid: catalog.nextOid,
+    };
+}
+
+/** Adds this session's temporary relations back onto a durable catalog. */
+function mergeTemporaryCatalog(catalog: CatalogDoc, temp: TempCatalogState): void {
+    catalog.relations.push(...temp.relations.map((relation) => ({ ...relation })));
+    catalog.columns.push(...temp.columns.map((column) => ({ ...column })));
+    catalog.indexes.push(
+        ...temp.indexes.map((index) => ({
+            ...index,
+            indkey: [...index.indkey],
+            ...(index.keys === undefined ? {} : { keys: index.keys.map((key) => ({ ...key })) }),
+        })),
+    );
+    catalog.constraints.push(...temp.constraints.map((constraint) => ({ ...constraint, conkey: [...constraint.conkey], confkey: [...constraint.confkey] })));
+    catalog.sequences.push(...temp.sequences.map((sequence) => ({ ...sequence })));
+    for (const [oid, next] of Object.entries(temp.nextRowId)) catalog.nextRowId[oid] = next;
+    catalog.nextOid = Math.max(catalog.nextOid, temp.nextOid);
+}
+
+/**
+ * The durable projection of a catalog document.
+ *
+ * Temporary relations and everything they own are dropped, and the oid counter
+ * is held at the highest oid any persisted entry uses: a session that only
+ * created temp tables must serialize back to exactly the committed JSON, so
+ * [`Database.commit`] can skip the write entirely.
+ */
+function durableCatalog(catalog: CatalogDoc, committedNextOid: number): CatalogDoc {
+    const temps = temporaryRelationOids(catalog);
+    const nextRowId: Record<string, number> = {};
+    for (const [oid, next] of Object.entries(catalog.nextRowId)) {
+        if (!temps.has(Number(oid))) nextRowId[oid] = next;
+    }
+    const projected: CatalogDoc = {
+        ...catalog,
+        relations: temps.size === 0 ? catalog.relations : catalog.relations.filter((relation) => !temps.has(relation.oid)),
+        columns: temps.size === 0 ? catalog.columns : catalog.columns.filter((column) => !temps.has(column.relid)),
+        indexes: temps.size === 0 ? catalog.indexes : catalog.indexes.filter((index) => !temps.has(index.relid)),
+        constraints: temps.size === 0 ? catalog.constraints : catalog.constraints.filter((constraint) => !temps.has(constraint.relid)),
+        sequences: temps.size === 0 ? catalog.sequences : catalog.sequences.filter((sequence) => !temps.has(sequence.relid)),
+        nextRowId,
+    };
+    // 计数器只由持久条目决定：临时关系分到的 oid 不能推高它，否则每次临时 DDL
+    // 都会改写目录行。持久条目都带着自己的 oid，`max + 1` 天然覆盖新分配。
+    let highest = committedNextOid;
+    for (const relation of projected.relations) highest = Math.max(highest, relation.oid + 1);
+    for (const index of projected.indexes) highest = Math.max(highest, index.oid + 1);
+    for (const constraint of projected.constraints) highest = Math.max(highest, constraint.oid + 1);
+    for (const sequence of projected.sequences) highest = Math.max(highest, sequence.oid + 1);
+    for (const view of projected.views) highest = Math.max(highest, view.oid + 1);
+    projected.nextOid = highest;
+    return projected;
 }
 
 export function createSessionRuntime(user = 'postgres', database = 'postgres'): SessionRuntime {
@@ -208,6 +328,10 @@ export class Database {
     /** Index access paths the executor really consumed in the current statement. */
     readonly scanStats: IndexScanStat[] = [];
     private catalogDirty = false;
+    /** 已提交目录行的原文，用来判断这次目录改动是否只是会话临时关系。 */
+    private committedCatalogJson: string | undefined;
+    /** 已提交目录的 oid 计数器，剥掉临时关系后不能低于它。 */
+    private committedNextOid = 0;
     private rolesDirty = false;
     private clusterDirty = false;
     /** `pg_roles` working copy; shared with the cluster directory until a write clones it. */
@@ -285,6 +409,9 @@ export class Database {
 
     static open(storage: Storage, cluster: ClusterStore, session: SessionRuntime = createSessionRuntime()): Database {
         const catalog = loadCatalog(storage);
+        // 持久目录里没有临时关系，跨语句靠会话那一份补回来。
+        const committedNextOid = catalog.nextOid;
+        if (session.tempCatalog !== undefined) mergeTemporaryCatalog(catalog, session.tempCatalog);
         // `nextval` survives statement rollback and separate sessions, so the
         // journal below is authoritative whenever it is ahead of the catalog.
         // 没有序列时该命名空间必然为空，省掉一次原生扫描。
@@ -296,7 +423,10 @@ export class Database {
                 if (sequence && Number.isFinite(value) && value > sequence.lastValue) sequence.lastValue = value;
             }
         }
-        return new Database(storage, catalog, session, cluster);
+        const database = new Database(storage, catalog, session, cluster);
+        database.committedNextOid = committedNextOid;
+        database.committedCatalogJson = storage.cachedCatalogJson?.(CATALOG_NAMESPACE);
+        return database;
     }
 
     /** Copies the working set for `SAVEPOINT`/`ROLLBACK TO`; shares row arrays. */
@@ -314,6 +444,8 @@ export class Database {
         for (const [relOid, next] of this.rowIdCounters) copy.rowIdCounters.set(relOid, next);
         for (const [relOid, next] of this.rowIdWrites) copy.rowIdWrites.set(relOid, next);
         copy.catalogDirty = this.catalogDirty;
+        copy.committedCatalogJson = this.committedCatalogJson;
+        copy.committedNextOid = this.committedNextOid;
         copy.rolesDirty = this.rolesDirty;
         copy.clusterDirty = this.clusterDirty;
         return copy;
@@ -587,6 +719,8 @@ export class Database {
         this.rowIdWrites.clear();
         for (const [relOid, next] of other.rowIdWrites) this.rowIdWrites.set(relOid, next);
         this.catalogDirty = other.catalogDirty;
+        this.committedCatalogJson = other.committedCatalogJson;
+        this.committedNextOid = other.committedNextOid;
         this.rolesDirty = other.rolesDirty;
         this.clusterDirty = other.clusterDirty;
         // Sequences are not transactional: a statement that fails still burns
@@ -653,12 +787,20 @@ export class Database {
             });
         }
         if (this.catalogDirty) {
-            changes.push({
-                kind: 'put',
-                namespace: CATALOG_NAMESPACE,
-                key: encode(CATALOG_KEY),
-                value: encode(JSON.stringify(this.catalog)),
-            });
+            // 临时关系只是本会话的，持久目录里永远看不到它们：剥掉之后如果与上次
+            // 提交的原文一致，这条目录写入连同落盘一起省掉。
+            const durable = durableCatalog(this.catalog, this.committedNextOid);
+            const json = JSON.stringify(durable);
+            if (json !== this.committedCatalogJson) {
+                changes.push({
+                    kind: 'put',
+                    namespace: CATALOG_NAMESPACE,
+                    key: encode(CATALOG_KEY),
+                    value: encode(json),
+                });
+                this.committedCatalogJson = json;
+            }
+            this.session.tempCatalog = temporaryCatalogState(this.catalog);
         }
         if (this.rolesDirty) this.cluster.doc.roles = this.roles;
         if (this.clusterDirty) {

@@ -151,6 +151,8 @@ export function storageFor(store: ServerStore): Storage {
      * 所以命中率接近 100%；`loadCatalog` 每次只复制一份可变快照。
      */
     const catalogCache = new Map<string, CatalogDoc>();
+    /** 目录行的原始 JSON，用来判断一次提交是否真的改变了目录内容。 */
+    const catalogJsonCache = new Map<string, string>();
 
     function shardId(db: string, relOid: number): string {
         const key = `${db}\u0000${relOid}`;
@@ -289,8 +291,13 @@ export function storageFor(store: ServerStore): Storage {
         cachedCatalog(namespace: string): CatalogDoc | undefined {
             return catalogCache.get(namespace);
         },
-        rememberCatalog(namespace: string, doc: CatalogDoc): void {
+        cachedCatalogJson(namespace: string): string | undefined {
+            return catalogJsonCache.get(namespace);
+        },
+        rememberCatalog(namespace: string, doc: CatalogDoc, json?: string): void {
             catalogCache.set(namespace, doc);
+            if (json === undefined) catalogJsonCache.delete(namespace);
+            else catalogJsonCache.set(namespace, json);
         },
         commitChanges(changes: StoredChange[]): void {
             // 提交会改变已提交状态，先失效缓存再接写入，避免中途失败留下旧值。
@@ -299,6 +306,7 @@ export function storageFor(store: ServerStore): Storage {
                 // 目录提交（DDL 与序列高水位）会让已解析的文档过期；事务回滚不
                 // 经过这里，缓存里的那份始终是最后一次提交的状态。
                 catalogCache.delete(change.namespace);
+                catalogJsonCache.delete(change.namespace);
             }
             const native: ServerStoreChange[] = changes.map((change) => ({
                 kind: change.kind,
@@ -414,8 +422,11 @@ export function scopedStorage(storage: Storage, prefix: string): Storage {
         cachedCatalog(namespace: string): CatalogDoc | undefined {
             return storage.cachedCatalog?.(scopeNamespace(prefix, namespace));
         },
-        rememberCatalog(namespace: string, doc: CatalogDoc): void {
-            storage.rememberCatalog?.(scopeNamespace(prefix, namespace), doc);
+        cachedCatalogJson(namespace: string): string | undefined {
+            return storage.cachedCatalogJson?.(scopeNamespace(prefix, namespace));
+        },
+        rememberCatalog(namespace: string, doc: CatalogDoc, json?: string): void {
+            storage.rememberCatalog?.(scopeNamespace(prefix, namespace), doc, json);
         },
     };
 }
@@ -485,8 +496,11 @@ export function volatileStorage(storage: Storage, isVolatile: (namespace: string
         cachedCatalog(namespace) {
             return storage.cachedCatalog?.(namespace);
         },
-        rememberCatalog(namespace, doc) {
-            storage.rememberCatalog?.(namespace, doc);
+        cachedCatalogJson(namespace) {
+            return storage.cachedCatalogJson?.(namespace);
+        },
+        rememberCatalog(namespace, doc, json) {
+            storage.rememberCatalog?.(namespace, doc, json);
         },
     };
 }
