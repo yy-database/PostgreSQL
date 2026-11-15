@@ -178,6 +178,12 @@ interface Context {
     /** Precomputed window-function values, indexed by output row. */
     windowValues?: Map<FunctionExpr, SqlValue[]>;
     windowIndex?: number;
+    /**
+     * Set on the outer context handed to a subquery while it is being probed for
+     * correlation: any column that resolves past the subquery's own scope flips
+     * `usedOuter`, so the result may only be cached when it stays `false`.
+     */
+    trace?: { usedOuter: boolean };
 }
 
 interface Scope {
@@ -222,6 +228,8 @@ function emptyTagName(statement: Statement): string {
 
 /** Runs one already-parsed statement against the message's working set. */
 export function runStatement(database: Database, statement: Statement, params: SqlValue[]): Outcome {
+    // 每条语句重新开始：同一 `Database` 上一条语句缓存的结果不能跨语句复用。
+    subqueryResultCache.delete(database);
     switch (statement.kind) {
         case 'select': {
             const result = executeSelect(database, statement, params, undefined);
@@ -1703,7 +1711,7 @@ function evaluate(database: Database, expr: Expr, context: Context, params: SqlV
             let matched = false;
             let sawNull = false;
             const candidates = node.select
-                ? executeSelect(database, node.select, params, context).rows.map((row) => row[0] ?? null)
+                ? subqueryRows(database, node.select, params, context).map((row) => row[0] ?? null)
                 : node.list.map((item) => evaluate(database, item, context, params));
             for (const candidate of candidates) {
                 if (candidate === null) sawNull = true;
@@ -1731,14 +1739,12 @@ function evaluate(database: Database, expr: Expr, context: Context, params: SqlV
         case 'case':
             return evaluateCase(database, expr as CaseExpr, context, params);
         case 'subquery': {
-            const result = executeSelect(database, (expr as SubqueryExpr).select, params, context);
-            if (result.rows.length > 1) throw new ServerError('21000', 'more than one row returned by a subquery used as an expression');
-            return result.rows[0]?.[0] ?? null;
+            const rows = subqueryRows(database, (expr as SubqueryExpr).select, params, context);
+            if (rows.length > 1) throw new ServerError('21000', 'more than one row returned by a subquery used as an expression');
+            return rows[0]?.[0] ?? null;
         }
-        case 'exists': {
-            const result = executeSelect(database, (expr as { select: SelectStatement }).select, params, context);
-            return result.rows.length > 0;
-        }
+        case 'exists':
+            return subqueryRows(database, (expr as { select: SelectStatement }).select, params, context).length > 0;
         case 'collate':
             return evaluate(database, (expr as { expr: Expr }).expr, context, params);
         case 'array':
@@ -1757,13 +1763,53 @@ function lookup(database: Database, context: Context, qualifier: string | undefi
     let current: Context | undefined = context;
     while (current) {
         const index = resolveColumnIndex(current.columns, qualifier, name, start);
-        if (index !== undefined) return current.row[index] ?? null;
+        if (index !== undefined) {
+            if (current !== context) markOuterRead(context, current);
+            return current.row[index] ?? null;
+        }
         if (qualifier !== undefined && current.columns.some((column) => matchesAlias(column, qualifier))) {
             throw new ServerError('42703', `column ${qualifier}.${name} does not exist`, undefined, start);
         }
         current = current.outer;
     }
     throw new ServerError('42703', `column "${name}" does not exist`, undefined, start);
+}
+
+/**
+ * Uncached subquery results per statement.
+ *
+ * `IN (SELECT ...)`, `EXISTS (...)` and scalar subqueries were re-executed for
+ * every outer row, so an uncorrelated `IN` over 200 rows ran the same scan 200
+ * times. The first evaluation probes whether the body resolved any column past
+ * its own scope; when it did not, the rows are reused for the rest of the
+ * statement. The map is dropped at the start of every statement, so parameters,
+ * uncommitted writes and snapshot-visible changes are never served stale.
+ */
+const subqueryResultCache = new WeakMap<Database, Map<SelectStatement, SqlValue[][]>>();
+
+function subqueryRows(database: Database, select: SelectStatement, params: SqlValue[], context: Context): SqlValue[][] {
+    let cache = subqueryResultCache.get(database);
+    if (cache === undefined) {
+        cache = new Map();
+        subqueryResultCache.set(database, cache);
+    }
+    const cached = cache.get(select);
+    if (cached !== undefined) return cached;
+    const trace = { usedOuter: false };
+    const traced: Context = { columns: context.columns, row: context.row, outer: context.outer, trace };
+    const rows = executeSelect(database, select, params, traced).rows;
+    if (!trace.usedOuter) cache.set(select, rows);
+    return rows;
+}
+
+/** Marks every traced context between `from` and `found`, so the probe sees the outer read. */
+function markOuterRead(from: Context, found: Context): void {
+    let current: Context | undefined = from;
+    while (current) {
+        if (current.trace !== undefined) current.trace.usedOuter = true;
+        if (current === found) return;
+        current = current.outer;
+    }
 }
 
 /**
