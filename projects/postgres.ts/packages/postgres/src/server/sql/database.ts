@@ -244,8 +244,20 @@ function temporaryCatalogState(catalog: CatalogDoc): TempCatalogState | undefine
     };
 }
 
-/** Adds this session's temporary relations back onto a durable catalog. */
-function mergeTemporaryCatalog(catalog: CatalogDoc, temp: TempCatalogState): void {
+/**
+ * Adds this session's temporary relations back onto a durable catalog.
+ *
+ * 返回 `false` 表示有临时关系的 oid 已被另一个会话提交的持久关系占用：临时关系
+ * 的 oid 只在会话内唯一，另一会话的持久 DDL 可能正好落在同一号段。这时宁可丢掉
+ * 会话的临时关系（后续语句报「不存在」），也不能让两本目录共用 oid——那会把别的
+ * 会话的持久表当成临时表、把它的行搬进会话内存。
+ */
+function mergeTemporaryCatalog(catalog: CatalogDoc, temp: TempCatalogState): boolean {
+    const used = new Set<number>();
+    for (const relation of catalog.relations) used.add(relation.oid);
+    for (const index of catalog.indexes) used.add(index.oid);
+    for (const sequence of catalog.sequences) used.add(sequence.oid);
+    if (temp.relations.some((relation) => used.has(relation.oid))) return false;
     catalog.relations.push(...temp.relations.map((relation) => ({ ...relation })));
     catalog.columns.push(...temp.columns.map((column) => ({ ...column })));
     catalog.indexes.push(
@@ -259,6 +271,7 @@ function mergeTemporaryCatalog(catalog: CatalogDoc, temp: TempCatalogState): voi
     catalog.sequences.push(...temp.sequences.map((sequence) => ({ ...sequence })));
     for (const [oid, next] of Object.entries(temp.nextRowId)) catalog.nextRowId[oid] = next;
     catalog.nextOid = Math.max(catalog.nextOid, temp.nextOid);
+    return true;
 }
 
 /**
@@ -411,7 +424,9 @@ export class Database {
         const catalog = loadCatalog(storage);
         // 持久目录里没有临时关系，跨语句靠会话那一份补回来。
         const committedNextOid = catalog.nextOid;
-        if (session.tempCatalog !== undefined) mergeTemporaryCatalog(catalog, session.tempCatalog);
+        if (session.tempCatalog !== undefined && !mergeTemporaryCatalog(catalog, session.tempCatalog)) {
+            session.tempCatalog = undefined;
+        }
         // `nextval` survives statement rollback and separate sessions, so the
         // journal below is authoritative whenever it is ahead of the catalog.
         // 没有序列时该命名空间必然为空，省掉一次原生扫描。
@@ -510,7 +525,15 @@ export class Database {
      * never call it: their working copy is the snapshot.
      */
     refreshCommitted(): void {
-        if (!this.catalogDirty) this.catalog = loadCatalog(this.storage);
+        if (!this.catalogDirty) {
+            this.catalog = loadCatalog(this.storage);
+            this.committedNextOid = this.catalog.nextOid;
+            this.committedCatalogJson = this.storage.cachedCatalogJson?.(CATALOG_NAMESPACE);
+            // 持久目录里没有本会话的临时关系，重新读已提交状态后必须再叠回去。
+            if (this.session.tempCatalog !== undefined && !mergeTemporaryCatalog(this.catalog, this.session.tempCatalog)) {
+                this.session.tempCatalog = undefined;
+            }
+        }
         if (!this.rolesDirty) {
             this.rolesValue = this.cluster.doc.roles;
             this.rolesShared = true;
