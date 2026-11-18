@@ -8,6 +8,7 @@
 
 use std::{
     collections::BTreeMap,
+    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
@@ -19,12 +20,13 @@ use database::harness::{
     evaluate, per_op_ms, render_json, summarize,
 };
 use database_client::pgsql::{
-    Notification, ServerChange as CoreServerChange, ServerRow as CoreServerRow, ServerStore as CoreServerStore, Store as CoreStore,
+    Notification, ServerChange as CoreServerChange, ServerRow as CoreServerRow, Store as CoreStore,
     client::{ClientConfig, Column, Connection as CoreConnection, Param as PostgresParam, QueryResult},
     error::{MessageField, Notice, PostgresError},
     psql::{PsqlOptions, format_results, parse_arguments},
 };
 use database_protocol_pgsql as protocol;
+use postgres::{Listener, PostgreSQL, PostgreSQLOptions, PostgreSQLStorage, instance::ServerInstance};
 
 /// Where to connect and which identity to present.
 #[napi(object)]
@@ -1009,157 +1011,23 @@ pub struct ServerStoreRow {
     pub value: Buffer,
 }
 
-/// Whether a process with this id is still running, the way PostgreSQL checks
-/// `postmaster.pid` before refusing a data directory.
-///
-/// Windows opens the process with `PROCESS_QUERY_LIMITED_INFORMATION` and
-/// treats `STILL_ACTIVE` as alive; Unix sends signal `0`, where success or
-/// `EPERM` both mean the process exists. PID reuse is accepted exactly as
-/// PostgreSQL accepts it: a recycled id keeps the lock owned.
-#[cfg(windows)]
-fn process_exists(pid: u32) -> bool {
-    use std::ffi::c_void;
-
-    type Dword = u32;
-    type Handle = *mut c_void;
-    const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x1000;
-    const STILL_ACTIVE: Dword = 259;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn OpenProcess(desired_access: Dword, inherit_handle: i32, process_id: Dword) -> Handle;
-        fn GetExitCodeProcess(process: Handle, exit_code: *mut Dword) -> i32;
-        fn CloseHandle(object: Handle) -> i32;
-    }
-
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return false;
-        }
-        let mut code: Dword = 0;
-        let queried = GetExitCodeProcess(handle, &mut code) != 0;
-        CloseHandle(handle);
-        queried && code == STILL_ACTIVE
-    }
-}
-
-#[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
-    const EPERM: i32 = 1;
-
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    #[cfg(target_os = "macos")]
-    unsafe extern "C" {
-        fn __error() -> *mut i32;
-    }
-    #[cfg(not(target_os = "macos"))]
-    unsafe extern "C" {
-        fn __errno_location() -> *mut i32;
-    }
-
-    let Ok(pid) = i32::try_from(pid)
-    else {
-        return false;
-    };
-    unsafe {
-        if kill(pid, 0) == 0 {
-            return true;
-        }
-        #[cfg(target_os = "macos")]
-        let errno_ptr = __error();
-        #[cfg(not(target_os = "macos"))]
-        let errno_ptr = __errno_location();
-        *errno_ptr == EPERM
-    }
-}
-
-#[cfg(not(any(windows, unix)))]
-fn process_exists(_pid: u32) -> bool {
-    true
-}
-
-/// Drops a `postmaster.pid` whose recorded process is gone, so the next
-/// `ServerStore::open` takes the directory instead of asking the operator to
-/// delete the file. A live holder, an unreadable file or an unparseable first
-/// line all leave the lock in place and let the open fail as before.
-fn clear_stale_lock(data_dir: &str) {
-    let lock = std::path::Path::new(data_dir).join(database_client::pgsql::postmaster::LOCK_FILE);
-    let Ok(bytes) = std::fs::read(&lock)
-    else {
-        return;
-    };
-    let text = String::from_utf8_lossy(&bytes);
-    let Some(first) = text.lines().next()
-    else {
-        return;
-    };
-    let Ok(pid) = first.trim().parse::<u32>()
-    else {
-        return;
-    };
-    if process_exists(pid) {
-        return;
-    }
-    let _ = std::fs::remove_file(&lock);
-}
-
 /// One durable server data directory: `.yyds` catalog, `.yykv` shard and lock.
 ///
-/// The primary handle owns the data directory itself: `local-0.yyds`, the shard
-/// its catalog registers and `postmaster.pid`. Table-group shards live under
-/// `shards/<shard-id>/`, each one a self-contained single-shard directory with
-/// its own catalog, shard and lock, so committing one group re-encodes only
-/// that group's bytes. Every lock a handle took is released by [`Self::close`].
+/// The layout, the `postmaster.pid` policy and the `shards/<shard-id>/`
+/// table-group directories are owned by `postgres::instance` upstream. This
+/// class only maps the napi DTOs onto that handle.
 #[napi]
 pub struct ServerStore {
-    inner: Mutex<Option<StoreSet>>,
+    inner: Mutex<Option<ServerInstance>>,
 }
 
-/// The primary store plus every table-group shard handle opened so far.
-struct StoreSet {
-    primary: CoreServerStore,
-    shards: BTreeMap<String, CoreServerStore>,
-}
-
-fn with_server_store<T>(inner: &Mutex<Option<StoreSet>>, run: impl FnOnce(&mut CoreServerStore) -> Result<T>) -> Result<T> {
+fn with_instance<T>(
+    inner: &Mutex<Option<ServerInstance>>,
+    run: impl FnOnce(&mut ServerInstance) -> std::result::Result<T, PostgresError>,
+) -> Result<T> {
     let mut guard = inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-    let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-    run(&mut set.primary)
-}
-
-/// A shard id becomes a directory name under `shards/`, so it stays inside the
-/// lowercase alphanumeric range a single path segment can hold: no separators,
-/// no `..`, no NUL, nothing that could escape the shard root.
-fn validate_shard_id(shard_id: &str) -> Result<()> {
-    let usable = shard_id.starts_with("local-")
-        && shard_id.len() <= 128
-        && shard_id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if usable { Ok(()) } else { Err(Error::from_reason(format!("shard id {shard_id:?} is unusable as a directory name"))) }
-}
-
-fn shard_directory(data_dir: &str, shard_id: &str) -> std::path::PathBuf {
-    std::path::Path::new(data_dir).join("shards").join(shard_id)
-}
-
-/// The file names one shard directory can ever hold, as written by
-/// `ServerStore::open` with the default catalog registration. Orphan cleanup
-/// deletes exactly these and nothing else, so an unexpected file keeps its
-/// directory in place instead of vanishing.
-const SHARD_DIRECTORY_FILES: [&str; 5] =
-    ["local-0.yyds", "local-0.yykv", "postmaster.pid", "local-0.yyds.tmp", "local-0.yykv.tmp"];
-
-/// Opens `shards/<shard-id>/` on demand and keeps the handle warm.
-fn ensure_shard<'a>(set: &'a mut StoreSet, shard_id: &str) -> Result<&'a mut CoreServerStore> {
-    if set.shards.contains_key(shard_id) {
-        return Ok(set.shards.get_mut(shard_id).expect("checked above"));
-    }
-    let directory = shard_directory(&set.primary.data_dir(), shard_id);
-    clear_stale_lock(&directory.display().to_string());
-    let store = CoreServerStore::open(&directory).map_err(native)?;
-    Ok(set.shards.entry(shard_id.to_owned()).or_insert(store))
+    let instance = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
+    run(instance).map_err(native)
 }
 
 /// Maps one batch of napi changes onto the core commit enum.
@@ -1199,10 +1067,7 @@ impl ServerStore {
     /// `postmaster.pid` whose holder process is gone.
     #[napi(constructor)]
     pub fn new(data_dir: String) -> Result<Self> {
-        clear_stale_lock(&data_dir);
-        CoreServerStore::open(&data_dir)
-            .map(|primary| Self { inner: Mutex::new(Some(StoreSet { primary, shards: BTreeMap::new() })) })
-            .map_err(native)
+        ServerInstance::open(&data_dir).map(|instance| Self { inner: Mutex::new(Some(instance)) }).map_err(native)
     }
 
     /// Ordered prefix scan inside one namespace.
@@ -1215,8 +1080,8 @@ impl ServerStore {
         before: Option<Buffer>,
         limit: u32,
     ) -> Result<Vec<ServerStoreRow>> {
-        with_server_store(&self.inner, |store| {
-            store.scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize).map_err(native)
+        with_instance(&self.inner, |instance| {
+            instance.scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize)
         })
         .map(|rows| {
             rows.into_iter().map(|row| ServerStoreRow { key: Buffer::from(row.key), value: Buffer::from(row.value) }).collect()
@@ -1239,8 +1104,8 @@ impl ServerStore {
         before: Option<Buffer>,
         limit: u32,
     ) -> Result<Buffer> {
-        let rows = with_server_store(&self.inner, |store| {
-            store.scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize).map_err(native)
+        let rows = with_instance(&self.inner, |instance| {
+            instance.scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize)
         })?;
         Ok(flat_rows(rows))
     }
@@ -1249,98 +1114,45 @@ impl ServerStore {
     #[napi]
     pub fn commit_changes(&self, changes: Vec<ServerStoreChange>) -> Result<()> {
         let batch = to_core_changes(changes)?;
-        with_server_store(&self.inner, |store| store.commit_changes(batch).map_err(native))
+        with_instance(&self.inner, |instance| instance.commit_changes(batch))
     }
 
     /// Opens `shards/<shard-id>/` as a table-group shard and keeps it warm.
     /// The directory is created when it does not exist yet.
     #[napi]
     pub fn open_shard(&self, shard_id: String) -> Result<()> {
-        validate_shard_id(&shard_id)?;
-        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-        ensure_shard(set, &shard_id).map(|_| ())
+        with_instance(&self.inner, |instance| instance.open_shard(&shard_id))
     }
 
     /// Releases one shard's directory lock, keeping its files.
     #[napi]
     pub fn close_shard(&self, shard_id: String) -> Result<()> {
-        validate_shard_id(&shard_id)?;
-        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-        if let Some(store) = set.shards.remove(&shard_id) {
-            store.close().map_err(native)?;
-        }
-        Ok(())
+        with_instance(&self.inner, |instance| instance.close_shard(&shard_id))
     }
 
-    /// Closes one shard and removes its directory.
-    ///
-    /// Only the known single-shard file names are deleted and the directory is
-    /// dropped when it is left empty; a directory holding anything else keeps
-    /// its contents in place. Used by the open-time orphan sweep.
+    /// Closes one shard and removes its directory, known file names only.
     #[napi]
     pub fn drop_shard(&self, shard_id: String) -> Result<()> {
-        validate_shard_id(&shard_id)?;
-        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-        let directory = shard_directory(&set.primary.data_dir(), &shard_id);
-        if let Some(store) = set.shards.remove(&shard_id) {
-            store.close().map_err(native)?;
-        }
-        for name in SHARD_DIRECTORY_FILES {
-            let _ = std::fs::remove_file(directory.join(name));
-        }
-        match std::fs::remove_dir(&directory) {
-            Ok(()) => {}
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => {}
-            Err(error) => return Err(Error::from_reason(format!("cannot remove {}: {error}", directory.display()))),
-        }
-        Ok(())
+        with_instance(&self.inner, |instance| instance.drop_shard(&shard_id))
     }
 
     /// Shard ids whose directory exists under `shards/`, sorted.
     #[napi]
     pub fn list_shards(&self) -> Result<Vec<String>> {
-        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-        let root = std::path::Path::new(&set.primary.data_dir()).join("shards");
-        let mut ids = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                let Some(name) = entry.file_name().to_str().map(str::to_owned)
-                else {
-                    continue;
-                };
-                if validate_shard_id(&name).is_ok() {
-                    ids.push(name);
-                }
-            }
-        }
-        ids.sort();
-        Ok(ids)
+        with_instance(&self.inner, |instance| instance.list_shards())
     }
 
     /// Whether `shards/<shard-id>/` exists. A missing shard directory reads as
     /// an empty group, so scans never create files on disk.
     #[napi]
     pub fn shard_exists(&self, shard_id: String) -> Result<bool> {
-        validate_shard_id(&shard_id)?;
-        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-        Ok(shard_directory(&set.primary.data_dir(), &shard_id).exists())
+        with_instance(&self.inner, |instance| instance.shard_exists(&shard_id))
     }
 
     /// Absolute shard directory, the single source of truth for the layout.
     #[napi]
     pub fn shard_dir(&self, shard_id: String) -> Result<String> {
-        validate_shard_id(&shard_id)?;
-        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-        Ok(shard_directory(&set.primary.data_dir(), &shard_id).display().to_string())
+        with_instance(&self.inner, |instance| instance.shard_dir(&shard_id))
     }
 
     /// Flat transfer form of a scan inside one table-group shard.
@@ -1358,15 +1170,9 @@ impl ServerStore {
         before: Option<Buffer>,
         limit: u32,
     ) -> Result<Buffer> {
-        validate_shard_id(&shard_id)?;
-        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-        if !set.shards.contains_key(&shard_id) && !shard_directory(&set.primary.data_dir(), &shard_id).exists() {
-            return Ok(flat_rows(Vec::new()));
-        }
-        let rows = ensure_shard(set, &shard_id)?
-            .scan(&namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize)
-            .map_err(native)?;
+        let rows = with_instance(&self.inner, |instance| {
+            instance.scan_shard(&shard_id, &namespace, prefix.as_ref(), after.as_deref(), before.as_deref(), limit as usize)
+        })?;
         Ok(flat_rows(rows))
     }
 
@@ -1374,32 +1180,18 @@ impl ServerStore {
     /// table-group shard, opening the shard on demand.
     #[napi]
     pub fn commit_shard(&self, shard_id: String, changes: Vec<ServerStoreChange>) -> Result<()> {
-        validate_shard_id(&shard_id)?;
         let batch = to_core_changes(changes)?;
-        let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        let set = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;
-        ensure_shard(set, &shard_id)?.commit_changes(batch).map_err(native)
+        with_instance(&self.inner, |instance| instance.commit_shard(&shard_id, batch))
     }
 
     /// Releases the directory lock, the shard locks included.
     #[napi]
     pub fn close(&self) -> Result<()> {
         let mut guard = self.inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
-        if let Some(mut set) = guard.take() {
-            let mut failure = None;
-            for (_, store) in std::mem::take(&mut set.shards) {
-                if let Err(error) = store.close() {
-                    failure.get_or_insert_with(|| native(error));
-                }
-            }
-            if let Err(error) = set.primary.close() {
-                failure.get_or_insert_with(|| native(error));
-            }
-            if let Some(error) = failure {
-                return Err(error);
-            }
+        match guard.take() {
+            Some(instance) => instance.close().map_err(native),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Whether every commit survives process exit, on every open handle.
@@ -1408,36 +1200,129 @@ impl ServerStore {
         self.inner
             .lock()
             .ok()
-            .and_then(|guard| {
-                guard.as_ref().map(|set| {
-                    set.primary.durable_atomic_commit() && set.shards.values().all(CoreServerStore::durable_atomic_commit)
-                })
-            })
+            .and_then(|guard| guard.as_ref().map(ServerInstance::durable_atomic_commit))
             .unwrap_or(false)
     }
 
     /// Data directory.
     #[napi]
     pub fn data_dir(&self) -> Result<String> {
-        with_server_store(&self.inner, |store| Ok(store.data_dir()))
+        with_instance(&self.inner, |instance| Ok(instance.data_dir()))
     }
 
     /// `.yykv` shard path.
     #[napi]
     pub fn shard_path(&self) -> Result<String> {
-        with_server_store(&self.inner, |store| Ok(store.shard_path()))
+        with_instance(&self.inner, |instance| Ok(instance.shard_path()))
     }
 
     /// `.yyds` catalog path.
     #[napi]
     pub fn catalog_path(&self) -> Result<String> {
-        with_server_store(&self.inner, |store| Ok(store.catalog_path()))
+        with_instance(&self.inner, |instance| Ok(instance.catalog_path()))
     }
 
     /// `postmaster.pid` lock path.
     #[napi]
     pub fn lock_path(&self) -> Result<String> {
-        with_server_store(&self.inner, |store| Ok(store.lock_path()))
+        with_instance(&self.inner, |instance| Ok(instance.lock_path()))
+    }
+}
+
+/// Options for opening one local engine over a data directory.
+#[napi(object)]
+pub struct LocalEngineOptions {
+    /// Directory that owns `local-0.yyds`, `local-0.yykv` and `postmaster.pid`.
+    pub data_dir: String,
+    /// Database this engine reports. Defaults to `postgres`.
+    pub database: Option<String>,
+}
+
+/// Address of one live protocol-v3 listener.
+#[napi(object)]
+pub struct ListenerInfo {
+    /// Handle for `closeListener`.
+    pub id: u32,
+    pub host: String,
+    pub port: u16,
+}
+
+/// One local PostgreSQL engine: data directory, SQL runtime and wire listeners.
+///
+/// The engine and the protocol-v3 gateway are owned by the `postgres` facade.
+/// This class only opens it, hands out listener addresses and maps failures, so
+/// no SQL execution or directory policy lives on this side.
+#[napi]
+pub struct LocalEngine {
+    state: Mutex<EngineState>,
+}
+
+struct EngineState {
+    engine: Option<PostgreSQL>,
+    listeners: BTreeMap<u32, Listener>,
+    next_listener: u32,
+}
+
+fn engine_error(error: postgres::Error) -> Error {
+    Error::from_reason(error.to_string())
+}
+
+#[napi]
+impl LocalEngine {
+    /// Opens (creating when absent) the data directory and takes its lock.
+    #[napi(constructor)]
+    pub fn new(options: LocalEngineOptions) -> Result<Self> {
+        let engine = PostgreSQL::open(PostgreSQLOptions {
+            storage: PostgreSQLStorage { directory: std::path::PathBuf::from(&options.data_dir) },
+            database: options.database.unwrap_or_else(|| "postgres".to_owned()),
+        })
+        .map_err(engine_error)?;
+        Ok(Self { state: Mutex::new(EngineState { engine: Some(engine), listeners: BTreeMap::new(), next_listener: 0 }) })
+    }
+
+    /// Starts one listener on `host:port` (`port` 0 picks a free port) and
+    /// returns the address the operating system bound.
+    #[napi]
+    pub fn listen(&self, host: String, port: u16) -> Result<ListenerInfo> {
+        let address = format!("{host}:{port}").parse::<SocketAddr>().map_err(|error| Error::from_reason(format!("invalid listen address: {error}")))?;
+        let mut state = self.state.lock().map_err(|_| Error::from_reason("engine lock poisoned"))?;
+        let engine = state.engine.as_ref().ok_or_else(|| Error::from_reason("engine is closed"))?;
+        let listener = engine.listen(address).map_err(engine_error)?;
+        let endpoint = listener.endpoint();
+        let id = state.next_listener;
+        state.next_listener += 1;
+        state.listeners.insert(id, listener);
+        Ok(ListenerInfo { id, host: endpoint.ip().to_string(), port: endpoint.port() })
+    }
+
+    /// Stops one listener. The engine stays open.
+    #[napi]
+    pub fn close_listener(&self, id: u32) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| Error::from_reason("engine lock poisoned"))?;
+        if let Some(listener) = state.listeners.remove(&id) {
+            listener.close();
+        }
+        Ok(())
+    }
+
+    /// Absolute data directory.
+    #[napi]
+    pub fn data_dir(&self) -> Result<String> {
+        let state = self.state.lock().map_err(|_| Error::from_reason("engine lock poisoned"))?;
+        state.engine.as_ref().ok_or_else(|| Error::from_reason("engine is closed"))?.data_dir().map_err(engine_error)
+    }
+
+    /// Stops every listener and releases the directory lock.
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| Error::from_reason("engine lock poisoned"))?;
+        for (_, listener) in std::mem::take(&mut state.listeners) {
+            listener.close();
+        }
+        match state.engine.take() {
+            Some(engine) => engine.close().map_err(engine_error),
+            None => Ok(()),
+        }
     }
 }
 
