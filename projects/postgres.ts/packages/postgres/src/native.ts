@@ -294,6 +294,16 @@ export interface ListenerInfo {
     port: number;
 }
 
+/** Authentication one listener requires before a statement runs. */
+export interface ListenAuthInfo {
+    /** `trust`, `password`, `md5` or `scram-sha-256`. */
+    method: 'trust' | 'password' | 'md5' | 'scram-sha-256';
+    /** Role the client must connect as. Defaults to `postgres`. */
+    user?: string;
+    /** Expected password. Required for every method except `trust`. */
+    password?: string;
+}
+
 /**
  * One local engine: data directory, SQL runtime and wire listeners.
  *
@@ -301,7 +311,7 @@ export interface ListenerInfo {
  * parsing, planning or execution happens on this side.
  */
 export interface LocalEngine {
-    listen(host: string, port: number): ListenerInfo;
+    listen(host: string, port: number, auth?: ListenAuthInfo): ListenerInfo;
     /** Stops one listener. The engine stays open. */
     closeListener(id: number): void;
     dataDir(): string;

@@ -1239,6 +1239,39 @@ pub struct LocalEngineOptions {
     pub database: Option<String>,
 }
 
+/// Authentication one listener requires before a statement runs.
+#[napi(object)]
+pub struct ListenAuth {
+    /// `trust`, `password`, `md5` or `scram-sha-256`.
+    pub method: String,
+    /// Role the client must connect as. Defaults to `postgres`.
+    pub user: Option<String>,
+    /// Expected password. Ignored for `trust` and required otherwise.
+    pub password: Option<String>,
+}
+
+impl ListenAuth {
+    fn into_authentication(self) -> Result<postgres::Authentication> {
+        let user = self.user.unwrap_or_else(|| "postgres".to_owned());
+        match self.method.to_ascii_lowercase().as_str() {
+            "trust" => Ok(postgres::Authentication::Trust),
+            "password" | "md5" | "scram-sha-256" => {
+                let Some(password) = self.password else {
+                    return Err(Error::from_reason(format!("auth method `{}` requires a password", self.method)));
+                };
+                Ok(match self.method.to_ascii_lowercase().as_str() {
+                    "password" => postgres::Authentication::Password { user, password },
+                    "md5" => postgres::Authentication::Md5 { user, password },
+                    _ => postgres::Authentication::ScramSha256 { user, password },
+                })
+            }
+            other => Err(Error::from_reason(format!(
+                "unsupported authentication method `{other}`, use trust, password, md5 or scram-sha-256"
+            ))),
+        }
+    }
+}
+
 /// Address of one live protocol-v3 listener.
 #[napi(object)]
 pub struct ListenerInfo {
@@ -1282,13 +1315,18 @@ impl LocalEngine {
     }
 
     /// Starts one listener on `host:port` (`port` 0 picks a free port) and
-    /// returns the address the operating system bound.
+    /// returns the address the operating system bound. `auth` defaults to
+    /// `trust`, which is what a loopback client without a password expects.
     #[napi]
-    pub fn listen(&self, host: String, port: u16) -> Result<ListenerInfo> {
+    pub fn listen(&self, host: String, port: u16, auth: Option<ListenAuth>) -> Result<ListenerInfo> {
         let address = format!("{host}:{port}").parse::<SocketAddr>().map_err(|error| Error::from_reason(format!("invalid listen address: {error}")))?;
+        let authentication = match auth {
+            Some(auth) => auth.into_authentication()?,
+            None => postgres::Authentication::Trust,
+        };
         let mut state = self.state.lock().map_err(|_| Error::from_reason("engine lock poisoned"))?;
         let engine = state.engine.as_ref().ok_or_else(|| Error::from_reason("engine is closed"))?;
-        let listener = engine.listen(address).map_err(engine_error)?;
+        let listener = engine.listen_with(address, authentication).map_err(engine_error)?;
         let endpoint = listener.endpoint();
         let id = state.next_listener;
         state.next_listener += 1;

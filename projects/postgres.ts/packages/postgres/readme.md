@@ -11,10 +11,10 @@ opens the native `LocalEngine`, which is the `postgres` facade: it locks
 serves protocol-v3 clients. This package only validates options and maps the
 resulting failures into the family envelope.
 
-Server authentication and remote binds are not implemented natively yet.
-`startPostgresServer` rejects them with a `native_capability_missing` failure
-carrying `postgres.server.authentication` or `postgres.server.remote_bind`
-instead of falling back to a local verifier.
+`startPostgresServer` accepts `auth` as `'trust'` or a password method
+(`'password'`, `'md5'`, `'scram-sha-256'`) with a password and an optional role.
+Remote binds stay unimplemented: a non-loopback `host` fails with
+`native_capability_missing` carrying `postgres.server.remote_bind`.
 
 Row data is durable in `.yykv` and the schema is durable in `schema.json`. The
 facade keeps the registry on disk, so a reopened data directory starts with the
@@ -22,10 +22,10 @@ tables it had. `PostgreSQL#execute()` runs parameterless statements as simple
 queries, which is the path `CREATE`/`ALTER`/`BEGIN` take.
 
 The gateway implements prepared statements, cursors, `EXPLAIN`, `COPY ... FROM
-STDIN`, `LISTEN`/`NOTIFY`, `GENERATED ... AS IDENTITY`, `ALTER TABLE ... ADD
-CONSTRAINT` and the `::` cast operator. It still refuses `CREATE
-DATABASE`/`CREATE ROLE`/`GRANT`, `CREATE TEMP TABLE` and `GENERATED ... AS
-(expression) STORED`.
+STDIN`, `LISTEN`/`NOTIFY`, `GENERATED ... AS IDENTITY`, `GENERATED ... AS
+(expression) STORED`, `ALTER TABLE ... ADD CONSTRAINT`, `CREATE TEMP TABLE`,
+`CREATE DATABASE`/`CREATE ROLE`/`GRANT`/`REVOKE`, `statement_timeout`, `E'...'`
+literals and the `::` cast operator.
 
 The package owns no wire code of its own. `loadNative()` resolves the platform
 binding, `query()` opens and closes one connection around a single statement,

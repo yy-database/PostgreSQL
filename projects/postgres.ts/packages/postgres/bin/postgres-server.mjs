@@ -2,6 +2,8 @@
 import { startPostgresServer } from '../dist/server/server.js';
 
 const options = { port: 5432, host: '127.0.0.1', user: 'postgres', database: 'postgres', auth: 'trust' };
+let authMethod = 'trust';
+let password;
 let stopOnStdinClose = false;
 for (let index = 2; index < process.argv.length; index += 1) {
     const flag = process.argv[index];
@@ -10,12 +12,23 @@ for (let index = 2; index < process.argv.length; index += 1) {
     else if (flag === '--port' && value) options.port = Number(value);
     else if (flag === '--user' && value) options.user = value;
     else if (flag === '--database' && value) options.database = value;
-    else if (flag === '--password' && value) options.auth = { password: value };
-    else if (flag === '--auth' && value === 'scram') options.auth = { scram: true };
+    else if (flag === '--auth' && value) authMethod = value;
+    else if (flag === '--password' && value) password = value;
     else if (flag === '--data-dir' && value) options.dataDir = value;
     else if (flag === '--stop-on-stdin-close') stopOnStdinClose = true;
     else continue;
     index += 1;
+}
+if (authMethod !== 'trust') {
+    if (!['password', 'md5', 'scram-sha-256'].includes(authMethod)) {
+        console.error(`postgres-server: unknown auth "${authMethod}", use trust, password, md5 or scram-sha-256`);
+        process.exit(2);
+    }
+    if (!password) {
+        console.error(`postgres-server: auth "${authMethod}" requires --password`);
+        process.exit(2);
+    }
+    options.auth = { method: authMethod, password, user: options.user };
 }
 
 let server;
@@ -25,7 +38,7 @@ try {
     console.error(`postgres-server: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
 }
-const authMode = options.auth === 'trust' ? 'trust' : 'scram' in options.auth ? 'scram' : 'password';
+const authMode = options.auth === 'trust' ? 'trust' : options.auth.method;
 console.log(`listening on ${server.host}:${server.port} (auth ${authMode}, data ${server.dataDir})`);
 
 for (const signal of ['SIGINT', 'SIGTERM']) {

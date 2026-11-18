@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import { loadNative, type ListenerInfo, type LocalEngine } from './native.ts';
 import type { ServerAuth } from './server/server.ts';
-import { isLoopbackHost } from './server/server.ts';
+import { isLoopbackHost, toListenAuth } from './server/server.ts';
 import { PostgreSQLError, nativeCapabilityMissing, stateFailure, transportFailure } from './errors.ts';
 import { resolveLocalOptions, type PostgreSQLListenOptions, type PostgreSQLOptions, type PostgreSQLQueryOptions, type PostgreSQLTransactionOptions } from './options.ts';
 import {
@@ -111,21 +111,15 @@ export class PostgreSQL {
             });
         }
         const auth: ServerAuth = options.authentication ?? 'trust';
-        if (auth !== 'trust') {
-            throw nativeCapabilityMissing(
-                'postgres.server.authentication',
-                'the native gateway has no authentication primitive, pass authentication "trust" or terminate authentication ahead of the engine',
-            );
-        }
         if (!isLoopbackHost(host)) {
             throw nativeCapabilityMissing(
                 'postgres.server.remote_bind',
-                'the native gateway accepts loopback listeners only until authentication and TLS land upstream',
+                'the native gateway accepts loopback listeners only until remote binds land upstream',
             );
         }
         let bound: ListenerInfo;
         try {
-            bound = engine.listen(host, port);
+            bound = engine.listen(host, port, toListenAuth(auth));
         } catch (error) {
             throw transportFailure(error, 'open');
         }

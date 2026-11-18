@@ -11,17 +11,28 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { loadNative } from '../native.ts';
+import { loadNative, type ListenAuthInfo } from '../native.ts';
 import { nativeCapabilityMissing, transportFailure } from '../errors.ts';
 
 /**
  * Authentication the server offers.
  *
- * Only `trust` is available: the native gateway has no authentication or TLS
- * primitive yet, so a password or SCRAM request fails with
- * `native_capability_missing` instead of falling back to a local verifier.
+ * `trust` accepts any loopback client. The password methods make the gateway
+ * verify the presented password with the protocol exchange named by the method
+ * (`password`, `md5` or `scram-sha-256`), so a client that sends the wrong
+ * password fails with `28P01`. The object form names the role the client must
+ * connect as; it defaults to `postgres`.
  */
-export type ServerAuth = 'trust' | { password: string } | { scram: true };
+export type ServerAuth =
+    | 'trust'
+    | 'password'
+    | 'md5'
+    | 'scram-sha-256'
+    | {
+          method: 'password' | 'md5' | 'scram-sha-256';
+          password: string;
+          user?: string;
+      };
 
 export interface PostgresServerOptions {
     /** Address to listen on. Defaults to `127.0.0.1`. Loopback only. */
@@ -55,20 +66,32 @@ export function isLoopbackHost(host: string): boolean {
     return host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
 }
 
+/**
+ * Normalizes the author-facing `auth` option for the native listener.
+ *
+ * A password method without a password is a caller mistake, so it fails here
+ * instead of starting a listener no client could ever authenticate against.
+ */
+export function toListenAuth(auth: ServerAuth): ListenAuthInfo {
+    if (auth === 'trust') return { method: 'trust' };
+    if (auth === 'password' || auth === 'md5' || auth === 'scram-sha-256') {
+        throw new TypeError(`auth "${auth}" requires a password: pass { method: "${auth}", password }`);
+    }
+    if (!auth.password) {
+        throw new TypeError(`auth "${auth.method}" requires a non-empty password`);
+    }
+    return { method: auth.method, password: auth.password, user: auth.user };
+}
+
 /** Starts a protocol-v3 server that accepts real `psql` and `pg` clients. */
 export async function startPostgresServer(options: PostgresServerOptions = {}): Promise<PostgresServerHandle> {
     const auth = options.auth ?? 'trust';
-    if (auth !== 'trust') {
-        throw nativeCapabilityMissing(
-            'postgres.server.authentication',
-            'the native gateway has no authentication primitive, pass auth "trust" or terminate authentication ahead of the engine',
-        );
-    }
+    const authInfo = toListenAuth(auth);
     const host = options.host ?? '127.0.0.1';
     if (!isLoopbackHost(host)) {
         throw nativeCapabilityMissing(
             'postgres.server.remote_bind',
-            'the native gateway accepts loopback listeners only until authentication and TLS land upstream',
+            'the native gateway accepts loopback listeners only until remote binds land upstream',
         );
     }
 
@@ -84,7 +107,7 @@ export async function startPostgresServer(options: PostgresServerOptions = {}): 
     }
 
     try {
-        const listener = engine.listen(host, options.port ?? 0);
+        const listener = engine.listen(host, options.port ?? 0, authInfo);
         return {
             host: listener.host,
             port: listener.port,
