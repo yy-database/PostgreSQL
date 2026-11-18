@@ -125,3 +125,20 @@ export function configurationFailure(message: string): PostgreSQLError {
 export function stateFailure(message: string): PostgreSQLError {
     return new PostgreSQLError({ code: '08003', message, phase: 'execute', execution: 'not-sent', retry: 'never' });
 }
+
+/**
+ * A capability the native binding does not implement yet.
+ *
+ * The failure is explicit and carries the missing `capability` so a caller can
+ * decide what to do. No degraded local implementation stands behind it.
+ */
+export function nativeCapabilityMissing(capability: string, message: string): PostgreSQLError {
+    return new PostgreSQLError({
+        code: 'native_capability_missing',
+        message,
+        phase: 'configuration',
+        execution: 'not-sent',
+        retry: 'never',
+        detail: capability,
+    });
+}

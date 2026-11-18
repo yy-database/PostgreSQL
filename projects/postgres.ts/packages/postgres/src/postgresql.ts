@@ -3,11 +3,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Worker } from 'node:worker_threads';
 
-import { loadNative } from './native.ts';
-import type { PostgresServerOptions, ServerAuth } from './server/server.ts';
-import { PostgreSQLError, stateFailure, transportFailure } from './errors.ts';
+import { loadNative, type ListenerInfo, type LocalEngine } from './native.ts';
+import type { ServerAuth } from './server/server.ts';
+import { isLoopbackHost } from './server/server.ts';
+import { PostgreSQLError, nativeCapabilityMissing, stateFailure, transportFailure } from './errors.ts';
 import { resolveLocalOptions, type PostgreSQLListenOptions, type PostgreSQLOptions, type PostgreSQLQueryOptions, type PostgreSQLTransactionOptions } from './options.ts';
 import {
     PostgreSQLOperations,
@@ -28,78 +28,11 @@ export interface PostgreSQLListener {
     close(): Promise<void>;
 }
 
-/** One request awaiting its worker reply. */
-interface PendingRequest {
-    resolve: (value: { host: string; port: number }) => void;
-    reject: (error: unknown) => void;
-}
-
-/**
- * Controls the engine assembly on its worker thread. The synchronous native
- * client blocks the main thread, so the engine's protocol loop must live on
- * another thread; this handle owns that thread and its endpoints.
- */
-class EngineWorker {
-    private readonly worker: Worker;
-    private readonly pending = new Map<number, PendingRequest>();
-    private nextId = 1;
-    private dead: Error | null = null;
-
-    constructor() {
-        this.worker = new Worker(new URL('./engine-worker.js', import.meta.url));
-        this.worker.on('message', (reply: { id: number; ok: boolean; host?: string; port?: number; message?: string }) => {
-            const waiter = this.pending.get(reply.id);
-            if (waiter === undefined) return;
-            this.pending.delete(reply.id);
-            if (reply.ok) waiter.resolve({ host: reply.host ?? '127.0.0.1', port: reply.port ?? 0 });
-            else waiter.reject(new Error(reply.message ?? 'the engine worker refused the request'));
-        });
-        this.worker.on('error', (error) => {
-            this.dead = error;
-            for (const waiter of this.pending.values()) waiter.reject(error);
-            this.pending.clear();
-        });
-    }
-
-    open(dataDir: string, options: PostgresServerOptions): Promise<{ host: string; port: number }> {
-        return this.request({ op: 'open', dataDir, options });
-    }
-
-    serve(key: string, options: PostgresServerOptions): Promise<{ host: string; port: number }> {
-        return this.request({ op: 'serve', key, options });
-    }
-
-    closeEndpoint(key: string): Promise<void> {
-        return this.request({ op: 'closeEndpoint', key }).then(() => undefined);
-    }
-
-    /** Releases the assembly and its lock, then ends the thread. */
-    async close(): Promise<void> {
-        if (this.dead === null) {
-            try {
-                await this.request({ op: 'close' });
-            } catch {
-                // A dead worker cannot release anything; termination still runs.
-            }
-        }
-        await this.worker.terminate();
-    }
-
-    private request(payload: Record<string, unknown>): Promise<{ host: string; port: number }> {
-        if (this.dead !== null) return Promise.reject(this.dead);
-        const id = (this.nextId += 1);
-        return new Promise((resolve, reject) => {
-            this.pending.set(id, { resolve, reject });
-            this.worker.postMessage({ id, ...payload });
-        });
-    }
-}
-
 /**
  * A local PostgreSQL-semantics engine. Construction validates options only;
- * `open` locks the storage directory and starts the engine on its own thread.
- * Queries drive the engine through the protocol primitives of the platform
- * binding, exactly as a remote client would.
+ * `open` locks the storage directory and brings the native engine up. Queries
+ * drive the engine through the protocol primitives of the platform binding,
+ * exactly as a remote client would.
  */
 export class PostgreSQL {
     private readonly config: { dataDir: string | undefined; database: string; user: string };
@@ -107,11 +40,10 @@ export class PostgreSQL {
     private stateValue: LocalState = 'new';
     private opening: Promise<void> | null = null;
     private closing: Promise<void> | null = null;
-    private engine: EngineWorker | null = null;
+    private engine: LocalEngine | null = null;
     private internalPort = 0;
     private operations: PostgreSQLOperations | null = null;
-    private listeners = new Map<string, { host: string; port: number; key: string }>();
-    private listenerCounter = 0;
+    private listeners = new Map<number, ListenerInfo>();
     private dataDir: string | null = null;
 
     constructor(options: PostgreSQLOptions = {}) {
@@ -179,22 +111,31 @@ export class PostgreSQL {
             });
         }
         const auth: ServerAuth = options.authentication ?? 'trust';
-        const key = `listener-${(this.listenerCounter += 1)}`;
-        let bound: { host: string; port: number };
+        if (auth !== 'trust') {
+            throw nativeCapabilityMissing(
+                'postgres.server.authentication',
+                'the native gateway has no authentication primitive, pass authentication "trust" or terminate authentication ahead of the engine',
+            );
+        }
+        if (!isLoopbackHost(host)) {
+            throw nativeCapabilityMissing(
+                'postgres.server.remote_bind',
+                'the native gateway accepts loopback listeners only until authentication and TLS land upstream',
+            );
+        }
+        let bound: ListenerInfo;
         try {
-            bound = await engine.serve(key, { host, port, auth, user: this.config.user, database: this.config.database });
+            bound = engine.listen(host, port);
         } catch (error) {
             throw transportFailure(error, 'open');
         }
-        const record = { host: bound.host, port: bound.port, key };
-        this.listeners.set(key, record);
+        this.listeners.set(bound.id, bound);
         return {
             endpoint: { host: bound.host, port: bound.port },
             close: async () => {
-                if (!this.listeners.has(key)) return;
-                this.listeners.delete(key);
-                if (this.engine === null) return;
-                await this.engine.closeEndpoint(key);
+                if (!this.listeners.has(bound.id)) return;
+                this.listeners.delete(bound.id);
+                this.engine?.closeListener(bound.id);
             },
         };
     }
@@ -218,25 +159,26 @@ export class PostgreSQL {
     private async doOpen(): Promise<void> {
         const dataDir = this.config.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-engine-'));
         this.dataDir = dataDir;
-        const engine = new EngineWorker();
+        const native = loadNative();
+        let engine: LocalEngine;
+        try {
+            engine = new native.LocalEngine({ dataDir, database: this.config.database });
+        } catch (error) {
+            if (this.ephemeral) fs.rmSync(dataDir, { recursive: true, force: true });
+            throw transportFailure(error, 'open');
+        }
         this.engine = engine;
         try {
-            const internal = await engine.open(dataDir, {
-                host: '127.0.0.1',
-                port: 0,
-                auth: 'trust',
-                user: this.config.user,
-                database: this.config.database,
-            });
+            const internal = engine.listen('127.0.0.1', 0);
             this.internalPort = internal.port;
         } catch (error) {
-            await engine.close();
+            engine.close();
             this.engine = null;
             if (this.ephemeral) fs.rmSync(dataDir, { recursive: true, force: true });
             throw transportFailure(error, 'open');
         }
         this.operations = new PostgreSQLOperations(
-            loadNative(),
+            native,
             { host: '127.0.0.1', port: this.internalPort, user: this.config.user, database: this.config.database },
             undefined,
         );
@@ -256,7 +198,7 @@ export class PostgreSQL {
         this.listeners = new Map();
         if (this.engine !== null) {
             try {
-                await this.engine.close();
+                this.engine.close();
             } catch (error) {
                 failures.push(error);
             }
@@ -274,7 +216,7 @@ export class PostgreSQL {
         return this.operations;
     }
 
-    private engineForCall(): EngineWorker {
+    private engineForCall(): LocalEngine {
         if (this.stateValue !== 'open' || this.engine === null) {
             throw stateFailure(`listen requires an open engine (state "${this.stateValue}")`);
         }

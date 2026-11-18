@@ -2,6 +2,7 @@
 
 import type {
     Connection,
+    ExecutionReport,
     ParamInfo,
     PostgresNative,
     PreparedStatement as NativePreparedStatement,
@@ -388,6 +389,7 @@ class PinnedSession implements PostgreSQLSession {
     }
 
     async execute(sql: string, params?: readonly PostgreSQLValue[]): Promise<PostgreSQLCommandResult> {
+        if (params === undefined || params.length === 0) return parseTag(this.runSimple(sql, 'execute').results[0]?.tag ?? '');
         return toCommandResult(this.run(sql, params, 'execute'));
     }
 
@@ -417,13 +419,13 @@ class PinnedSession implements PostgreSQLSession {
             }
             return this.savepoint(fn);
         }
-        this.run(beginStatement(options), [], 'execute');
+        this.runSimple(beginStatement(options), 'execute');
         this.inTransaction = true;
         const tx = new TransactionView(this);
         try {
             const result = await fn(tx);
             tx.assertOpen();
-            this.run('COMMIT', [], 'commit');
+            this.runSimple('COMMIT', 'commit');
             return result;
         } catch (error) {
             this.rollbackQuietly();
@@ -445,6 +447,26 @@ class PinnedSession implements PostgreSQLSession {
             throw this.wrap(error);
         }
         if (report.error !== undefined && report.error !== null) throw serverFailure(report.error, phase);
+        return report;
+    }
+
+    /**
+     * Runs one parameterless statement through the simple-query path.
+     *
+     * DDL and utility statements (`CREATE`, `ALTER`, `BEGIN`, `SET`, …) only exist on
+     * that path: the extended-protocol binding accepts `SELECT`/`INSERT`/`UPDATE`/
+     * `DELETE` alone. Every parameterised statement keeps the extended path so its
+     * column type OIDs survive.
+     */
+    private runSimple(sql: string, phase: DatabasePhase): ExecutionReport {
+        this.assertActive();
+        let report: ExecutionReport;
+        try {
+            report = this.connection().executeReport(sql);
+        } catch (error) {
+            throw this.wrap(error);
+        }
+        if (report.error) throw serverFailure(report.error, phase);
         return report;
     }
 
@@ -470,7 +492,7 @@ class PinnedSession implements PostgreSQLSession {
      * `Sync`, so a batched cursor runs inside one transaction for its lifetime.
      */
     beginCursorTransaction(): void {
-        if (this.openCursors === 0) this.run('BEGIN', [], 'execute');
+        if (this.openCursors === 0) this.runSimple('BEGIN', 'execute');
         this.openCursors += 1;
     }
 
@@ -479,7 +501,7 @@ class PinnedSession implements PostgreSQLSession {
         this.openCursors -= 1;
         if (this.openCursors === 0) {
             try {
-                this.run('ROLLBACK', [], 'execute');
+                this.runSimple('ROLLBACK', 'execute');
             } catch {
                 // The portal's own failure outranks the goodbye.
             }
@@ -501,16 +523,16 @@ class PinnedSession implements PostgreSQLSession {
 
     private async savepoint<T>(fn: (tx: PostgreSQLTransaction) => Promise<T>): Promise<T> {
         const name = `pgts_sp_${(handleCounter += 1)}`;
-        this.run(`SAVEPOINT ${name}`, [], 'execute');
+        this.runSimple(`SAVEPOINT ${name}`, 'execute');
         const tx = new TransactionView(this);
         try {
             const result = await fn(tx);
             tx.assertOpen();
-            this.run(`RELEASE SAVEPOINT ${name}`, [], 'commit');
+            this.runSimple(`RELEASE SAVEPOINT ${name}`, 'commit');
             return result;
         } catch (error) {
             try {
-                this.run(`ROLLBACK TO SAVEPOINT ${name}`, [], 'commit');
+                this.runSimple(`ROLLBACK TO SAVEPOINT ${name}`, 'commit');
             } catch {
                 // The caller's original failure is the one worth seeing.
             }
@@ -523,7 +545,7 @@ class PinnedSession implements PostgreSQLSession {
     private rollbackQuietly(): void {
         if (this.broken) return;
         try {
-            this.run('ROLLBACK', [], 'commit');
+            this.runSimple('ROLLBACK', 'commit');
         } catch {
             this.broken = true;
         }

@@ -279,6 +279,36 @@ export interface ServerStore {
     lockPath(): string;
 }
 
+/** Options for opening one local engine over a data directory. */
+export interface LocalEngineOptions {
+    dataDir: string;
+    /** Database this engine reports. Defaults to `postgres`. */
+    database?: string;
+}
+
+/** Address of one live protocol-v3 listener. */
+export interface ListenerInfo {
+    /** Handle for `closeListener`. */
+    id: number;
+    host: string;
+    port: number;
+}
+
+/**
+ * One local engine: data directory, SQL runtime and wire listeners.
+ *
+ * The engine and the protocol-v3 gateway live in the native binding, so no SQL
+ * parsing, planning or execution happens on this side.
+ */
+export interface LocalEngine {
+    listen(host: string, port: number): ListenerInfo;
+    /** Stops one listener. The engine stays open. */
+    closeListener(id: number): void;
+    dataDir(): string;
+    /** Stops every listener and releases the directory lock. */
+    close(): void;
+}
+
 /** Effective `psql` options, as normalized by the binding. */
 export interface CommandOptions extends ClientOptions {
     sql: string;
@@ -349,6 +379,7 @@ export interface PostgresNative {
     harnessBenchPerOp(stats: BenchStats, ops: number): number;
     Store: new (dataDir: string) => Store;
     ServerStore: new (dataDir: string) => ServerStore;
+    LocalEngine: new (options: LocalEngineOptions) => LocalEngine;
 }
 
 /** Map Node platform/arch to the optionalDependency package suffix. */
