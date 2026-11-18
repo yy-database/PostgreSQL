@@ -1067,46 +1067,97 @@ def fnv1a(data):
     return value
 
 
+def _read_record(data, offset):
+    namespace_length = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    namespace = data[offset : offset + namespace_length].decode("utf-8")
+    offset += namespace_length
+    key_length = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    key = data[offset : offset + key_length].decode("utf-8")
+    offset += key_length
+    revision = struct.unpack_from("<Q", data, offset)[0]
+    offset += 8
+    deadline = struct.unpack_from("<Q", data, offset)[0]
+    offset += 8
+    tag = data[offset]
+    offset += 1
+    value_length = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    value = data[offset : offset + value_length].decode("utf-8")
+    offset += value_length
+    return (
+        {"namespace": namespace, "key": key, "value": value, "revision": revision, "deadline": deadline, "tag": tag},
+        offset,
+    )
+
+
+def _read_key(data, offset):
+    namespace_length = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    namespace = data[offset : offset + namespace_length].decode("utf-8")
+    offset += namespace_length
+    key_length = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+    key = data[offset : offset + key_length].decode("utf-8")
+    offset += key_length
+    return (namespace, key), offset
+
+
 def parse_shard(path):
+    """Decodes `magic | base length | base checksum | base body | delta frames`."""
     with open(path, "rb") as handle:
         data = handle.read()
-    if data[:5] != b"YYKV\x03":
+    if data[:5] != b"YYKV\x04":
         raise AssertionError("bad shard magic")
-    checksum = struct.unpack_from("<Q", data, 5)[0]
-    body = data[13:]
-    if fnv1a(body) != checksum:
+    base_length = struct.unpack_from("<Q", data, 5)[0]
+    body_start = 21
+    if body_start + base_length > len(data):
+        raise AssertionError("truncated shard base")
+    base = data[body_start : body_start + base_length]
+    if fnv1a(base) != struct.unpack_from("<Q", data, 13)[0]:
         raise AssertionError("bad shard checksum")
     offset = 0
-    next_revision = struct.unpack_from("<Q", body, offset)[0]
+    next_revision = struct.unpack_from("<Q", base, offset)[0]
     offset += 8
-    count = struct.unpack_from("<I", body, offset)[0]
+    count = struct.unpack_from("<I", base, offset)[0]
     offset += 4
-    records = []
+    records = {}
     for _ in range(count):
-        namespace_length = struct.unpack_from("<I", body, offset)[0]
-        offset += 4
-        namespace = body[offset : offset + namespace_length].decode("utf-8")
-        offset += namespace_length
-        key_length = struct.unpack_from("<I", body, offset)[0]
-        offset += 4
-        key = body[offset : offset + key_length].decode("utf-8")
-        offset += key_length
-        revision = struct.unpack_from("<Q", body, offset)[0]
-        offset += 8
-        deadline = struct.unpack_from("<Q", body, offset)[0]
-        offset += 8
-        tag = body[offset]
-        offset += 1
-        value_length = struct.unpack_from("<I", body, offset)[0]
-        offset += 4
-        value = body[offset : offset + value_length].decode("utf-8")
-        offset += value_length
-        records.append(
-            {"namespace": namespace, "key": key, "value": value, "revision": revision, "deadline": deadline, "tag": tag}
-        )
-    if offset != len(body):
+        record, offset = _read_record(base, offset)
+        records[(record["namespace"], record["key"])] = record
+    if offset != len(base):
         raise AssertionError("trailing shard bytes")
-    return {"nextRevision": next_revision, "records": records}
+    offset = body_start + base_length
+    while offset < len(data):
+        if offset + 12 > len(data):
+            raise AssertionError("truncated shard frame")
+        payload_length = struct.unpack_from("<I", data, offset)[0]
+        payload = data[offset + 12 : offset + 12 + payload_length]
+        if len(payload) != payload_length:
+            raise AssertionError("truncated shard frame")
+        if fnv1a(payload) != struct.unpack_from("<Q", data, offset + 4)[0]:
+            raise AssertionError("bad frame checksum")
+        next_revision = struct.unpack_from("<Q", payload, 0)[0]
+        cursor = 8
+        ops = struct.unpack_from("<I", payload, cursor)[0]
+        cursor += 4
+        for _ in range(ops):
+            op = payload[cursor]
+            cursor += 1
+            if op == 0:
+                record, cursor = _read_record(payload, cursor)
+                records[(record["namespace"], record["key"])] = record
+            elif op == 1:
+                key, cursor = _read_key(payload, cursor)
+                records.pop(key, None)
+            else:
+                raise AssertionError("unknown shard delta op")
+        if cursor != len(payload):
+            raise AssertionError("trailing delta bytes")
+        offset += 12 + payload_length
+    ordered = [records[key] for key in sorted(records)]
+    return {"nextRevision": next_revision, "records": ordered}
 
 
 def parse_catalog(path):

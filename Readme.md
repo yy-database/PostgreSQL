@@ -12,16 +12,13 @@ surfaces on top.
 - **Socket client.** `Connection::open` connects to a server and
   `Connection::execute` sends one simple-query packet and decodes the replies
   from `database-client`'s `pgsql` client.
-- **Wire server.** `startPostgresServer` in
-  `projects/postgres.ts/packages/postgres/src/server/` listens on TCP and speaks
-  protocol v3 as the backend: startup, trust, cleartext-password or
-  SCRAM-SHA-256 authentication, `SET`, `SHOW`, DDL/DML, the catalog subset
-  `psql` needs for `\dt`, `\dv` and `\d`, and `ErrorResponse` plus
-  `ReadyForQuery` on failure. Rows live
-  in `.yyds`/`.yykv` through the native `ServerStore` primitive; the SQL parser,
-  catalog projection and executor are TypeScript under `server/sql/`, so the
-  Rust side keeps no server main loop. `postgres-server --port 5432 --data-dir DIR`
-  runs it.
+- **Wire server.** `startPostgresServer` (and `PostgreSQL#listen`) in
+  `projects/postgres.ts/packages/postgres/src/server/` opens the native
+  `LocalEngine`, which is the `postgres` facade: it owns the data directory, the
+  SQL runtime and the protocol-v3 gateway. This repository keeps no parser,
+  planner or executor; the TypeScript side validates options, maps the
+  listener addresses and turns every failure into the family envelope.
+  `postgres-server --port 5432 --data-dir DIR` runs it.
 - **Bindings and surfaces.** `postgres-napi`, `postgres-pyo3`, and the
   TypeScript and Python packages composed on top of them.
 - **`psql` surface.** Argument parsing and result rendering.
@@ -33,32 +30,30 @@ surfaces on top.
 
 ## What this repository does NOT implement
 
-There is no planner and no general-purpose server engine. Batch 2 implements a
-parser, a catalog projection and an executor for the batch-2 surface only:
-`CREATE TABLE`/`DROP TABLE`, `INSERT`/`UPDATE`/`DELETE` with `RETURNING`, and the
-catalog SQL `psql` sends for `\dt` and `\d`. Types are `int2`/`int4`/`int8`/
-`float4`/`float8`/`bool`/`text`/`varchar(n)`/`char(n)`/`date`/`timestamp`/
-`timestamptz`/`uuid`; constraints are `NOT NULL`, literal `DEFAULT`,
-`PRIMARY KEY` and `UNIQUE`.
+There is no SQL engine here. Every SQL statement, transaction and catalog
+projection belongs to the `postgres` facade, so this section records the
+boundary of that facade as the product surface reaches it rather than a private
+engine:
 
-Still missing: `ALTER` beyond constraint operations, `EXPLAIN (ANALYZE)` for
-grouping and joins, grouping by a primary key's functional dependency, and
-ordered-set aggregates. `EXPLAIN` itself covers single-relation scans with
-`ANALYZE` counts plus grouping and join plans as plan text, and rejects set
-operations, `WITH`, subqueries and `DISTINCT` with `0A000`.
-`INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL` joins with `ON` or `USING`, and
-`count`/`sum`/`avg`/`min`/`max`/`string_agg`/`array_agg`/`bool_and`/`bool_or`/
-`every` with `DISTINCT`, `FILTER` and aggregate `ORDER BY`, are gated against
-real `psql` transcripts.
-`CREATE INDEX`/`DROP INDEX` cover `btree` and `hash`, expression keys,
-`INCLUDE`, `DESC`/`NULLS FIRST`/`NULLS LAST`, partial predicates, the
-`IF NOT EXISTS`/`IF EXISTS` notices, and `pg_get_indexdef`/`pg_indexes`
-rendering, also gated against real `psql` transcripts.
-`Connection.execute(sql)` still serialises the statement text and reads the
-reply; the acceptance suites for the client surfaces keep talking to PGlite as
-their independent reference.
+- **Authentication and remote binds.** The gateway offers `trust` over loopback
+  only. A password, SCRAM or non-loopback request fails with
+  `native_capability_missing` and the missing capability in `detail`; no local
+  verifier runs.
+- **Schema persistence.** Row data is durable in `.yykv`, but DDL lives in the
+  facade's in-memory registry: a reopened data directory starts with an empty
+  catalog. Replaying the DDL on open is the documented bootstrap contract, and
+  the rows written by the previous run become visible again once the schema is
+  replayed.
+- **Server-side SQL.** `CREATE DATABASE`/`CREATE ROLE`/`GRANT`, `COPY ... FROM
+  STDIN`, `DECLARE` cursors, SQL-level `PREPARE`, `LISTEN`/`NOTIFY`, `EXPLAIN`
+  plans, `GENERATED` columns, `CREATE TEMP`, `ALTER TABLE ... ADD CONSTRAINT`,
+  the `::` cast operator, `E'...'` strings and the `statement_timeout` GUC are
+  all refused by the gateway (mostly `0A000`); the SQL surface that does run is
+  the DDL/DML/metadata subset listed in **Wire server** below.
 
-The acceptance harness runs **PGlite 0.5.15** as that server:
+The client surfaces stay independent of that boundary: `query()` sends the
+statement text and decodes the reply, and the acceptance suites keep talking to
+**PGlite 0.5.15** as their reference:
 
 - `projects/postgres.ts/packages/postgres-harness/server.mjs` imports PGlite and
   `PGLiteSocketServer` (lines 2-3) and constructs `new PGlite()` **without a data
@@ -83,168 +78,66 @@ implemented here:
   `CommandComplete` payload.
 
 The client-surface suites keep PGlite's SQL data in its own in-memory database;
-that is the oracle, not this repository's server. Inside `postgres-server` the
-SQL path does land in `.yyds`/`.yykv`: the catalog document lives under
-`pg_catalog/catalog` and every user relation under `pg_data.<relOid>`, written
-through `ServerStore.commitChanges`. The standalone `Store` primitive is
-unchanged and remains unrelated to the client suites.
+that is the oracle, not this repository's server. The standalone `Store`
+primitive is unchanged and remains unrelated to the client suites.
 
-## Wire server (batch 2)
+## Wire server
 
-`postgres-server --port 5432 --data-dir DIR` (or `startPostgresServer`) listens
-on TCP and speaks protocol v3 as the backend. It answers startup,
-`AuthenticationOk` for trust, `AuthenticationCleartextPassword` for
-`--password`, and the `AuthenticationSASL` exchange for `--auth scram`, where
-the verifier stored by `CREATE ROLE ... PASSWORD` / `ALTER ROLE ... PASSWORD`
-is the only accepted credential. It then serves `SET`, `SHOW`, `SELECT`,
-DDL/DML, and closes on `Terminate`. Every
-statement failure is `ErrorResponse` followed by `ReadyForQuery`, so the session
-survives.
+`postgres-server --port 5432 --data-dir DIR` (or `startPostgresServer`) opens the
+data directory and listens on TCP. The gateway answers startup with
+`AuthenticationOk` (trust) and then serves:
+
+- **Simple query.** `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`,
+  `DROP TABLE`, `CREATE INDEX`, `ALTER TABLE ... ADD COLUMN`, `BEGIN`/`COMMIT`/
+  `ROLLBACK`/`SAVEPOINT` and the `SHOW`/`SET` parameters the gateway knows.
+- **Extended query.** `SELECT`/`INSERT`/`UPDATE`/`DELETE` with bound parameters.
+  DDL and utility statements are simple-query only, and the binding says so.
+- **Catalog projection.** `information_schema.tables`/`.columns`,
+  `pg_catalog.pg_class`/`pg_namespace`/`pg_attribute`/`pg_type`,
+  `SELECT current_schema()` and `SELECT version()`. Casts must be written as
+  `CAST(x AS type)`: `::` is refused with a message naming the alternative, and
+  a cast literal may describe a wider type OID than PostgreSQL (`CAST(1 AS
+  int4)` reports `int8`). Table columns keep their declared OIDs (`int4` 23,
+  `numeric` 1700, `bytea` 17), which is what the authoring suite asserts.
+
+Every statement failure is `ErrorResponse` followed by `ReadyForQuery`, so the
+session survives. A unique violation carries `23505` but not the `D`/`n` fields
+PostgreSQL fills in.
 
 Storage layout under `--data-dir`:
 
-- `postmaster.pid` is the lock. A second server started on the same directory
-  fails with `lock file "..." already exists: another server owns this data
-  directory` and never starts listening. The first line records the owning
-  process id. A hard kill leaves the file behind, exactly like PostgreSQL, but
-  the next start reads the recorded pid and checks whether that process is
-  still alive: a live holder keeps the refusal, a dead one has its stale lock
-  reclaimed automatically and the server takes the directory. A clean shutdown
-  — `close()`, `SIGINT` or `SIGTERM` — removes the file.
-- `local-0.yyds` holds the catalog documents. `local-0.yykv` holds the primary
-  shard: the catalog is `pg_catalog/catalog`, the cluster directory is
-  `pg_cluster`, and sequence high-water marks live beside them.
-- Every table and its own indexes live together in
-  `shards/local-<relOid>-<hex database>/`, a self-contained single-shard
-  directory with its own `.yyds`/`.yykv`/`postmaster.pid` files. A DML commit
-  therefore re-encodes only the group it touched, and opening a data directory
-  sweeps unreferenced shard directories.
-- `sql-schema.v0.json` is a `yyds-sql-schema/v0` projection of the same catalogs,
-  rewritten atomically after every schema commit so a data directory carries the
-  artifact set the yyds gateways expect. It is never read back for recovery, and
-  table names are qualified as `<database>.<schema>.<table>` because the registry
-  contract has no cluster dimension. `local-0.yyds` remains the only truth.
-- One statement message opens one `Database`, runs its statements, then calls
-  `ServerStore.commitChanges` once. A multi-statement simple query therefore
-  behaves like one implicit transaction: either every statement becomes durable
-  or the whole batch is discarded. `RETURNING` rows are emitted only after the
-  commit succeeded.
-- `pg_catalog.*` is a pure projection of that single catalog document; there is
-  no second copy of table metadata.
+- `postmaster.pid` is the lock. A second engine over the same directory fails
+  with `lock file "..." already exists: another server owns this data
+  directory` and never starts listening; the refusal reaches the caller as
+  `phase: "open"`. A stale lock from a dead process is reclaimed on the next
+  open and a clean `close()` removes the file.
+- `local-0.yykv` is the shard: `YYKV<0x04> | base length | base checksum | base
+  body | delta frames`. The base body is the snapshot layout and every later
+  commit appends one checksummed delta frame, so a commit appends only the
+  changed bytes. `local-0.yyds` holds the directory catalog.
+- Row data is durable across a restart; the schema is not (see **What this
+  repository does NOT implement**). Replay the DDL and the rows written by the
+  previous run become visible again.
 
-Two accepted limitations, recorded so the next change does not need a fresh
-investigation:
+The two harness stages that used to compare this server against real `psql`
+transcripts were retired with the TypeScript engine:
 
-1. **Per-group commits.** Each table group is its own shard, so a statement that
-   touches several groups commits them one at a time with the catalog ordered
-   last (or first, for a drop). A crash between groups loses at most the
-   unacknowledged statement, but it is not one atomic commit across groups.
-2. **One handle.** One `ServerStore` handle per process owns one data directory.
-   Concurrent writers are serialised by the native mutex instead of having a
-   shared page cache.
+- `stages/server.mjs` froze `catalog-queries.json`, replayed 68 system-catalog
+  meta commands (`fixtures/psql-meta.sql`), and exercised password/SCRAM logins,
+  roles, databases, ACLs, cursors, `PREPARE`, `COPY` and `LISTEN`/`NOTIFY`.
+- `stages/durability.mjs` seeded the pre-sharding directory layout, asserted the
+  `sql-schema.v0.json` projection and migrated shards.
 
-Evidence from real `psql` 16.9 (`LC_MESSAGES=C`) against this server, compared
-byte for byte with a real PostgreSQL 16.9 instance holding the same schema
-(`CREATE TABLE t (id int PRIMARY KEY, name text DEFAULT 'x', code varchar(20))`):
-
-```text
-$ psql ... -c "\dt"
- List of relations
- Schema | Name | Type  |  Owner
---------+------+-------+----------
- public | t    | table | postgres
-(1 row)
-
-$ psql ... -c "\d t"
-                         Table "public.t"
- Column |         Type          | Collation | Nullable |  Default  
---------+-----------------------+-----------+----------+-----------
- id     | integer               |           | not null | 
- name   | text                  |           |          | 'x'::text
- code   | character varying(20) |           |          | 
-Indexes:
-    "t_pkey" PRIMARY KEY, btree (id)
-```
-
-`Buffer.compare` on the two captured outputs returned `0` for `\dt`, `\d t`,
-`\d types` (13 types plus literal defaults) and `\d u` (`PRIMARY KEY` +
-`UNIQUE`). The 10 catalog statements `psql` emits are frozen in
-`packages/postgres-harness/fixtures/catalog-queries.json`; the `server` stage
-asserts each one parses, executes and returns the real row count, and compares
-the two `psql` transcripts with the captured real ones.
-
-The same `server` stage now replays 68 system-catalog meta commands in one
-`psql` session (`fixtures/psql-meta.sql`) against a server seeded from
-`fixtures/meta-setup.sql`, and compares the transcript with one captured from a
-real PostgreSQL 16 cluster holding that identical schema. Covered families are
-`\d`/`\d+`/`\d <relation>`, `\dt`/`\di`/`\dv`/`\dm`/`\ds`/`\dP(i)` and their
-`+` variants, `\dn`, `\df`, `\dp`/`\z`, `\dA`, `\dc`, `\dD`, `\dd`, `\ddf`,
-`\dT`, `\dL`, `\dO`, `\dX`, `\dE`, `\det`, `\des`/`\dew`/`\deu`, `\dg`,
-`\dl`/`\lo_list`, `\db`, `\dRp`, `\drds`, `\ddp`, `\drg`, `\dRs`, `\dx`, `\l`.
-`psql` advisories for empty command results are compared as well, and a server
-`ERROR` anywhere in the sweep fails the check instead of being swallowed.
-
-`pg_table_size`, `pg_indexes_size`, `pg_database_size` and
-`pg_tablespace_size` report this engine's real byte footprint: the sum of
-`.yykv` key and value bytes for the relation, and catalog plus all relations for
-a database or tablespace. PostgreSQL counts 8 kB pages, so the `Size` cell of
-`\d+`, `\dt+`, `\di+`, `\l+` and `\db+` necessarily differs. The harness masks
-only that cell (and the alignment it implies) and still compares every other
-character; it does not claim the sizes match.
-
-Deliberately not implemented: `\dAc`, `\dAf`, `\dAo`, `\dAp` and `\dC`, which
-dump PostgreSQL's own built-in operator, function, aggregate and conversion
-catalogs; `\dFd`/`\dFp`/`\dFt` and their `+` variants, which dump built-in text
-search dictionaries, parsers and templates; `\dconfig`, which reads
-`pg_settings`; and `\sf`/`\sv`, which print function source. These describe the
-server's own implementation inventory rather than user objects, and `\sf`/`\sv`
-fail identically on an empty schema in a real cluster.
-
-SQLSTATE evidence through the `pg` driver: `22P02` invalid input syntax,
-`42703` unknown column, `42P01` unknown relation, `42P07` duplicate relation,
-`23502` not-null, `23505` duplicate key with `Key (id)=(2) already exists.`
-
-Transactions are session state in the wire server. Every simple-query message
-still runs as one implicit transaction, and `BEGIN`/`START TRANSACTION` opens an
-explicit one whose rows are staged until `COMMIT`. `ROLLBACK`, `SAVEPOINT`,
-`RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and nested `BEGIN` behave like
-PostgreSQL 16.9. Isolation is per transaction: `READ COMMITTED` refreshes the
-catalog before each statement, `REPEATABLE READ` freezes a commit counter
-snapshot at its first statement and rejects a write to a row committed after it
-with `40001 could not serialize access due to concurrent update`; `READ
-UNCOMMITTED` is accepted and behaves as `READ COMMITTED`. Row locks are held
-until commit, rollback or the first error, which aborts the block, hands its
-locks to waiting sessions and turns later statements into `25P02` while
-`ROLLBACK` still closes it. A wait that closes a cycle fails the requester with
-`40P01 deadlock detected`, the two `Process ... waits for ShareLock ...` detail
-lines, the hint and the `while updating tuple (0,N) in relation "..."` context.
-The implicit and explicit block transcript, savepoints, DDL rollback, nested
-`BEGIN`, read-only transactions, `SET`/`SHOW transaction_isolation`, and the
-`READ COMMITTED`/`REPEATABLE READ` visibility transcript match real `psql`
-byte for byte against PostgreSQL 16.9; the `40001` and `40P01` reports are
-compared modulo process, transaction, tuple and source-location ids. A client
-that disappears mid-transaction leaves no rows, and a `COMMIT` already on the
-wire completes exactly once.
-
-`CREATE VIEW`/`DROP VIEW` store the query text, expand it on read, track
-dependencies for `2BP01` and the cascade notices, and project `pg_views`.
-`VACUUM`/`ANALYZE` are accepted as no-ops with PostgreSQL's transaction rule and
-non-table warning. `ALTER` beyond constraint operations remains `0A000` +
-`DETAIL`.
-
-**COPY and notifications.** `COPY ... TO STDOUT` streams `CopyOutResponse`, one
-`CopyData`, `CopyDone` and the `COPY n` tag; text and CSV honor `HEADER`,
-`DELIMITER`, `NULL`, `QUOTE` and `ESCAPE`, and `COPY (SELECT ...) TO STDOUT`
-runs the embedded query. `COPY ... FROM STDIN` answers `CopyInResponse` and
-consumes `CopyData`/`CopyDone`/`CopyFail` through the simple-query protocol
-only; the extended protocol keeps an explicit `0A000` for it. The text parser
-matches PostgreSQL on `\N` versus `NULL`, on `\.` as the end marker, on escaped
-delimiters, and on `COPY t, line n: "row"` / `column c: "value"` contexts, while
-binary COPY stays `0A000`. `LISTEN`/`UNLISTEN`/`NOTIFY` deliver
-`NotificationResponse` after the committing `CommandComplete` and before
-`ReadyForQuery`, drop duplicate channel/payload pairs within one transaction,
-undo `LISTEN` on `ROLLBACK`, and expose the session's channels through
-`SELECT * FROM pg_listening_channels()`.
+The native gateway refuses most of that surface (it is listed above and in
+**What this repository does NOT implement**), so keeping the stages would have
+gated the product on features nobody implements yet. Their coverage now lives
+in the `node`/`python` acceptance suites, which drive the native engine through
+the public package entry points: typed columns, parameters, bytea, transactions
+with savepoints, session scopes, the listener roundtrip, the directory lock,
+restart durability with a DDL replay, the `23505` envelope, and the explicit
+`native_capability_missing` refusals for authentication, remote binds and
+SCRAM. The `store` cases parse the version 4 `.yykv` layout including its delta
+frames.
 
 Build cost of bringing `database-storage` (and `vos`) into the native graph,
 measured once on this machine with clean release target directories:
@@ -325,15 +218,12 @@ for byte (`0000001004d2162e...`) in `cargo test` and in both acceptance suites
 through `encodeCancelRequest`, including a zero and a negative key pair.
 
 PGlite is not an oracle for cancellation: its socket server consumes the
-packet and closes silently because there is no backend process to signal.
-The server side enforces `statement_timeout` on its own: a statement that runs
-past its deadline is cancelled at the next row boundary with SQLSTATE `57014`
-(`canceling statement due to statement timeout`), and an open transaction block
-enters the aborted state until `ROLLBACK`, the way PostgreSQL 16 does. `0`, the
-default, disables the deadline. Termination semantics against an external
-engine remain recorded as an **oracle limitation**: what is asserted is what
+packet and closes silently because there is no backend process to signal. The
+native gateway does not implement the `statement_timeout` GUC, so the server
+answers `unrecognized configuration parameter` for it; what is asserted is what
 the client owns — the packet bytes, and that a cancel followed by a normal
-statement on the same session still returns `SELECT 1`.
+statement on the same session still returns `SELECT 1`. Termination semantics
+against an external engine remain recorded as an **oracle limitation**.
 
 **Connection interruption.** A read that ends after a partial result, a frame
 that declares more bytes than arrive, and a peer that closes before
@@ -350,8 +240,7 @@ listener.
 deadline: a six-second idle gap leaves the session usable and the next
 statement returns normally. A statement slower than that limit fails the call
 and, through the poison rule above, cannot leave half a result behind. The
-client socket keeps that 5 s per-read limit and is not a statement deadline;
-`statement_timeout` is enforced by the server as described above.
+client socket keeps that 5 s per-read limit and is not a statement deadline.
 
 **COPY subprotocol.** `Connection::copy_in(sql, chunks)` writes the chunks as
 `CopyData` only after the server answered `CopyInResponse`, then sends
