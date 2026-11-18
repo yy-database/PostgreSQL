@@ -16,17 +16,16 @@ Server authentication and remote binds are not implemented natively yet.
 carrying `postgres.server.authentication` or `postgres.server.remote_bind`
 instead of falling back to a local verifier.
 
-Row data is durable in `.yykv`; the schema is not. The facade keeps DDL in an
-in-memory registry, so a reopened data directory starts with an empty catalog.
-Replay your DDL after `open()` and the rows written by the previous run become
-visible again; `PostgreSQL#execute()` runs parameterless statements as simple
+Row data is durable in `.yykv` and the schema is durable in `schema.json`. The
+facade keeps the registry on disk, so a reopened data directory starts with the
+tables it had. `PostgreSQL#execute()` runs parameterless statements as simple
 queries, which is the path `CREATE`/`ALTER`/`BEGIN` take.
 
-The gateway's SQL surface is the DDL/DML/metadata subset it implements: no
-`CREATE DATABASE`/`CREATE ROLE`/`GRANT`, no `COPY ... FROM STDIN`, cursors,
-SQL-level `PREPARE`, `LISTEN`/`NOTIFY`, `EXPLAIN` plans, `GENERATED` columns,
-`CREATE TEMP` or `ALTER TABLE ... ADD CONSTRAINT`, and the `::` cast operator is
-refused in favour of `CAST(x AS type)`.
+The gateway implements prepared statements, cursors, `EXPLAIN`, `COPY ... FROM
+STDIN`, `LISTEN`/`NOTIFY`, `GENERATED ... AS IDENTITY`, `ALTER TABLE ... ADD
+CONSTRAINT` and the `::` cast operator. It still refuses `CREATE
+DATABASE`/`CREATE ROLE`/`GRANT`, `CREATE TEMP TABLE` and `GENERATED ... AS
+(expression) STORED`.
 
 The package owns no wire code of its own. `loadNative()` resolves the platform
 binding, `query()` opens and closes one connection around a single statement,

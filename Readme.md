@@ -39,17 +39,17 @@ engine:
   only. A password, SCRAM or non-loopback request fails with
   `native_capability_missing` and the missing capability in `detail`; no local
   verifier runs.
-- **Schema persistence.** Row data is durable in `.yykv`, but DDL lives in the
-  facade's in-memory registry: a reopened data directory starts with an empty
-  catalog. Replaying the DDL on open is the documented bootstrap contract, and
-  the rows written by the previous run become visible again once the schema is
-  replayed.
-- **Server-side SQL.** `CREATE DATABASE`/`CREATE ROLE`/`GRANT`, `COPY ... FROM
-  STDIN`, `DECLARE` cursors, SQL-level `PREPARE`, `LISTEN`/`NOTIFY`, `EXPLAIN`
-  plans, `GENERATED` columns, `CREATE TEMP`, `ALTER TABLE ... ADD CONSTRAINT`,
-  the `::` cast operator, `E'...'` strings and the `statement_timeout` GUC are
-  all refused by the gateway (mostly `0A000`); the SQL surface that does run is
-  the DDL/DML/metadata subset listed in **Wire server** below.
+- **Schema persistence.** Row data is durable in `.yykv` and DDL is durable in
+  `schema.json`, both inside the data directory: a reopened data directory sees
+  the same tables without replaying the DDL. A rolled-back `CREATE` restores the
+  previous document.
+- **Server-side SQL.** `CREATE DATABASE`/`CREATE ROLE`/`GRANT`, `CREATE TEMP
+  TABLE`, `GENERATED ... AS (expression) STORED`, `E'...'` strings and the
+  `statement_timeout` GUC are still refused (mostly `0A000`). Prepared
+  statements, cursors, `EXPLAIN`/`EXPLAIN ANALYZE`, `COPY ... FROM STDIN`,
+  `LISTEN`/`NOTIFY`, `GENERATED ... AS IDENTITY`, `ALTER TABLE ... ADD
+  CONSTRAINT`, password/MD5/SCRAM authentication and the `::` cast operator run
+  through the gateway.
 
 The client surfaces stay independent of that boundary: `query()` sends the
 statement text and decodes the reply, and the acceptance suites keep talking to
@@ -115,29 +115,24 @@ Storage layout under `--data-dir`:
   body | delta frames`. The base body is the snapshot layout and every later
   commit appends one checksummed delta frame, so a commit appends only the
   changed bytes. `local-0.yyds` holds the directory catalog.
-- Row data is durable across a restart; the schema is not (see **What this
-  repository does NOT implement**). Replay the DDL and the rows written by the
-  previous run become visible again.
+- Row data is durable across a restart and so is the schema, in `schema.json`
+  beside the shard files.
 
-The two harness stages that used to compare this server against real `psql`
-transcripts were retired with the TypeScript engine:
+The `server` and `durability` harness stages drive the native engine through a
+stock `pg` client instead of the retired TypeScript engine:
 
-- `stages/server.mjs` froze `catalog-queries.json`, replayed 68 system-catalog
-  meta commands (`fixtures/psql-meta.sql`), and exercised password/SCRAM logins,
-  roles, databases, ACLs, cursors, `PREPARE`, `COPY` and `LISTEN`/`NOTIFY`.
-- `stages/durability.mjs` seeded the pre-sharding directory layout, asserted the
-  `sql-schema.v0.json` projection and migrated shards.
+- `stages/server.mjs` builds the native binding, starts a `LocalEngine` and
+  checks identity columns, `::` casts, `PREPARE`/`EXECUTE`/`DEALLOCATE`,
+  `DECLARE`/`FETCH`/`CLOSE`, `EXPLAIN`/`EXPLAIN ANALYZE`, `COPY ... FROM STDIN`
+  over `pg-copy-streams`, `ALTER TABLE ... ADD CONSTRAINT`, SQLSTATE fidelity,
+  `LISTEN`/`NOTIFY`, concurrent connections and the persisted schema document.
+- `stages/durability.mjs` reopens the same data directory and checks that DDL
+  and rows survive a restart, that a rolled-back `CREATE` stays gone, that the
+  directory lock stays exclusive and that prepared statements are session state.
 
-The native gateway refuses most of that surface (it is listed above and in
-**What this repository does NOT implement**), so keeping the stages would have
-gated the product on features nobody implements yet. Their coverage now lives
-in the `node`/`python` acceptance suites, which drive the native engine through
-the public package entry points: typed columns, parameters, bytea, transactions
-with savepoints, session scopes, the listener roundtrip, the directory lock,
-restart durability with a DDL replay, the `23505` envelope, and the explicit
-`native_capability_missing` refusals for authentication, remote binds and
-SCRAM. The `store` cases parse the version 4 `.yykv` layout including its delta
-frames.
+Both stages assert PostgreSQL behaviour, so a regression in the gateway fails
+them directly. Coverage that needs an oracle (system catalogs, roles, ACLs)
+remains in the `node`/`python` acceptance suites.
 
 Build cost of bringing `database-storage` (and `vos`) into the native graph,
 measured once on this machine with clean release target directories:

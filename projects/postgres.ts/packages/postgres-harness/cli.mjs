@@ -8,10 +8,12 @@ import { fileURLToPath } from 'node:url';
 
 import { startServer } from './server.mjs';
 import { runDriversStage } from './stages/drivers.mjs';
+import { runDurability } from './stages/durability.mjs';
 import { runNative } from './stages/native.mjs';
 import { runNodeSuite } from './stages/node.mjs';
 import { runPythonSuite } from './stages/python.mjs';
 import { runRust } from './stages/rust.mjs';
+import { runServer } from './stages/server.mjs';
 
 const harnessDir = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(harnessDir, '..', '..', '..', '..');
@@ -268,6 +270,8 @@ const env = {
 const stages = [];
 try {
     stages.push(await runNative(repositoryRoot));
+    stages.push(await runServer(repositoryRoot));
+    stages.push(await runDurability(repositoryRoot));
     stages.push(await runRust(repositoryRoot, env));
     stages.push(await runNodeSuite(repositoryRoot, harnessDir, env));
     stages.push(await runPythonSuite(repositoryRoot, harnessDir, env));
