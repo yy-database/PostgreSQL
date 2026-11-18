@@ -1733,14 +1733,93 @@ await checkAsync('authoring/local-listener-roundtrip', async () => {
     assert(stillOpen.rows[0].one === 1n, `closing a listener leaves the engine open (read ${String(stillOpen.rows[0]?.one)})`);
 });
 await checkAsync('authoring/local-listener-auth', async () => {
+    for (const method of ['password', 'md5', 'scram-sha-256']) {
+        const listener = await local.listen({
+            endpoint: { host: '127.0.0.1', port: 0 },
+            authentication: { method, password: 'secret', user: 'postgres' },
+        });
+        const accepted = new PostgreSQLClient({
+            endpoint: { host: listener.endpoint.host, port: listener.endpoint.port },
+            auth: { username: 'postgres', password: 'secret' },
+        });
+        try {
+            await accepted.connect();
+            const result = await accepted.query('select 1 as one');
+            assert(result.rows[0].one === 1n, `auth ${method} accepts the configured password`);
+        } finally {
+            await accepted.close().catch(() => undefined);
+        }
+        let rejected = null;
+        const denied = new PostgreSQLClient({
+            endpoint: { host: listener.endpoint.host, port: listener.endpoint.port },
+            auth: { username: 'postgres', password: 'wrong' },
+        });
+        try {
+            await denied.connect();
+        } catch (error) {
+            rejected = error;
+        }
+        await denied.close().catch(() => undefined);
+        await listener.close().catch(() => undefined);
+        assert(rejected instanceof PostgreSQLError && rejected.code === '28P01', `auth ${method} rejects a wrong password with 28P01`);
+    }
     let raised = null;
     try {
-        await local.listen({ endpoint: { host: '127.0.0.1', port: 0 }, authentication: { password: 'secret' } });
+        await local.listen({ endpoint: { host: '127.0.0.1', port: 0 }, authentication: { method: 'password', password: '' } });
     } catch (error) {
         raised = error;
     }
-    assert(raised instanceof PostgreSQLError && raised.code === 'native_capability_missing', 'authentication reports the missing native capability');
-    assert(raised.detail === 'postgres.server.authentication', 'the envelope names the missing capability');
+    assert(raised instanceof TypeError, 'an empty password is refused before a listener starts');
+});
+await checkAsync('authoring/local-catalog-capabilities', async () => {
+    // A temporary table lives on one session, so it is created and used by the
+    // same statement batch; the pooled surface opens a session per call.
+    await local.execute(
+        "create temp table staging (id bigint primary key, label text); insert into staging (id, label) values (1, 'staged')",
+    );
+    await local.execute('create table escape_probe (id bigint primary key, label text)');
+    await local.execute("insert into escape_probe (id, label) values (1, E'a\\tb')");
+    const escaped = await local.query('select label from escape_probe where id = 1');
+    assert(escaped.rows[0].label === 'a\tb', 'an escape literal decodes on the direct path');
+
+    await local.execute('create table generated_probe (id bigint primary key, price bigint, total bigint generated always as (price * 2) stored)');
+    await local.execute('insert into generated_probe (id, price) values (1, 21)');
+    const computed = await local.query('select total from generated_probe where id = 1');
+    assert(computed.rows[0].total === 42n, 'the stored generated column is computed on write');
+    let generatedError = null;
+    try {
+        await local.execute('insert into generated_probe (id, price, total) values (2, 1, 0)');
+    } catch (error) {
+        generatedError = error;
+    }
+    assert(generatedError instanceof PostgreSQLError && generatedError.code === '428C9', 'writing a generated column reports 428C9');
+
+    await local.execute('set statement_timeout = 0');
+    let timeoutError = null;
+    try {
+        await local.execute("set statement_timeout = 'soon'");
+    } catch (error) {
+        timeoutError = error;
+    }
+    assert(timeoutError instanceof PostgreSQLError && timeoutError.code === '22023', 'an invalid statement_timeout reports 22023');
+
+    await local.execute('create database harness_app');
+    let databaseError = null;
+    try {
+        await local.execute('create database harness_app');
+    } catch (error) {
+        databaseError = error;
+    }
+    assert(databaseError instanceof PostgreSQLError && databaseError.code === '42P04', 'a duplicate database reports 42P04');
+    await local.execute('create role harness_reader');
+    await local.execute('grant select on generated_probe to harness_reader');
+    let grantError = null;
+    try {
+        await local.execute('grant select on missing_table to harness_reader');
+    } catch (error) {
+        grantError = error;
+    }
+    assert(grantError instanceof PostgreSQLError && grantError.code === '42P01', 'a grant on an unknown table reports 42P01');
 });
 await checkAsync('authoring/local-directory-locked', async () => {
     const rival = new PostgreSQL({ storage: { directory: authoringDir } });
