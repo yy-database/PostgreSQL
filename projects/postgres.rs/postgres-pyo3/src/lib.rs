@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use pyo3::{create_exception, exceptions::PyException, prelude::*};
 
 use database_client::pgsql::{
-    ServerChange as CoreServerChange, Store as CoreStore,
     client::{ClientConfig, Column, Connection as CoreConnection, Param as CoreParam, QueryResult},
     error::{MessageField, Notice, PostgresError as CoreError},
     psql::{PsqlOptions as CoreOptions, format_results, parse_arguments},
 };
 use database_protocol_pgsql as protocol;
+use database_storage::pgsql::{ServerChange as CoreServerChange, Store as CoreStore};
 use postgres::instance::ServerInstance;
 
 create_exception!(postgres_pyo3, PostgresError, PyException);

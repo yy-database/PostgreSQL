@@ -20,12 +20,13 @@ use database::harness::{
     evaluate, per_op_ms, render_json, summarize,
 };
 use database_client::pgsql::{
-    Notification, ServerChange as CoreServerChange, ServerRow as CoreServerRow, Store as CoreStore,
+    Notification,
     client::{ClientConfig, Column, Connection as CoreConnection, Param as PostgresParam, QueryResult},
     error::{MessageField, Notice, PostgresError},
     psql::{PsqlOptions, format_results, parse_arguments},
 };
 use database_protocol_pgsql as protocol;
+use database_storage::pgsql::{ServerChange as CoreServerChange, ServerRow as CoreServerRow, Store as CoreStore};
 use postgres::{Listener, PostgreSQL, PostgreSQLOptions, PostgreSQLStorage, instance::ServerInstance};
 
 /// Where to connect and which identity to present.
