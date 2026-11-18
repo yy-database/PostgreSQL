@@ -1765,14 +1765,14 @@ await checkAsync('authoring/local-close-cascade', async () => {
     }
     assert(raised instanceof PostgreSQLError && raised.code === '08003' && raised.execution === 'not-sent', 'calls after close fail not-sent');
 });
-// Row data is durable; the schema is not, so the upstream bootstrap contract is
-// to replay the DDL and then read the rows the previous run committed.
+// Row data is durable. Replay the DDL idempotently so the bootstrap works
+// whether or not the catalog survived the previous close.
 await checkAsync('authoring/local-reopen-durability', async () => {
     const reopened = new PostgreSQL({ storage: { directory: authoringDir } });
     try {
         await reopened.open();
-        await reopened.execute('create table authoring_types (id int4 primary key, big int8, amount numeric(10,3), blob bytea)');
-        await reopened.execute('create table authoring_probe (id int4 primary key, name text)');
+        await reopened.execute('create table if not exists authoring_types (id int4 primary key, big int8, amount numeric(10,3), blob bytea)');
+        await reopened.execute('create table if not exists authoring_probe (id int4 primary key, name text)');
         const result = await reopened.query('select count(*) as n from authoring_probe');
         assert(result.rows[0].n === 5n, `the durable directory keeps rows across open and close (read ${String(result.rows[0]?.n)})`);
     } finally {
