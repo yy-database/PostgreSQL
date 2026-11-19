@@ -1141,7 +1141,7 @@ fn closed_error() -> Error {
     Error::from_reason("connection is closed")
 }
 
-fn native(error: PostgresError) -> Error {
+fn native(error: impl std::fmt::Display) -> Error {
     Error::from_reason(error.to_string())
 }
 
@@ -1175,7 +1175,7 @@ pub struct ServerStore {
 
 fn with_instance<T>(
     inner: &Mutex<Option<ServerInstance>>,
-    run: impl FnOnce(&mut ServerInstance) -> std::result::Result<T, PostgresError>,
+    run: impl FnOnce(&mut ServerInstance) -> std::result::Result<T, database_storage::pgsql::Error>,
 ) -> Result<T> {
     let mut guard = inner.lock().map_err(|_| Error::from_reason("server store lock poisoned"))?;
     let instance = guard.as_mut().ok_or_else(|| Error::from_reason("server store is closed"))?;

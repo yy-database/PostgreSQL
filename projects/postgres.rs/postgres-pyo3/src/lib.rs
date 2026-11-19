@@ -1154,7 +1154,7 @@ fn closed_error() -> PyErr {
     PostgresError::new_err("connection is closed")
 }
 
-fn native(error: CoreError) -> PyErr {
+fn native(error: impl std::fmt::Display) -> PyErr {
     PostgresError::new_err(error.to_string())
 }
 
