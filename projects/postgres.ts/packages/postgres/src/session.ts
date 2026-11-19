@@ -4,6 +4,7 @@ import type {
     Connection,
     ExecutionReport,
     ParamInfo,
+    Pool as NativePool,
     PostgresNative,
     PreparedStatement as NativePreparedStatement,
     TypedExecutionReport,
@@ -222,151 +223,79 @@ interface Lease {
     discard(): void;
 }
 
-interface Waiter {
-    resolve: (lease: Lease) => void;
-    reject: (error: unknown) => void;
-    timer: NodeJS.Timeout | null;
+/**
+ * Maps the core pool's refusal messages back into the authoring envelope.
+ * The strings are the contract with `database.client::pgsql`'s `PoolError`.
+ */
+function poolFailure(error: unknown): unknown {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === 'the connection pool is saturated') {
+        return new PostgreSQLError({
+            code: '53400',
+            message: 'the connection pool is saturated',
+            phase: 'execute',
+            execution: 'not-sent',
+            retry: 'application-decision',
+        });
+    }
+    if (message === 'timed out waiting for a pooled connection') {
+        return new PostgreSQLError({
+            code: '53200',
+            message: 'timed out waiting for a pooled connection',
+            phase: 'execute',
+            execution: 'not-sent',
+            retry: 'application-decision',
+        });
+    }
+    if (message === 'the connection pool is closed') return stateFailure('the connection pool is closed');
+    return error;
 }
 
-/** A small pool over the synchronous native connections. */
+/**
+ * A thin lease wrapper over the native pool. Every piece of scheduling state —
+ * the idle set, the waiter queue, the in-use count and the close drain — lives
+ * in the Rust core; this side only hands a leased connection back once.
+ */
 class ConnectionPool {
-    private readonly native: PostgresNative;
-    private readonly target: { host: string; port: number; user: string; database: string; password?: string };
-    private readonly max: number;
-    private readonly maxPending: number;
-    private readonly acquireTimeoutMs: number;
-    private readonly idle: Connection[] = [];
-    private readonly waiters: Waiter[] = [];
-    private inUse = 0;
-    private closed = false;
-    private draining: (() => void) | null = null;
+    private readonly pool: NativePool;
 
     constructor(
         native: PostgresNative,
         target: { host: string; port: number; user: string; database: string; password?: string },
         pool: PoolOptions | undefined,
     ) {
-        this.native = native;
-        this.target = target;
-        this.max = pool?.max ?? 10;
-        this.maxPending = pool?.maxPending ?? 100;
-        this.acquireTimeoutMs = pool?.acquireTimeoutMs ?? 10_000;
-    }
-
-    acquire(): Promise<Lease> {
-        if (this.closed) return Promise.reject(stateFailure('the connection pool is closed'));
-        const existing = this.idle.pop();
-        if (existing !== undefined) {
-            this.inUse += 1;
-            return Promise.resolve(this.leaseFor(existing));
-        }
-        if (this.inUse < this.max) {
-            this.inUse += 1;
-            try {
-                return Promise.resolve(this.leaseFor(this.native.connect(this.target)));
-            } catch (error) {
-                this.inUse -= 1;
-                this.pumpDrain();
-                return Promise.reject(error);
-            }
-        }
-        if (this.waiters.length >= this.maxPending) {
-            return Promise.reject(
-                new PostgreSQLError({
-                    code: '53400',
-                    message: 'the connection pool is saturated',
-                    phase: 'execute',
-                    execution: 'not-sent',
-                    retry: 'application-decision',
-                }),
-            );
-        }
-        return new Promise<Lease>((resolve, reject) => {
-            const waiter: Waiter = { resolve, reject, timer: null };
-            if (this.acquireTimeoutMs > 0) {
-                waiter.timer = setTimeout(() => {
-                    const index = this.waiters.indexOf(waiter);
-                    if (index >= 0) this.waiters.splice(index, 1);
-                    reject(
-                        new PostgreSQLError({
-                            code: '53200',
-                            message: 'timed out waiting for a pooled connection',
-                            phase: 'execute',
-                            execution: 'not-sent',
-                            retry: 'application-decision',
-                        }),
-                    );
-                }, this.acquireTimeoutMs);
-                waiter.timer.unref();
-            }
-            this.waiters.push(waiter);
+        this.pool = new native.Pool(target, {
+            max: pool?.max,
+            maxPending: pool?.maxPending,
+            acquireTimeoutMs: pool?.acquireTimeoutMs,
         });
     }
 
-    close(): Promise<void> {
-        this.closed = true;
-        for (const waiter of this.waiters.splice(0)) {
-            if (waiter.timer !== null) clearTimeout(waiter.timer);
-            waiter.reject(stateFailure('the connection pool is closed'));
+    async acquire(): Promise<Lease> {
+        let connection: Connection;
+        try {
+            connection = await this.pool.acquire();
+        } catch (error) {
+            throw poolFailure(error);
         }
-        for (const connection of this.idle.splice(0)) this.closeQuietly(connection);
-        if (this.inUse === 0) return Promise.resolve();
-        return new Promise<void>((resolve) => {
-            this.draining = resolve;
-        });
-    }
-
-    private leaseFor(connection: Connection): Lease {
         let handed = false;
         return {
             connection,
             release: () => {
                 if (handed) return;
                 handed = true;
-                this.handBack(connection);
+                this.pool.release(connection);
             },
             discard: () => {
                 if (handed) return;
                 handed = true;
-                this.closeQuietly(connection);
-                this.inUse -= 1;
-                this.pumpDrain();
+                this.pool.discard(connection);
             },
         };
     }
 
-    private handBack(connection: Connection): void {
-        const waiter = this.waiters.shift();
-        if (waiter !== undefined) {
-            if (waiter.timer !== null) clearTimeout(waiter.timer);
-            waiter.resolve(this.leaseFor(connection));
-            return;
-        }
-        if (this.closed) {
-            this.closeQuietly(connection);
-            this.inUse -= 1;
-            this.pumpDrain();
-            return;
-        }
-        this.idle.push(connection);
-        this.inUse -= 1;
-        this.pumpDrain();
-    }
-
-    private pumpDrain(): void {
-        if (this.inUse === 0 && this.draining !== null) {
-            const resolve = this.draining;
-            this.draining = null;
-            resolve();
-        }
-    }
-
-    private closeQuietly(connection: Connection): void {
-        try {
-            connection.close();
-        } catch {
-            // A socket that is already gone needs no second goodbye.
-        }
+    close(): Promise<void> {
+        return this.pool.close();
     }
 }
 
@@ -376,8 +305,6 @@ class PinnedSession implements PostgreSQLSession {
     private readonly lease: Lease;
     private active = true;
     private broken = false;
-    private inTransaction = false;
-    private openCursors = 0;
 
     constructor(native: PostgresNative, lease: Lease) {
         this.native = native;
@@ -407,7 +334,7 @@ class PinnedSession implements PostgreSQLSession {
     /** Runs one callback exactly once inside `BEGIN` … `COMMIT`; nested calls map to savepoints. */
     async transaction<T>(fn: (tx: PostgreSQLTransaction) => Promise<T>, options?: PostgreSQLTransactionOptions): Promise<T> {
         this.assertActive();
-        if (this.inTransaction) {
+        if (this.connection().inTransaction()) {
             if (options?.isolation !== undefined || options?.readOnly !== undefined) {
                 throw new PostgreSQLError({
                     code: '25001',
@@ -420,7 +347,6 @@ class PinnedSession implements PostgreSQLSession {
             return this.savepoint(fn);
         }
         this.runSimple(beginStatement(options), 'execute');
-        this.inTransaction = true;
         const tx = new TransactionView(this);
         try {
             const result = await fn(tx);
@@ -431,7 +357,6 @@ class PinnedSession implements PostgreSQLSession {
             this.rollbackQuietly();
             throw error;
         } finally {
-            this.inTransaction = false;
             tx.close();
         }
     }
@@ -490,32 +415,38 @@ class PinnedSession implements PostgreSQLSession {
     /**
      * PostgreSQL drops named portals created outside a transaction block at
      * `Sync`, so a batched cursor runs inside one transaction for its lifetime.
+     * The scope count and its `BEGIN`/`ROLLBACK` live on the connection.
      */
-    beginCursorTransaction(): void {
-        if (this.openCursors === 0) this.runSimple('BEGIN', 'execute');
-        this.openCursors += 1;
-    }
-
-    endCursorTransaction(): void {
-        if (this.openCursors === 0) return;
-        this.openCursors -= 1;
-        if (this.openCursors === 0) {
-            try {
-                this.runSimple('ROLLBACK', 'execute');
-            } catch {
-                // The portal's own failure outranks the goodbye.
-            }
+    beginCursorScope(): void {
+        try {
+            this.connection().beginCursorScope();
+        } catch (error) {
+            throw this.wrap(error);
         }
     }
 
-    /** Ends the scope: healthy connections return to the pool, broken ones are closed. */
+    endCursorScope(): void {
+        try {
+            this.connection().endCursorScope();
+        } catch {
+            // The portal's own failure outranks the goodbye.
+        }
+    }
+
+    /**
+     * Ends the scope: healthy connections return to the pool, broken ones are
+     * closed. A connection still inside a transaction is retired rather than
+     * handed on, so the next lease never inherits an open block.
+     */
     end(): void {
         if (!this.active) return;
         this.active = false;
-        if (this.inTransaction || this.openCursors > 0) {
-            this.openCursors = 0;
-            this.rollbackQuietly();
-            this.inTransaction = false;
+        const connection = this.lease.connection;
+        try {
+            connection.clearCursorScopes();
+            if (connection.inTransaction()) this.broken = true;
+        } catch {
+            this.broken = true;
         }
         if (this.broken) this.lease.discard();
         else this.lease.release();
@@ -705,7 +636,7 @@ class PortalCursor implements AsyncRowCursor<PostgreSQLRow | PostgreSQLArrayRow>
         }));
         try {
             if (this.portal === null) {
-                this.session.beginCursorTransaction();
+                this.session.beginCursorScope();
                 this.txHeld = true;
                 this.portal = `pgts_cursor_${(handleCounter += 1)}`;
                 const info = this.session.connection().bindPortal(this.statementName, this.portal, paramInfos, []);
@@ -736,7 +667,7 @@ class PortalCursor implements AsyncRowCursor<PostgreSQLRow | PostgreSQLArrayRow>
         }
         if (this.txHeld) {
             this.txHeld = false;
-            this.session.endCursorTransaction();
+            this.session.endCursorScope();
         }
     }
 }

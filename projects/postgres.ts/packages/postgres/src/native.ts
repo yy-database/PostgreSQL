@@ -212,7 +212,39 @@ export interface Connection {
     copyIn(sql: string, chunks: Buffer[]): CopyInReport;
     /** Collects every `CopyData` payload of one `COPY ... TO STDOUT` statement. */
     copyOut(sql: string): CopyOutReport;
+    /** Whether the server last reported an open transaction block. */
+    inTransaction(): boolean;
+    /** Opens one cursor scope; the outermost scope runs `BEGIN` in the core. */
+    beginCursorScope(): void;
+    /** Closes one cursor scope; the last owned scope runs `ROLLBACK` in the core. */
+    endCursorScope(): void;
+    /** Drops stale cursor-scope bookkeeping without running any goodbye. */
+    clearCursorScopes(): void;
     close(): void;
+}
+
+/** Admission limits for one native pool; `undefined` keeps the binding default. */
+export interface PoolLimitsInfo {
+    max?: number;
+    maxPending?: number;
+    /** Milliseconds a queued lease waits before it is dropped; `0` waits forever. */
+    acquireTimeoutMs?: number;
+}
+
+/**
+ * A pool of leased connections. The leasing state machine — the `max` cap,
+ * the admission queue, acquire deadlines, idle hand-back and the close drain —
+ * lives entirely in the Rust core; this handle only moves connections.
+ */
+export interface Pool {
+    /** Takes one lease. Rejects with the core's refusal message when saturated, timed out or closed. */
+    acquire(): Promise<Connection>;
+    /** Returns a healthy connection; the first queued waiter adopts it, otherwise it parks idle. */
+    release(connection: Connection): void;
+    /** Shuts a connection down for good and frees its slot. */
+    discard(connection: Connection): void;
+    /** Settles once every outstanding lease is back and idle connections are closed. */
+    close(): Promise<void>;
 }
 
 /** One stored row. */
@@ -390,6 +422,7 @@ export interface PostgresNative {
     Store: new (dataDir: string) => Store;
     ServerStore: new (dataDir: string) => ServerStore;
     LocalEngine: new (options: LocalEngineOptions) => LocalEngine;
+    Pool: new (options: ClientOptions, limits?: PoolLimitsInfo) => Pool;
 }
 
 /** Map Node platform/arch to the optionalDependency package suffix. */

@@ -10,6 +10,7 @@ use std::{
     collections::BTreeMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use napi::bindgen_prelude::*;
@@ -23,6 +24,7 @@ use database_client::pgsql::{
     Notification,
     client::{ClientConfig, Column, Connection as CoreConnection, Param as PostgresParam, QueryResult},
     error::{MessageField, Notice, PostgresError},
+    pool::{Pool as CorePool, PoolLimits as CorePoolLimits},
     psql::{PsqlOptions, format_results, parse_arguments},
 };
 use database_protocol_pgsql as protocol;
@@ -499,6 +501,46 @@ impl Connection {
         })
     }
 
+    /// Whether the server last reported an open transaction block.
+    ///
+    /// The core client records every `ReadyForQuery` status byte, so this is
+    /// the single copy of the session's transaction state; hosts must not
+    /// mirror it in a flag of their own.
+    #[napi]
+    pub fn in_transaction(&self) -> Result<bool> {
+        let guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_ref().ok_or_else(closed_error)?;
+        Ok(connection.in_transaction())
+    }
+
+    /// Opens one cursor scope. The first scope on the session starts the
+    /// transaction the named portals live in; later scopes only count.
+    #[napi]
+    pub fn begin_cursor_scope(&self) -> Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection.begin_cursor_scope().map_err(native)
+    }
+
+    /// Closes one cursor scope. The last owned scope rolls its transaction
+    /// back, swallowing the goodbye's failure like the portal path always has.
+    #[napi]
+    pub fn end_cursor_scope(&self) -> Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection.end_cursor_scope();
+        Ok(())
+    }
+
+    /// Drops stale cursor-scope bookkeeping when a lease ends mid-scope.
+    #[napi]
+    pub fn clear_cursor_scopes(&self) -> Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| lock_error())?;
+        let connection = guard.as_mut().ok_or_else(closed_error)?;
+        connection.clear_cursor_scopes();
+        Ok(())
+    }
+
     /// Shuts the socket down on the wire.
     #[napi]
     pub fn close(&self) -> Result<()> {
@@ -576,6 +618,115 @@ impl PreparedStatement {
         }
         self.closed = true;
         Ok(())
+    }
+}
+
+/// Admission limits for one [`Pool`]; every field left out keeps its upstream default.
+#[napi(object)]
+pub struct PoolLimitsOptions {
+    /// Upper bound of simultaneously leased connections.
+    pub max: Option<u32>,
+    /// Upper bound of queued waiters; further acquires are refused saturated.
+    pub max_pending: Option<u32>,
+    /// Milliseconds a queued lease waits before it is dropped; `0` waits forever.
+    pub acquire_timeout_ms: Option<u32>,
+}
+
+/// One pooled connection handle: the pool moves it, hosts only lease it.
+type PooledConnection = Arc<Mutex<Option<CoreConnection>>>;
+
+/// A pool of leased connections.
+///
+/// The whole leasing state machine — the `max` cap, the admission queue, the
+/// acquire deadlines, idle hand-back and the close drain — lives in
+/// `database.client::pgsql`; this class only moves handles across the
+/// boundary. `acquire` and `close` settle from a worker thread, so the event
+/// loop keeps running (and can hand leases back) while one is queued.
+#[napi(js_name = "Pool")]
+pub struct Pool {
+    inner: Arc<CorePool<PooledConnection>>,
+}
+
+#[napi]
+impl Pool {
+    #[napi(constructor)]
+    pub fn new(options: ClientOptions, limits: Option<PoolLimitsOptions>) -> Result<Self> {
+        let config = ClientConfig::new(options.host, options.port, options.user, options.database);
+        let config = match options.password {
+            Some(password) => config.with_password(password),
+            None => config,
+        };
+        let mut core_limits = CorePoolLimits::default();
+        if let Some(limits) = limits {
+            if let Some(max) = limits.max {
+                core_limits.max = usize::try_from(max).map_err(|_| Error::from_reason("pool max does not fit this platform"))?;
+            }
+            if let Some(max_pending) = limits.max_pending {
+                core_limits.max_pending =
+                    usize::try_from(max_pending).map_err(|_| Error::from_reason("pool maxPending does not fit this platform"))?;
+            }
+            if let Some(timeout_ms) = limits.acquire_timeout_ms {
+                core_limits.acquire_timeout =
+                    if timeout_ms == 0 { None } else { Some(Duration::from_millis(u64::from(timeout_ms))) };
+            }
+        }
+        let connector_config = Arc::new(config);
+        let dialer = Arc::clone(&connector_config);
+        let pool = CorePool::new(
+            core_limits,
+            move || CoreConnection::open(&dialer).map(|connection| Arc::new(Mutex::new(Some(connection))) as PooledConnection),
+            |handle| {
+                if let Ok(mut guard) = handle.lock() {
+                    if let Some(mut connection) = guard.take() {
+                        let _ = connection.disconnect();
+                    }
+                }
+            },
+        );
+        Ok(Self { inner: Arc::new(pool) })
+    }
+
+    /// Takes one lease: an idle connection, a freshly dialled one, or a place
+    /// in the admission queue.
+    ///
+    /// The promise resolves with a `Connection` and rejects with the pool's
+    /// own refusal message when it is saturated, timed out or closed.
+    #[napi]
+    pub fn acquire<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let pool = Arc::clone(&self.inner);
+        let (deferred, promise) = env.create_deferred::<Connection, _>()?;
+        std::thread::spawn(move || match pool.acquire() {
+            Ok(handle) => deferred.resolve(move |_| Ok(Connection { inner: handle })),
+            Err(error) => deferred.reject(Error::from_reason(error.to_string())),
+        });
+        Ok(promise)
+    }
+
+    /// Returns a healthy connection; the first queued waiter adopts it, otherwise it parks idle.
+    #[napi]
+    pub fn release(&self, connection: &Connection) -> Result<()> {
+        self.inner.release(Arc::clone(&connection.inner));
+        Ok(())
+    }
+
+    /// Shuts a connection down for good and frees its slot.
+    #[napi]
+    pub fn discard(&self, connection: &Connection) -> Result<()> {
+        self.inner.discard(Arc::clone(&connection.inner));
+        Ok(())
+    }
+
+    /// Closes the pool: queued leases are refused, idle connections shut down,
+    /// and the promise settles once every outstanding lease is back.
+    #[napi]
+    pub fn close<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let pool = Arc::clone(&self.inner);
+        let (deferred, promise) = env.create_deferred::<bool, _>()?;
+        std::thread::spawn(move || {
+            pool.close();
+            deferred.resolve(|_| Ok(true));
+        });
+        Ok(promise)
     }
 }
 
